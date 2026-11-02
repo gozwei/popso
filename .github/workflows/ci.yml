@@ -39,7 +39,7 @@ jobs:
           - name: windows-msvc
             os: windows-latest
             cxx: ''
-            werror: OFF
+            werror: ON
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +96,7 @@ jobs:
       - name: Configure (ASan + UBSan)
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPOPSO_BUILD_TESTS=ON
-          -DPOPSO_SANITIZE=ON -DPOPSO_WERROR=ON -DCMAKE_CXX_COMPILER=clang++
+          -DPOPSO_SANITIZE=ON -DPOPSO_WERROR=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
 
       - name: Build
         run: cmake --build build --parallel 4

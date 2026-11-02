@@ -862,6 +862,9 @@ SolveScratch& scratch() {
 }
 
 constexpr double kDrop = 1e-14;
+// Largest Forrest-Tomlin row eta entry accepted without asking for a refactorization (relative error
+// of the later solves ~ 2.2e-16 * 1e7 = 2e-9).
+constexpr double kMaxRowEta = 1e7;
 
 // Index list of a vector being solved hyper-sparsely; `valid` false once a stage ran dense.
 struct NzList {
@@ -1613,7 +1616,7 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
     }
   }
   // Row eta R = I - e_r mu^T, and the new pivot (row r of R times the spike).
-  double piv = spike_[r];
+  double piv = spike_[r], mu_max = 0.0;
   for (Index k = 0; k < h.count; ++k) {
     const Index i = h.nz[k];
     const double v = u[i];
@@ -1621,6 +1624,7 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
     u[i] = 0.0;
     if (i == r || std::abs(v) < 1e-14) continue;
     piv -= v * spike_[i];
+    mu_max = std::max(mu_max, std::abs(v));
     r_index_.push_back(i);
     r_value_.push_back(v);
   }
@@ -1629,7 +1633,11 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
   r_row_.push_back(r);
   r_start_.push_back(static_cast<Index>(r_index_.size()));
   const double expected = piv_val_[s] * alpha_p;
-  if (!(std::abs(piv - expected) <= 1e-8 * std::max(1.0, std::abs(expected))) || std::abs(piv) < pivot_tolerance)
+  // Besides a new pivot that disagrees with the ftran's, a large row eta makes the factorization
+  // inaccurate: every later solve applies it, with rounding errors of about eps * max|mu| relative to
+  // the solution (on ill-conditioned bases while the pivots still agree).
+  if (!(std::abs(piv - expected) <= 1e-8 * std::max(1.0, std::abs(expected))) || std::abs(piv) < pivot_tolerance ||
+      mu_max > kMaxRowEta)
     ft_unstable_ = true;
   // Column p of U leaves the rows of earlier (original) steps.
   if (s < m_) {

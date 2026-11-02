@@ -3,6 +3,8 @@
 // positions).
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <random>
 #include <vector>
 
@@ -30,7 +32,11 @@ std::vector<Col> random_basis(std::mt19937& rng, Index m, bool dense_block) {
       const Index r = static_cast<Index>(rng() % m);
       if (used[r]) continue;
       used[r] = 1;
-      cols[c].push_back({r, static_cast<double>(static_cast<int>(rng() % 19) - 9) + ((rng() % 4) ? 0.0 : 0.37)});
+      // Two draws: sequenced explicitly (the operands of + are not; MSVC drew them in the other
+      // order and so built different matrices).
+      const int whole = static_cast<int>(rng() % 19) - 9;
+      const double frac = (rng() % 4) ? 0.0 : 0.37;
+      cols[c].push_back({r, static_cast<double>(whole) + frac});
     }
   }
   if (dense_block && m >= 120) {
@@ -72,6 +78,20 @@ HVector sparse_rhs(std::mt19937& rng, Index m, int nnz) {
   return h;
 }
 
+// FNV-1a over the columns (instance fingerprint for diagnostics across platforms).
+uint64_t fingerprint(const std::vector<Col>& cols) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t x) { h = (h ^ x) * 1099511628211ull; };
+  for (const Col& c : cols) {
+    mix(c.size());
+    for (auto [r, v] : c) {
+      mix(static_cast<uint64_t>(r));
+      mix(static_cast<uint64_t>(static_cast<int64_t>(v * 1024.0)));
+    }
+  }
+  return h;
+}
+
 // a and b agree to rounding and both index lists are exact (every nonzero listed once).
 bool same(const HVector& a, const HVector& b, double* err) {
   const Index m = static_cast<Index>(a.dense.size());
@@ -85,11 +105,22 @@ bool same(const HVector& a, const HVector& b, double* err) {
     std::vector<int> listed(m, 0);
     for (Index k = 0; k < v->count; ++k) ++listed[v->nz[k]];
     for (Index i = 0; i < m; ++i) {
-      if (listed[i] > 1) return false;
-      if (v->dense[i] != 0.0 && !listed[i]) return false;
+      if (listed[i] > 1 || (v->dense[i] != 0.0 && !listed[i])) {
+        std::fprintf(stderr, "  index list of the %s solve is invalid at %d (listed %d, value %.17g)\n",
+                     v == &a ? "dense" : "hyper-sparse", static_cast<int>(i), listed[i], v->dense[i]);
+        return false;
+      }
     }
   }
-  return *err <= 1e-11;
+  if (*err > 1e-11) {
+    Index worst_i = 0;
+    for (Index i = 0; i < m; ++i)
+      if (std::abs(a.dense[i] - b.dense[i]) > std::abs(a.dense[worst_i] - b.dense[worst_i])) worst_i = i;
+    std::fprintf(stderr, "  relative discrepancy %.3g (max |x| %.3g) at %d: dense %.17g, hyper-sparse %.17g\n", *err, mx,
+                 static_cast<int>(worst_i), a.dense[worst_i], b.dense[worst_i]);
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -101,9 +132,14 @@ TEST(lu_hyper_sparse_solves_match_dense) {
   for (int trial = 0; trial < 120; ++trial) {
     const Index m = 20 + static_cast<Index>(rng() % (trial % 3 == 0 ? 700 : 250));
     std::vector<Col> cols = random_basis(rng, m, trial % 4 == 1);
+    const uint64_t fp = fingerprint(cols);
     LuFactor lu;
     if (trial % 5 == 4) lu.forrest_tomlin = false;
     factorize(lu, cols);
+    auto where = [&](int u, const char* what) {
+      std::fprintf(stderr, "  (trial %d, m %d, instance %016llx, update %d, %s)\n", trial, static_cast<int>(m),
+                   static_cast<unsigned long long>(fp), u, what);
+    };
     if (trial % 2 == 0) {
       std::vector<Index> old_pos;
       lu.renumber_positions(old_pos);
@@ -125,8 +161,8 @@ TEST(lu_hyper_sparse_solves_match_dense) {
         dense.btran(b1);
         hyper.btran(b2);
         double e1, e2;
-        CHECK(same(f1, f2, &e1));
-        CHECK(same(b1, b2, &e2));
+        if (!CHECK(same(f1, f2, &e1))) where(u, s == 2 ? "ftran, denser rhs" : "ftran");
+        if (!CHECK(same(b1, b2, &e2))) where(u, s == 2 ? "btran, denser rhs" : "btran");
         worst = std::max({worst, e1, e2});
         compared += 2;
       }
@@ -146,7 +182,7 @@ TEST(lu_hyper_sparse_solves_match_dense) {
       dense.ftran(h1);
       hyper.ftran(h2);
       double e;
-      CHECK(same(h1, h2, &e));
+      if (!CHECK(same(h1, h2, &e))) where(u, "ftran of the entering column");
       const Index p = static_cast<Index>(rng() % m);
       double amax = 0.0;
       for (Index i = 0; i < m; ++i) amax = std::max(amax, std::abs(h1.dense[i]));
@@ -164,6 +200,19 @@ TEST(lu_hyper_sparse_solves_match_dense) {
         if (v != 0.0) ac.push_back({r, v});
       }
       cols[p] = ac;
+      // Refactorize when the update asks for it (as the simplex does): an inaccurate update (large
+      // Forrest-Tomlin row eta on an ill-conditioned basis) makes both solves inaccurate, and their
+      // difference is then rounding amplified by the eta, not a defect of either solve.
+      if (dense.wants_refactor() || hyper.wants_refactor()) {
+        CHECK(dense.wants_refactor() == hyper.wants_refactor());
+        LuFactor fresh;
+        fresh.forrest_tomlin = lu.forrest_tomlin;
+        factorize(fresh, cols);
+        dense = fresh;
+        hyper = fresh;
+        dense.hyper_mode = 1;
+        hyper.hyper_mode = 2;
+      }
     }
     // Residual of the hyper-sparse solve against the basis: B x = b.
     HVector b = sparse_rhs(rng, m, 3), x = b;
@@ -176,10 +225,10 @@ TEST(lu_hyper_sparse_solves_match_dense) {
       res = std::max(res, std::abs(bx[i] - b.dense[i]));
       scale = std::max(scale, std::abs(b.dense[i]));
     }
-    CHECK(res <= 1e-7 * scale);
+    if (!CHECK(res <= 1e-7 * scale)) where(updates, "residual");
   }
   CHECK(compared > 1000);
-  CHECK(worst <= 1e-11);
+  if (!CHECK(worst <= 1e-11)) std::fprintf(stderr, "  worst relative discrepancy %.3g\n", worst);
 }
 
 TEST(lu_multi_ftran_mixed_modes) {
@@ -201,5 +250,25 @@ TEST(lu_multi_ftran_mixed_modes) {
     CHECK(same(a, a1, &e));
     CHECK(same(b, b1, &e));
     CHECK(same(c, c1, &e));
+  }
+}
+
+TEST(lu_ft_update_flags_large_row_eta) {
+  // B = [[1, -K, 0], [0, 1, -K], [0, 0, 1]]; replacing column 0 (by itself) eliminates row 0 of U,
+  // -K e_1, with the row eta mu = (-K, -K^2): accurate pivots, but the eta amplifies rounding by K^2.
+  for (const double K : {10.0, 1e4}) {
+    std::vector<Col> cols = {{{0, 1.0}}, {{0, -K}, {1, 1.0}}, {{1, -K}, {2, 1.0}}};
+    LuFactor lu;
+    factorize(lu, cols);
+    CHECK(!lu.wants_refactor());
+    HVector a;
+    a.resize(3);
+    a.dense[0] = 1.0;
+    a.nz[a.count++] = 0;
+    lu.ftran(a);
+    CHECK_NEAR(a.dense[0], 1.0, 1e-15);
+    lu.update(0, a);
+    CHECK_EQ(lu.num_updates(), 1);
+    CHECK_EQ(lu.wants_refactor(), K > 100.0);
   }
 }
