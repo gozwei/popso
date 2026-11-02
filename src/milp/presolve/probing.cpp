@@ -20,6 +20,14 @@ class Prober {
     first_.assign(p.num_cols(), -1);
     lb0_.resize(p.num_cols());
     ub0_.resize(p.num_cols());
+    row_int_.assign(p.num_rows(), 1);
+    for (Index i = 0; i < p.num_rows(); ++i) {
+      for (Index k = rows_.begin(i); k < rows_.end(i); ++k) {
+        const Index j = rows_.index[k];
+        const double b = std::max(std::abs(p.col_lb[j]), std::abs(p.col_ub[j]));
+        if (!(b < (p.is_int[j] ? kBigBound : 1e7))) row_int_[i] = 0;
+      }
+    }
   }
 
   ProbingResult run() {
@@ -42,8 +50,8 @@ class Prober {
     }
     init_activities();
     long long idle = 0;  // work since the last useful probe
-    // Longest columns first. When half of the budget passed without a useful probe, the rest of
-    // the budget goes to the other end of the order (shortest columns first) instead of stopping:
+    // Longest columns first. When 10% of the budget (MILP_PROBE_IDLE, fraction) passed without a useful probe, the
+    // probing continues from the other end of the order (shortest columns first), then stops after another idle stretch:
     // 30n20b8's 3241 fixings are all among its shorter columns (2745 long-column probes found none;
     // SCIP and HiGHS find them by continuing to probe). MILP_PROBE_SWITCH=0: stop as before.
     static const bool allow_switch = [] { const char* v = std::getenv("MILP_PROBE_SWITCH"); return !(v && v[0] == '0'); }();
@@ -51,7 +59,8 @@ class Prober {
     bool reversed = false;
     while (lo < hi) {
       if (work_ > limit_) break;
-      if (idle > limit_ / 2) {
+      static const double idle_frac = [] { const char* v = std::getenv("MILP_PROBE_IDLE"); return v ? std::atof(v) : 0.1; }();
+      if (idle > static_cast<long long>(idle_frac * static_cast<double>(limit_))) {
         if (reversed || !allow_switch) break;
         reversed = true;
         idle = 0;
@@ -165,13 +174,28 @@ class Prober {
 
   // Bounds of j change from [l0, u0] to the current ones: updates the activities of its rows.
   void update_activities(Index j, double l0, double u0, bool enqueue) {
+    // Only the contributions of a changed bound are updated (same arithmetic as contrib()).
+    const double l1 = lb_[j], u1 = ub_[j];
+    const bool lch = l1 != l0, uch = u1 != u0;
+    auto term = [](double a, double b, double* v, int* inf) {
+      if (std::abs(b) < kBigBound) *v = a * b, *inf = 0; else *v = 0.0, *inf = 1;
+    };
     for (Index k = p_.A.begin(j); k < p_.A.end(j); ++k) {
       const Index i = p_.A.index[k];
-      double lo0, hi0, lo1, hi1;
-      int li0, hi0i, li1, hi1i;
-      contrib(p_.A.value[k], l0, u0, &lo0, &hi0, &li0, &hi0i);
-      contrib(p_.A.value[k], lb_[j], ub_[j], &lo1, &hi1, &li1, &hi1i);
-      amin_[i] += lo1 - lo0, amax_[i] += hi1 - hi0, nmin_[i] += li1 - li0, nmax_[i] += hi1i - hi0i;
+      const double a = p_.A.value[k];
+      const bool pos = a > 0;
+      double v0, v1;
+      int i0, i1;
+      if (pos ? lch : uch) {  // minimal contribution: a l (a > 0) or a u
+        term(a, pos ? l0 : u0, &v0, &i0);
+        term(a, pos ? l1 : u1, &v1, &i1);
+        amin_[i] += v1 - v0, nmin_[i] += i1 - i0;
+      }
+      if (pos ? uch : lch) {  // maximal contribution
+        term(a, pos ? u0 : l0, &v0, &i0);
+        term(a, pos ? u1 : l1, &v1, &i1);
+        amax_[i] += v1 - v0, nmax_[i] += i1 - i0;
+      }
       if (enqueue && !queued_[i]) queued_[i] = 1, queue_.push_back(i);
     }
     updates_ += p_.A.end(j) - p_.A.begin(j);
@@ -242,13 +266,19 @@ class Prober {
     work_ += re - rb;
     double minact = 0.0, maxact = 0.0;
     int mininf = 0, maxinf = 0;
-    for (Index k = rb; k < re; ++k) {
-      const Index j = rows_.index[k];
-      const double a = rows_.value[k];
-      const double l = lb_[j] < -kBigBound ? -kInf : lb_[j], u = ub_[j] > kBigBound ? kInf : ub_[j];
-      const double lo = a > 0 ? l : u, hi = a > 0 ? u : l;
-      if (std::isfinite(lo)) minact += a * lo; else ++mininf;
-      if (std::isfinite(hi)) maxact += a * hi; else ++maxinf;
+    if (row_int_[i]) {
+      // Rows of columns with moderate finite bounds: the incremental activities are accurate (drift ~1e-16 relative, far
+      // below the rounding margins; they are recomputed periodically).
+      minact = amin_[i], maxact = amax_[i], mininf = nmin_[i], maxinf = nmax_[i];
+    } else {
+      for (Index k = rb; k < re; ++k) {
+        const Index j = rows_.index[k];
+        const double a = rows_.value[k];
+        const double l = lb_[j] < -kBigBound ? -kInf : lb_[j], u = ub_[j] > kBigBound ? kInf : ub_[j];
+        const double lo = a > 0 ? l : u, hi = a > 0 ? u : l;
+        if (std::isfinite(lo)) minact += a * lo; else ++mininf;
+        if (std::isfinite(hi)) maxact += a * hi; else ++maxinf;
+      }
     }
     const double rlo = p_.row_lb[i], rhi = p_.row_ub[i];
     const double scale = 1.0 + std::max(std::abs(minact), std::abs(maxact));
@@ -257,12 +287,19 @@ class Prober {
     }
     const bool use_hi = std::isfinite(rhi) && mininf <= 1, use_lo = std::isfinite(rlo) && maxinf <= 1;
     if (!use_hi && !use_lo) return true;
+    // A column with a finite domain can only be tightened by a side whose slack is below |a| (u - l).
+    const double slack_hi = mininf == 0 ? rhi - minact : -kInf, slack_lo = maxinf == 0 ? maxact - rlo : -kInf;
+    const double gate_hi = slack_hi - 1e-9 * (1.0 + std::abs(slack_hi)), gate_lo = slack_lo - 1e-9 * (1.0 + std::abs(slack_lo));
     for (Index k = rb; k < re; ++k) {
       const Index j = rows_.index[k];
       if (lb_[j] == ub_[j]) continue;
-      const bool integer = p_.is_int[j];
       const double a = rows_.value[k];
       const double l = lb_[j] < -kBigBound ? -kInf : lb_[j], u = ub_[j] > kBigBound ? kInf : ub_[j];
+      if (std::isfinite(l) && std::isfinite(u)) {
+        const double span = std::abs(a) * (u - l);
+        if (!(use_hi && mininf == 0 && span > gate_hi) && !(use_lo && maxinf == 0 && span > gate_lo)) continue;
+      }
+      const bool integer = p_.is_int[j];
       const double lo = a > 0 ? l : u, hi = a > 0 ? u : l;
       // Residual activities without j.
       const bool rmin_ok = mininf - (std::isfinite(lo) ? 0 : 1) == 0;
@@ -286,11 +323,14 @@ class Prober {
         nl = std::ceil(nl);
         nu = std::floor(nu);
       } else {
-        // Insignificant changes would only keep the queue busy.
-        const double range = std::isfinite(l) && std::isfinite(u) ? u - l : kInf;
-        const double min_gain = std::max(1e-7, 1e-3 * std::min(range, 1e6));
-        if (!(nl > l + min_gain * (1.0 + std::abs(l)) || nl > u - 1e-8 * (1.0 + std::abs(u)))) nl = -kInf;
-        if (!(nu < u - min_gain * (1.0 + std::abs(u)) || nu < l + 1e-8 * (1.0 + std::abs(l)))) nu = kInf;
+        // Insignificant changes would only keep the queue busy: a change must be 0.1% of the column's domain
+        // when probing started (a threshold that does not shrink with the domain, so chains of ever smaller
+        // steps stop; neos-1122047).
+        const double l0 = p_.col_lb[j], u0 = p_.col_ub[j];
+        const double range = std::isfinite(l0) && std::isfinite(u0) && u0 - l0 < kBigBound ? u0 - l0 : kInf;
+        const double min_gain = 1e-3 * std::min(range, 1e6);
+        if (!(nl > l + std::max(min_gain, 1e-7 * (1.0 + std::abs(l))) || nl > u - 1e-8 * (1.0 + std::abs(u)))) nl = -kInf;
+        if (!(nu < u - std::max(min_gain, 1e-7 * (1.0 + std::abs(u))) || nu < l + 1e-8 * (1.0 + std::abs(l)))) nu = kInf;
         if (std::abs(nl) >= kBigBound) nl = -kInf;
         if (std::abs(nu) >= kBigBound) nu = kInf;
         // Crossing within rounding errors: the column is fixed.
@@ -317,6 +357,7 @@ class Prober {
   std::vector<Index> stamp_, first_;
   std::vector<Change> trail_;
   std::vector<char> queued_;
+  std::vector<char> row_int_;  // incremental activities usable: finite, moderate bounds (continuous: <= 1e7)
   std::vector<Index> queue_;
   std::vector<double> amin_, amax_, range_;  // incremental row activities; max entry range per row
   std::vector<int> nmin_, nmax_;

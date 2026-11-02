@@ -319,6 +319,23 @@ def size_of(name):
     return parts[1] if len(parts) >= 3 else None
 
 
+def resolve_solver(spec):
+    """--solver value -> argv list. A plain existing path is taken as is (Windows paths contain
+    backslashes, which shlex would eat); otherwise the string is split like a shell command. If
+    the binary does not exist, also try <path>.exe and the multi-config layout
+    <dir>/Release/<name>.exe (Visual Studio generators), so `--solver build/popso` works on Windows."""
+    cmd = [spec] if os.path.exists(spec) else shlex.split(spec, posix=os.name != "nt")
+    exe = cmd[0]
+    if not os.path.exists(exe):
+        p = Path(exe)
+        name = p.name if p.suffix == ".exe" else p.name + ".exe"
+        for cand in (p.with_name(name), p.parent / "Release" / name):
+            if cand.exists():
+                cmd[0] = str(cand)
+                break
+    return cmd
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("instances", nargs="*", help="files, globs or directories "
@@ -354,10 +371,12 @@ def main(argv=None):
     ap.add_argument("--tag", default="", help="label appended to the result file name")
     ap.add_argument("--no-save", action="store_true", help="do not write result files")
     ap.add_argument("--keep-sols", action="store_true", help="keep .sol/.log under results/tmp")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit code 1 also when an instance is not solved (errors, limits; for CI)")
     args = ap.parse_args(argv)
 
-    solver_cmd = shlex.split(args.solver)
-    if len(solver_cmd) == 1 and not os.path.exists(solver_cmd[0]):
+    solver_cmd = resolve_solver(args.solver)
+    if not os.path.exists(solver_cmd[0]) and len(solver_cmd) == 1:
         print(f"solver binary not found: {solver_cmd[0]}", file=sys.stderr)
         return 2
     set_files = [f for s in args.set for f in read_set(s)]
@@ -523,6 +542,9 @@ def main(argv=None):
         for r in wrong:
             print(f"!!!   {r['instance']}: {r['message']}")
         print("!" * 78)
+        return 1
+    if args.strict and solved < n:
+        print(f"--strict: {n - solved} of {n} instances not solved")
         return 1
     return 0
 

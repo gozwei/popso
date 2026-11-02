@@ -13,3 +13,10 @@ benchmarks/results/tmp/
 
 # local-only data and tools (never committed)
 private/
+
+# shared library copied into the Python package; Python build output
+python/popso/*.so
+python/popso/*.dylib
+python/popso/*.dll
+python/build/
+python/*.egg-info/

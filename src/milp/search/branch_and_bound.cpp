@@ -513,7 +513,14 @@ class NodePool {
   void take(bool by_estimate, Node* out) {
     std::vector<Key>& h = drain_ ? dheap_ : by_estimate ? eheap_ : bheap_;
     drop_stale(h);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"  // false positive through the inlined heap code
+#endif
     const int s = h.front().slot;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     pop_key(h);
     *out = std::move(slots_[s]);
     slots_[s] = Node{};
@@ -3439,8 +3446,8 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
       Index bad = -1;
       for (const PathSeg* b = c.path.get(); b && b != stop; b = b->parent()) {
         b->for_each([&](const BoundChange& bc) {
-          const double x = debug_sol_[bc.col];
-          if (bad < 0 && (x < bc.lb - 1e-6 || x > bc.ub + 1e-6)) bad = bc.col;
+          const double xd = debug_sol_[bc.col];
+          if (bad < 0 && (xd < bc.lb - 1e-6 || xd > bc.ub + 1e-6)) bad = bc.col;
         });
       }
       return bad;

@@ -20,6 +20,12 @@ The MPS writer emits fixed-column-style free MPS: integer columns inside
 MARKER INTORG/INTEND blocks, every integer column with explicit bounds
 (BV for binaries, LI for an integer with an infinite upper bound), so the
 file reads the same under all common MPS conventions.
+
+The LP writer (Model.to_lp, or Model.write("x.lp"); lp_text() for models
+from other sources) emits the CPLEX LP format: every variable is listed in
+the objective in column order (with coefficient 0 if needed), so a reader
+numbers the columns exactly as in the MPS file; bounds are explicit wherever
+they differ from the LP defaults ([0, +inf), binaries [0, 1]).
 """
 
 from __future__ import annotations
@@ -213,10 +219,20 @@ class Model:
     def num_int_vars(self):
         return sum(1 for v in self.vars if v.vtype != "C")
 
-    # ---- MPS output
+    # ---- MPS / LP output
     def write(self, path):
+        """Write MPS, or CPLEX LP if the file name ends in .lp."""
+        text = self.to_lp() if str(path).lower().endswith(".lp") else self.to_mps()
         with open(path, "w") as f:
-            f.write(self.to_mps())
+            f.write(text)
+
+    def to_lp(self):
+        cols = [(v.name, v.obj, v.lb, v.ub, v.vtype) for v in self.vars]
+        rows = []
+        for c in self.constrs:
+            lo, hi = {"L": (-INF, c.rhs), "G": (c.rhs, INF), "E": (c.rhs, c.rhs)}[c.sense]
+            rows.append((c.name, lo, hi, [(v.name, a) for v, a in c.terms.items()]))
+        return lp_text(self.name, self.sense, 0.0, cols, rows)
 
     def to_mps(self):
         out = [f"NAME {self.name}"]
@@ -300,3 +316,112 @@ def _num(x):
     if float(s) == x:
         return s
     return f"{x:.16e}"
+
+
+# ---- CPLEX LP output
+
+_LP_NAME_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&()/,;?@_`'{}|~")
+_LP_NAME_CHARS = _LP_NAME_START | set("0123456789.")
+# Words a reader may take for a keyword (at the start of a line) or a number.
+_LP_RESERVED = {
+    "min", "minimize", "minimise", "minimum", "max", "maximize", "maximise", "maximum",
+    "st", "s.t.", "st.", "s.t", "subject", "such", "bound", "bounds", "general", "generals", "gen",
+    "integer", "integers", "binary", "binaries", "bin", "semi", "semis", "semicontinuous", "sos",
+    "sos1", "sos2", "end", "free", "inf", "infinity", "lazy", "user", "pwlobj", "pwl",
+}
+
+
+def _lp_name(name):
+    if (not name or name[0] not in _LP_NAME_START or any(ch not in _LP_NAME_CHARS for ch in name)
+            or name.lower() in _LP_RESERVED):
+        raise ValueError(f"name {name!r} cannot be written in LP format")
+    return name
+
+
+def _lp_num(x):
+    if x == INF:
+        return "+inf"
+    if x == -INF:
+        return "-inf"
+    return _num(x)
+
+
+def _lp_terms(terms):
+    """[(name, coef)] -> ["+ 3 x", "- y", ...] (coefficients written exactly)."""
+    out = []
+    for name, a in terms:
+        a = float(a)
+        sign = "-" if a < 0 or (a == 0.0 and math.copysign(1.0, a) < 0) else "+"
+        mag = abs(a)
+        out.append(f"{sign} {name}" if mag == 1.0 else f"{sign} {_num(mag)} {name}")
+    return out
+
+
+def _lp_wrap(head, parts, width=100):
+    """Join parts after head, continuing on new lines (expressions may span lines)."""
+    lines, cur = [], head
+    for p in parts:
+        if len(cur) + 1 + len(p) > width and cur.strip():
+            lines.append(cur)
+            cur = "   " + p
+        else:
+            cur = f"{cur} {p}" if cur else p
+    lines.append(cur)
+    return lines
+
+
+def lp_text(name, sense, obj_const, cols, rows):
+    """CPLEX LP text.
+
+    cols: [(name, obj, lb, ub, vtype)] with vtype "C", "I" or "B";
+    rows: [(name, lo, hi, [(col name, coef)])] with lo/hi possibly infinite.
+    """
+    if sense not in ("min", "max"):
+        raise ValueError(f"bad sense {sense!r}")
+    out = []
+    if name:
+        out.append(f"\\Problem name: {name}")
+    out.append("Maximize" if sense == "max" else "Minimize")
+    obj = _lp_terms((_lp_name(c[0]), c[1]) for c in cols)
+    if obj_const:
+        obj.append(("- " if obj_const < 0 else "+ ") + _num(abs(obj_const)))
+    out.extend(_lp_wrap(" obj:", obj))
+    out.append("Subject To")
+    first_col = _lp_name(cols[0][0]) if cols else None
+    for rname, lo, hi, terms in rows:
+        lhs = _lp_terms((_lp_name(c), a) for c, a in terms)
+        if not lhs and first_col is not None:
+            lhs = [f"+ 0 {first_col}"]  # empty row
+        head = f" {_lp_name(rname)}:"
+        if lo == hi:
+            out.extend(_lp_wrap(head, lhs + ["=", _lp_num(hi)]))
+        elif lo == -INF:
+            out.extend(_lp_wrap(head, lhs + ["<=", _lp_num(hi)]))
+        elif hi == INF:
+            out.extend(_lp_wrap(head, lhs + [">=", _lp_num(lo)]))
+        else:  # ranged
+            out.extend(_lp_wrap(head, [_lp_num(lo), "<="] + lhs + ["<=", _lp_num(hi)]))
+    out.append("Bounds")
+    for cname, _, lb, ub, vtype in cols:
+        n = _lp_name(cname)
+        if vtype == "B" and lb == 0.0 and ub == 1.0:
+            continue
+        if lb == ub:
+            out.append(f" {n} = {_lp_num(lb)}")
+        elif lb == -INF and ub == INF:
+            out.append(f" {n} free")
+        elif lb == 0.0 and ub == INF:
+            continue
+        elif lb == 0.0 and ub >= 0.0:
+            out.append(f" {n} <= {_lp_num(ub)}")
+        elif ub == INF:
+            out.append(f" {n} >= {_lp_num(lb)}")
+        else:
+            out.append(f" {_lp_num(lb)} <= {n} <= {_lp_num(ub)}")
+    for title, kind in (("Generals", "I"), ("Binaries", "B")):
+        names = [_lp_name(c[0]) for c in cols if c[4] == kind]
+        if names:
+            out.append(title)
+            out.extend(_lp_wrap("", names))
+    out.append("End")
+    return "\n".join(out) + "\n"

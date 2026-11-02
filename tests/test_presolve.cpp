@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "milp/io/mps_reader.hpp"
+#include "milp/presolve/clique_merge.hpp"
 #include "milp/presolve/presolve.hpp"
 #include "milp/solver/solver.hpp"
 #include "test_framework.hpp"
@@ -430,6 +431,142 @@ TEST(presolve_dominated_columns) {
   CHECK_EQ(xs[y], 0.0);
 }
 
+TEST(presolve_dominated_columns_set_cover) {
+  // x1 covers a subset of x2's rows at no lower cost: with x2 = 1 every row of x1 is covered, so x1 = 0.
+  Builder b;
+  const Index x1 = b.col(3.0, 0.0, 1.0, true);
+  const Index x2 = b.col(2.0, 0.0, 1.0, true);
+  const Index x3 = b.col(1.0, 0.0, 1.0, true);
+  const Index x4 = b.col(1.0, 0.0, 1.0, true);
+  b.row(1.0, kInf, {{x1, 1.0}, {x2, 1.0}, {x3, 1.0}});
+  b.row(1.0, kInf, {{x1, 1.0}, {x2, 1.0}, {x4, 1.0}});
+  b.row(1.0, kInf, {{x2, 1.0}, {x3, 1.0}, {x4, 1.0}});
+  PresolveOptions o = only(false, false, false, false, false);
+  o.dominated_cols = true;
+  Presolver pre;
+  REQUIRE(pre.run(b.build(), o, kQuiet) == PresolveStatus::Reduced);
+  CHECK_EQ(reduced_index(pre, x1), -1);
+  const auto xs = pre.postsolve(std::vector<double>(pre.reduced().num_cols(), 1.0));
+  CHECK_EQ(xs[x1], 0.0);
+}
+
+TEST(presolve_probing_continuous_bounds) {
+  // Disjunction s2 >= s1 + 10 or s1 >= s2 + 20 (big-M on y): both settings of y imply cmax >= 30.
+  Builder b;
+  const Index s1 = b.col(0.0, 0.0, 1000.0);
+  const Index s2 = b.col(0.0, 0.0, 1000.0);
+  const Index y = b.col(0.0, 0.0, 1.0, true);
+  const Index cmax = b.col(1.0, 20.0, 1000.0);
+  b.row(-990.0, kInf, {{s2, 1.0}, {s1, -1.0}, {y, -1000.0}});  // s2 - s1 >= 10 - 1000 (1 - y)
+  b.row(20.0, kInf, {{s1, 1.0}, {s2, -1.0}, {y, 1000.0}});     // s1 - s2 >= 20 - 1000 y
+  b.row(10.0, kInf, {{cmax, 1.0}, {s1, -1.0}});
+  b.row(20.0, kInf, {{cmax, 1.0}, {s2, -1.0}});
+  Presolver pre;
+  REQUIRE(pre.run(b.build(), only_probing(), kQuiet) == PresolveStatus::Reduced);
+  const Index rc = reduced_index(pre, cmax);
+  REQUIRE(rc >= 0);
+  CHECK(pre.reduced().col_lb[rc] >= 30.0 - 1e-6);
+}
+
+TEST(presolve_gcd_tightening) {
+  Builder b;
+  const Index x = b.col(-1.0, 0.0, 10.0, true);
+  const Index y = b.col(-1.0, 0.0, 10.0, true);
+  const Index z = b.col(-1.0, 0.0, 10.0, true);
+  b.row(-kInf, 5.0, {{x, 2.0}, {y, 4.0}});
+  b.row(-7.0, kInf, {{y, -3.0}, {z, -6.0}});
+  PresolveOptions o = only(false, true, false, false, false);
+  Presolver pre;
+  REQUIRE(pre.run(b.build(), o, kQuiet) == PresolveStatus::Reduced);
+  const MipProblem& q = pre.reduced();
+  REQUIRE(q.num_rows() == 2);
+  CHECK_EQ(q.row_ub[0], 4.0);
+  CHECK_EQ(q.row_lb[1], -6.0);
+  Builder c;
+  const Index u = c.col(0.0, 0.0, 10.0, true);
+  const Index v = c.col(0.0, 0.0, 10.0, true);
+  c.row(3.0, 3.0, {{u, 2.0}, {v, 4.0}});
+  Presolver pre2;
+  CHECK(pre2.run(c.build(), o, kQuiet) == PresolveStatus::Infeasible);
+}
+
+TEST(presolve_dual_bound_strengthening) {
+  // y (cost >= 0) is only locked downwards by 25 y >= 10 x1 + 20 x2 + 15 x3: y never needs to exceed 2.
+  // z (cost <= 0) only locked upwards by z + x1 <= 7.5 (x1 <= 1): z >= 6.5 is always possible.
+  Builder b;
+  const Index x1 = b.col(-1.0, 0.0, 1.0, true);
+  const Index x2 = b.col(-2.0, 0.0, 1.0, true);
+  const Index x3 = b.col(-3.0, 0.0, 1.0, true);
+  const Index y = b.col(1.0, 0.0, kInf, true);
+  const Index z = b.col(-1.0, 0.0, 100.0);
+  b.row(0.0, kInf, {{y, 25.0}, {x1, -10.0}, {x2, -20.0}, {x3, -15.0}});
+  b.row(-kInf, 7.5, {{z, 1.0}, {x1, 1.0}});
+  b.row(-kInf, 2.0, {{x1, 1.0}, {x2, 1.0}, {x3, 1.0}, {z, 0.0}});
+  PresolveOptions o = only(false, false, false, true, false);
+  Presolver pre;
+  const Model model = b.b.build();
+  MipProblem p;
+  REQUIRE(MipProblem::from_model(model, &p));
+  REQUIRE(pre.run(p, o, kQuiet) == PresolveStatus::Reduced);
+  CHECK(pre.stats().dual_bounds >= 2);
+  const Index ry = reduced_index(pre, y), rz = reduced_index(pre, z);
+  if (ry >= 0) CHECK_EQ(pre.reduced().col_ub[ry], 2.0);
+  if (rz >= 0) CHECK(pre.reduced().col_lb[rz] >= 6.5 - 1e-6);
+  // Round trip through the solver: x2 = x3 = 1, y = 2, z = 7.5.
+  SolverParams params;
+  params.verbosity = 0;
+  params.threads = 1;
+  const SolveResult r1 = solve(model, params);
+  CHECK(r1.status == Status::Optimal);
+  CHECK_NEAR(r1.objective, -10.5, 1e-6);
+}
+
+TEST(presolve_clique_extension) {
+  // Packing row x1 + x2 + x3 <= 1; x4 conflicts with x1, x2 (pairwise rows) and with x3 (knapsack 3 x3 + 3 x4 <= 4).
+  Builder b;
+  std::vector<Index> x;
+  for (int k = 0; k < 6; ++k) x.push_back(b.col(-1.0 - k, 0.0, 1.0, true));
+  b.row(-kInf, 1.0, {{x[0], 1.0}, {x[1], 1.0}, {x[2], 1.0}});
+  b.row(-kInf, 1.0, {{x[0], 1.0}, {x[3], 1.0}});
+  b.row(0.0, 1.0, {{x[1], 1.0}, {x[3], 1.0}});
+  b.row(-kInf, 4.0, {{x[2], 3.0}, {x[3], 3.0}, {x[4], 1.0}});
+  // Partitioning row x4 + x5 = 1 (0-based x[4], x[5]); x[0] conflicts with both: x[0] = 0.
+  b.row(1.0, 1.0, {{x[4], 1.0}, {x[5], 1.0}});
+  b.row(-kInf, 1.0, {{x[0], 1.0}, {x[4], 1.0}});
+  b.row(-kInf, 0.0, {{x[0], 1.0}, {x[5], 1.0}, {x[1], -1.0}});  // x0 + x5 <= x1 <= 1 - x0 ... (x0 = x5 = 1 infeasible)
+  MipProblem p = b.build();
+  CliqueExtendStats cs;
+  REQUIRE(extend_cliques(p, 1000000, &cs));
+  CHECK(cs.extended >= 1);
+  CHECK(cs.dominated >= 2);  // x0 + x3 <= 1 and x1 + x3 <= 1 lie in the extended row
+  CHECK_EQ(cs.fixed, 1);
+  CHECK_EQ(p.col_ub[x[0]], 0.0);
+  // The extended row x0 + x1 + x2 + x3 <= 1 exists.
+  const SparseMatrix R = p.A.transpose();
+  bool found = false;
+  for (Index i = 0; i < p.num_rows(); ++i) {
+    if (R.end(i) - R.begin(i) == 4 && p.row_ub[i] == 1.0) found = true;
+  }
+  CHECK(found);
+  // End to end: same optimum as without presolve.
+  Builder c;
+  for (int k = 0; k < 6; ++k) c.col(-1.0 - k, 0.0, 1.0, true);
+  c.row(-kInf, 1.0, {{0, 1.0}, {1, 1.0}, {2, 1.0}});
+  c.row(-kInf, 1.0, {{0, 1.0}, {3, 1.0}});
+  c.row(0.0, 1.0, {{1, 1.0}, {3, 1.0}});
+  c.row(-kInf, 4.0, {{2, 3.0}, {3, 3.0}, {4, 1.0}});
+  c.row(1.0, 1.0, {{4, 1.0}, {5, 1.0}});
+  SolverParams params;
+  params.verbosity = 0;
+  params.threads = 1;
+  const Model model = c.b.build();
+  const SolveResult r1 = solve(model, params);
+  params.presolve = false;
+  const SolveResult r2 = solve(model, params);
+  CHECK(r1.status == Status::Optimal && r2.status == Status::Optimal);
+  CHECK_NEAR(r1.objective, r2.objective, 1e-9);
+}
+
 TEST(presolve_probing) {
   Builder b;
   const Index x = b.col(1.0, 0.0, 1.0, true);
@@ -607,9 +744,10 @@ int g_numeric = 0;      // cases skipped because the LP solver reported numerica
 
 void print_coverage(const char* name) {
   std::printf("  %s reductions: %lld aggregations, %lld substitutions, %lld parallel cols, %lld dominated, probing "
-              "%lld fixed / %lld bounds / %lld equivs\n",
+              "%lld fixed / %lld bounds / %lld equivs, cliques %lld extended / %lld dominated / %lld fixed\n",
               name, g_stats.aggregations, g_stats.substitutions, g_stats.parallel_cols, g_stats.dominated,
-              g_stats.probing_fixed, g_stats.probing_bounds, g_stats.probing_equivs);
+              g_stats.probing_fixed, g_stats.probing_bounds, g_stats.probing_equivs, g_stats.clique_extended,
+              g_stats.clique_dominated, g_stats.clique_fixed);
   if (g_numeric > 0) std::printf("  %s: %d cases skipped (numerical trouble)\n", name, g_numeric);
   g_stats = PresolveStats{};
   g_numeric = 0;
@@ -640,6 +778,9 @@ Status compare_with_presolve(const Model& m, int it) {
   g_stats.probing_equivs += pre.stats().probing_equivs;
   g_stats.parallel_cols += pre.stats().parallel_cols;
   g_stats.dominated += pre.stats().dominated;
+  g_stats.clique_extended += pre.stats().clique_extended;
+  g_stats.clique_dominated += pre.stats().clique_dominated;
+  g_stats.clique_fixed += pre.stats().clique_fixed;
   if (ps == PresolveStatus::Infeasible) {
     b.status = Status::Infeasible;
   } else if (ps == PresolveStatus::Unbounded) {
@@ -830,4 +971,79 @@ TEST(presolve_random_structured_milps_match_no_presolve) {
   std::printf("  structured presolve: %d optimal, %d infeasible, %d other\n", optimal, infeasible, other);
   print_coverage("structured");
   CHECK(optimal > iters / 5);
+}
+
+namespace {
+
+// Random set packing / partitioning models with conflicts hidden in knapsacks and equations (clique extension,
+// clique fixings, dominated packing rows).
+Model random_clique_model(std::mt19937& rng) {
+  auto uni = [&](int lo, int hi) { return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1)); };
+  ModelBuilder b;
+  const int n = uni(5, 12);
+  std::vector<Index> x;
+  for (int j = 0; j < n; ++j) x.push_back(b.add_col("x" + std::to_string(j), uni(-6, 3), 0, 1, VarType::Binary));
+  const Index c = b.add_col("c", uni(-2, 2), 0, uni(1, 3));
+  auto pick = [&] { return x[uni(0, n - 1)]; };
+  const int m = uni(3, 10);
+  for (int i = 0; i < m; ++i) {
+    const int kind = uni(0, 5);
+    std::vector<std::pair<Index, double>> coefs;
+    auto add = [&](Index j, double v) {
+      for (const auto& e : coefs) {
+        if (e.first == j) return;
+      }
+      coefs.push_back({j, v});
+    };
+    double lb = -kInf, ub = kInf;
+    if (kind <= 1) {  // packing (sometimes partitioning)
+      for (int k = uni(2, 5); k > 0; --k) add(pick(), 1.0);
+      ub = 1.0;
+      if (uni(0, 3) == 0) lb = 1.0;
+    } else if (kind == 2) {  // pairwise conflict
+      add(pick(), 1.0);
+      add(pick(), 1.0);
+      ub = 1.0;
+    } else if (kind == 3) {  // knapsack with large coefficients
+      double tot = 0.0;
+      for (int k = uni(2, 5); k > 0; --k) {
+        const double a = uni(2, 9);
+        add(pick(), a);
+        tot += a;
+      }
+      if (uni(0, 1)) add(c, uni(1, 3));
+      ub = std::floor(tot * uni(3, 7) / 10.0);
+    } else if (kind == 4) {  // x_a + x_b <= x_c
+      add(pick(), 1.0);
+      add(pick(), 1.0);
+      add(pick(), -1.0);
+      ub = 0.0;
+    } else {  // covering
+      for (int k = uni(2, 4); k > 0; --k) add(pick(), 1.0);
+      lb = 1.0;
+    }
+    const Index r = b.add_row("r" + std::to_string(i), lb, ub);
+    for (const auto& [j, v] : coefs) b.add_coef(r, j, v);
+  }
+  if (uni(0, 1)) b.model().sense = ObjSense::Maximize;
+  return b.build();
+}
+
+}  // namespace
+
+TEST(presolve_random_clique_models_match_no_presolve) {
+  std::mt19937 rng(fuzz_seed(4242u));
+  const int iters = fuzz_iters(1000);
+  int optimal = 0, infeasible = 0;
+  for (int it = 0; it < iters; ++it) {
+    const Status st = compare_with_presolve(random_clique_model(rng), it);
+    optimal += st == Status::Optimal;
+    infeasible += st == Status::Infeasible;
+  }
+  std::printf("  clique presolve: %d optimal, %d infeasible\n", optimal, infeasible);
+  const long long ext = g_stats.clique_extended, fixed = g_stats.clique_fixed;
+  print_coverage("clique");
+  CHECK(optimal > iters / 3);
+  CHECK(ext > 0);
+  CHECK(fixed > 0);
 }

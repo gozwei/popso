@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "popso"
+version = "0.1.0"
+description = "Python bindings (ctypes) for the popso LP/MILP solver"
+license = {text = "Apache-2.0"}
+authors = [{name = "Marcin Polkowski"}]
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Homepage = "https://github.com/gozwei/popso"
+
+[tool.setuptools]
+packages = ["popso"]
+
+# The shared library built by CMake; copy it into popso/ before `pip install` (see README.md).
+[tool.setuptools.package-data]
+popso = ["*.so", "*.dylib", "*.dll"]

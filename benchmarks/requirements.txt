@@ -1,0 +1,3 @@
+highspy
+pyscipopt
+numpy

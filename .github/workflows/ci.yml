@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Runs in the public repository only (the private development repo has few Actions minutes).
+    if: github.repository == 'gozwei/popso'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            cxx: g++
+            werror: ON
+          - name: linux-clang
+            os: ubuntu-latest
+            cxx: clang++
+            werror: ON
+          - name: macos-clang
+            os: macos-latest
+            cxx: clang++
+            werror: ON
+          - name: windows-msvc
+            os: windows-latest
+            cxx: ''
+            werror: OFF
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure
+        shell: bash
+        run: |
+          args=(-DCMAKE_BUILD_TYPE=Release -DPOPSO_BUILD_TESTS=ON -DPOPSO_WERROR=${{ matrix.werror }})
+          if [ -n "${{ matrix.cxx }}" ]; then args+=(-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}); fi
+          cmake -S . -B build "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Locate binaries
+        id: bin
+        shell: bash
+        run: |
+          # Visual Studio generators put the binaries in build/Release/ and add .exe.
+          if [ -f build/Release/popso.exe ]; then dir=build/Release; ext=.exe; else dir=build; ext=; fi
+          echo "solver=$dir/popso$ext" >> "$GITHUB_OUTPUT"
+          "$dir/popso$ext" --version
+
+      - name: Tests (unit, C API, Python bindings)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: End-to-end (tiny instances, answers verified)
+        shell: bash
+        # run.py needs only the Python standard library when it does not run reference solvers.
+        run: >
+          python benchmarks/run.py --solver ${{ steps.bin.outputs.solver }} --sizes tiny
+          -t 20 --threads 2 --mem-limit 1000 --no-save --strict
+
+      - name: End-to-end, deterministic mode
+        shell: bash
+        run: >
+          python benchmarks/run.py --solver "${{ steps.bin.outputs.solver }} --deterministic" --sizes tiny
+          -t 20 --threads 2 --mem-limit 1000 --no-save --strict
+
+  sanitizers:
+    if: github.repository == 'gozwei/popso'
+    name: linux-sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (ASan + UBSan)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPOPSO_BUILD_TESTS=ON
+          -DPOPSO_SANITIZE=ON -DPOPSO_WERROR=ON -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Tests (unit, C API)
+        # The Python binding test is left out: python itself is not built with the sanitizers,
+        # so it cannot load the instrumented library.
+        run: ctest --test-dir build --output-on-failure -E '^python$'

@@ -32,8 +32,8 @@ Choice choose(const MipProblem& p, const double* x, DiveRule rule, const SimpleR
     if (!p.is_int[j]) continue;
     const double f = x[j] - std::floor(x[j]);
     if (f <= 1e-6 || f >= 1.0 - 1e-6) continue;
-    bool up;
-    double score;
+    bool up = false;
+    double score = kInf;
     switch (rule) {
       case DiveRule::Coefficient: {
         // Round in the direction with fewer locks; prefer few locks, then small fractionality.
@@ -104,7 +104,7 @@ bool dive(const MipProblem& p, DualSimplex& lp, DiveRule rule, const SimpleRound
     }
   };
   bool found = false;
-  for (int depth = 0;; ++depth) {
+  for (;;) {
     const double* x = lp.x();
     if (rounding.run(x, sol)) {
       found = true;

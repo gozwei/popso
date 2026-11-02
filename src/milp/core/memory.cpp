@@ -1,8 +1,17 @@
 #include "milp/core/memory.hpp"
 
 #if defined(__APPLE__)
+// Recent macOS SDKs use C11 _Static_assert in the Mach headers, which g++ does not accept in C++.
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_Static_assert)
+#define _Static_assert static_assert
+#define POPSO_DEFINED_STATIC_ASSERT
+#endif
 #include <mach/mach.h>
 #include <malloc/malloc.h>
+#ifdef POPSO_DEFINED_STATIC_ASSERT
+#undef _Static_assert
+#undef POPSO_DEFINED_STATIC_ASSERT
+#endif
 #elif defined(__linux__)
 #include <unistd.h>
 
@@ -11,9 +20,17 @@
 #include <malloc.h>
 #endif
 #elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <psapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "psapi.lib")  // also linked by CMake; keeps other build systems working
+#endif
 #endif
 
 namespace milp {

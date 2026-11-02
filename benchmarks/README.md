@@ -6,7 +6,7 @@ on it.
 
 ```
 benchmarks/
-  requirements.txt        highspy, pyscipopt, numpy
+  requirements.txt        highspy, pyscipopt, numpy (reference solves, generators; run.py needs only the standard library)
   generators/
     lp_sanity.py          hand-written tiny LP/MIP edge cases (MPS text)
     families.py           random instance families (model builders on lib/modeler.py)
@@ -19,8 +19,10 @@ benchmarks/
   miplib/download.py      downloads + decompresses the MIPLIB 2017 subset (dir is gitignored)
   run.py                  benchmark runner for our solver (verifies every answer)
   results/                run.py output: <timestamp>_<git-sha>.json/.csv
-  lib/                    shared helpers: MPS reader + verifier, modeler + MPS writer, .sol I/O, solver wrappers
+  lib/                    shared helpers: MPS reader + verifier, modeler + MPS/LP writers, .sol I/O, solver wrappers
   tools/highs_cli.py      HiGHS-based stand-in implementing our CLI contract (harness tests)
+  tools/lp_crosscheck.py  LP-reader check: every instance as LP must read to the same model as its MPS
+                          file (--highs N / --scip N: also solve LP files written by HiGHS / SCIP)
 ```
 
 ## Setup

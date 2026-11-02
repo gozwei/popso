@@ -2,6 +2,8 @@
 
 # popso
 
+[![ci](https://github.com/gozwei/popso/actions/workflows/ci.yml/badge.svg)](https://github.com/gozwei/popso/actions/workflows/ci.yml)
+
 **popso** (Polkowski's Optimization Solver) is an open-source solver for **mixed-integer linear programs (MILP)** and **linear programs
 (LP)**. It is written from scratch in C++20 using only the standard library.
 
@@ -34,8 +36,12 @@ cmake --build build -j 4
 ./build/popso_tests            # unit tests
 ```
 
-The solver is developed and benchmarked on macOS (Apple silicon). Linux and Windows builds
-are intended but are not yet tested regularly.
+On Windows with Visual Studio, add `--config Release` to the build command; the binaries are
+then in `build/Release/`.
+
+The solver is developed and benchmarked on macOS (Apple silicon). Continuous integration
+builds it and runs the unit tests and a small end-to-end check on Linux (gcc and clang),
+macOS (clang) and Windows (MSVC).
 
 ## Usage
 
@@ -43,7 +49,9 @@ are intended but are not yet tested regularly.
 ./build/popso model.mps --sol model.sol --time-limit 60 --threads 4
 ```
 
-The solver reads a model in MPS format (free or fixed) and prints a summary:
+The solver reads a model in MPS format (free or fixed) or in the CPLEX LP format and prints
+a summary. The format is chosen by the file extension (`.lp` is LP, anything else MPS,
+case-insensitive); `--format lp|mps` overrides it:
 
 ```
 Status: OPTIMAL
@@ -68,6 +76,8 @@ x1 1
 | option | meaning |
 |---|---|
 | `--sol <file>` | write the solution file |
+| `--start <file>` | starting solution in the same `name value` format; may be partial (see below) |
+| `--format <mps\|lp>` | input format (default: from the file extension) |
 | `--time-limit <sec>` | wall-clock time limit (default: none) |
 | `--threads <n>` | number of threads (0 = all cores, the default) |
 | `--gap <rel>` | relative optimality gap at which to stop (default 1e-4) |
@@ -80,13 +90,77 @@ x1 1
 | `--verbosity <0-3>` | 0 silent, 1 summary (default), 2 progress, 3 debug |
 | `--version` | print the version |
 
+**Starting solutions.** `--start` takes a solution file, for example one written by an earlier run
+with `--sol`. A complete feasible start becomes the first incumbent. If only some values are given, or
+the start is infeasible, the given integer values are fixed and the rest is completed by a short
+sub-MIP. If that fails, the start is ignored and the log says so.
+
+### C library
+
+The build also produces a shared library (`build/libpopso.dylib`, `libpopso.so` or `popso.dll`) with
+a C API declared in [`include/popso.h`](include/popso.h):
+
+```c
+#include "popso.h"
+
+popso_model* m = popso_create();
+int x, y;
+popso_add_var(m, 0.0, 10.0, 3.0, POPSO_INTEGER, "x", &x);
+popso_add_var(m, 0.0, POPSO_INFINITY, 4.0, POPSO_CONTINUOUS, "y", &y);
+int cols[2] = {x, y};
+double vals[2] = {1.0, 2.0};
+popso_add_row(m, 2, cols, vals, -POPSO_INFINITY, 14.0, "c1", NULL);  /* x + 2y <= 14 */
+popso_set_objective_sense(m, POPSO_MAXIMIZE);
+popso_set_param(m, "time_limit", 10.0);
+if (popso_solve(m) == POPSO_OK && popso_has_solution(m)) {
+  double obj, sol[2];
+  popso_get_objective(m, &obj);
+  popso_get_solution(m, sol, 2);
+}
+popso_free(m);
+```
+
+Models can also be read with `popso_read_mps`. Functions return error codes, and
+`popso_last_error` describes the last failure. Separate models can be solved from different threads
+at the same time. The library prints nothing unless you set the `verbosity` parameter.
+
+### Python
+
+The Python package in [`python/`](python) uses `ctypes` to load the shared library. It needs no
+compiled extension and no third-party packages.
+
+```python
+import popso
+
+m = popso.Model("example")
+x = m.add_var(ub=10, vtype=popso.INTEGER, name="x")
+y = m.add_var(name="y")
+m.add_constr(x + 2 * y <= 14)
+m.add_constr(3 * x - y >= 0)
+m.set_objective(3 * x + 4 * y, sense=popso.MAXIMIZE)
+m.set_start({x: 4})             # optional, may be partial
+r = m.solve(time_limit=10, threads=4)
+print(r.status, r.objective, r.bound, r[x], r["y"], r.nodes, r.time)
+
+m2 = popso.read_mps("model.mps")
+```
+
+To use it from a source checkout, add `python/` to `PYTHONPATH`. The library is then found in
+`build/`; you can also point `POPSO_LIBRARY` at it. To install the package, copy the library into the
+package and run pip:
+
+```sh
+cp build/libpopso.dylib python/popso/     # libpopso.so on Linux, popso.dll on Windows
+pip install ./python
+```
+
 ## What's inside
 
 - **LP:** bounded dual simplex with hyper-sparse LU factorization, Forrest–Tomlin updates and
   dual steepest-edge pricing, plus a primal simplex for cleanup.
-- **Presolve:** singleton rows and columns, bound and coefficient tightening, parallel rows and
-  columns, dominated columns, aggregation and substitution, probing and clique merging, with
-  full postsolve.
+- **Presolve:** singleton rows and columns, bound, coefficient and GCD tightening, parallel rows
+  and columns, dual fixing and dual bound strengthening, dominated columns, aggregation and
+  substitution, probing, clique merging and clique extension, with full postsolve.
 - **Cutting planes:**
   - Gomory mixed-integer cuts;
   - c-MIR cuts on aggregated rows;
@@ -117,9 +191,9 @@ x1 1
 - **Model features:** no SOS constraints, indicator constraints, or semi-continuous or
   semi-integer variables.
 - **Input and interfaces:**
-  - MPS input only; no LP-format reader.
-  - There is no library API, no language bindings and no callbacks; it is command line only.
-  - You cannot pass a starting solution.
+  - MPS and LP-format input only (no gzipped files).
+  - The C API and the Python bindings have no callbacks. They return no LP dual values or reduced
+    costs, and a running solve cannot be interrupted.
 - **LP algorithms:** dual simplex only. There is no barrier or interior-point method, so very
   large LPs are slow.
 - **Maturity:** this is young software. It is tuned on a limited benchmark set, and
@@ -129,8 +203,11 @@ x1 1
 
 ```
 src/milp/      the solver: core/ io/ lp/ presolve/ cuts/ heuristics/ search/ solver/
+include/       public C API header (popso.h)
+src/api/       C API implementation (shared library popso)
+python/        Python bindings (ctypes) and their tests
 apps/          command-line front end
-tests/         unit tests (own small harness, standard library only)
+tests/         unit tests (own small harness, standard library only) and C API tests
 benchmarks/    instance generators, reference results, benchmark runner (Python)
 docs/          plots
 ```

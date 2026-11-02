@@ -27,7 +27,10 @@ namespace {
 Model random_mkp(std::mt19937& rng, int n, int m) {
   ModelBuilder b;
   b.model().sense = ObjSense::Maximize;
-  std::uniform_int_distribution<int> w(10, 60), noise(0, 10);
+  // Plain modulo instead of std::uniform_int_distribution: the distributions are implementation-
+  // defined, the mt19937 sequence is not, so every standard library builds the same instances.
+  auto w = [](std::mt19937& g) { return 10 + static_cast<int>(g() % 51); };
+  auto noise = [](std::mt19937& g) { return static_cast<int>(g() % 11); };
   std::vector<std::vector<int>> a(m, std::vector<int>(n));
   std::vector<double> sum(m, 0.0);
   for (int i = 0; i < m; ++i) {
@@ -105,7 +108,7 @@ TEST(deterministic_mode_reproducible) {
 // first and still proves the optimum (same objective as without the cap), in both modes; the
 // deterministic one stays reproducible.
 TEST(memory_limit_drains_tree) {
-  std::mt19937 rng(77);
+  std::mt19937 rng(8);  // an instance of ~1300 nodes
   const Model m = random_mkp(rng, 90, 4);
   MipProblem p;
   CHECK(MipProblem::from_model(m, &p));
@@ -132,6 +135,7 @@ TEST(memory_limit_drains_tree) {
   CHECK(a.status == Status::Optimal);
   CHECK(std::abs(a.objective - ref.objective) <= 1e-6);
   const MipResult b = run(cap, 2, true), c = run(cap, 2, true);
+  if (b.status != Status::Optimal) std::printf("  b: status %d, %lld nodes, obj %g\n", (int)b.status, b.nodes, b.objective);
   CHECK(b.status == Status::Optimal);
   CHECK(std::abs(b.objective - ref.objective) <= 1e-6);
   CHECK_EQ(b.nodes, c.nodes);

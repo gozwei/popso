@@ -16,6 +16,7 @@
 #include "milp/search/branch_and_bound.hpp"
 #include "milp/search/symmetry.hpp"
 #include "milp/search/mip_problem.hpp"
+#include "milp/solver/start.hpp"
 
 namespace milp {
 
@@ -256,7 +257,9 @@ bool solve_presolved(const MipProblem& p, const SolverParams& params, const Logg
 }
 
 // Reduced problem as a user model (columns c<j>, rows r<i>; minimization).
-Model reduced_model(const MipProblem& q) {
+// With orig_names / col_map, columns keep their original names (diagnostics: diffs against other presolvers).
+Model reduced_model(const MipProblem& q, const std::vector<std::string>* orig_names = nullptr,
+                    const std::vector<Index>* col_map = nullptr) {
   Model m;
   m.name = "presolved";
   m.obj = q.cost;
@@ -268,7 +271,11 @@ Model reduced_model(const MipProblem& q) {
   m.A = q.A;
   for (Index j = 0; j < q.num_cols(); ++j) {
     m.col_type.push_back(q.is_int[j] ? VarType::Integer : VarType::Continuous);
-    m.col_names.push_back("c" + std::to_string(j));
+    if (orig_names && col_map && (*col_map)[j] < static_cast<Index>(orig_names->size())) {
+      m.col_names.push_back((*orig_names)[(*col_map)[j]]);
+    } else {
+      m.col_names.push_back("c" + std::to_string(j));
+    }
   }
   for (Index i = 0; i < q.num_rows(); ++i) m.row_names.push_back("r" + std::to_string(i));
   return m;
@@ -298,7 +305,8 @@ bool presolve_tool(const Model& model, const MipProblem& p, const Logger& log, S
             sym.num_generators(), sym.moved_cols, support, sym.log10_order(), sym.work, sym.seconds,
             sym.aborted ? " (aborted)" : "");
   }
-  const Model red = reduced_model(pre.reduced());
+  const bool keep_names = std::getenv("MILP_PRESOLVE_NAMES") != nullptr;  // original column names in the dump
+  const Model red = keep_names ? reduced_model(pre.reduced(), &model.col_names, &pre.col_map()) : reduced_model(pre.reduced());
   if (dump) write_mps(red, dump);
   if (check) {
     std::vector<double> xr = read_solution(check, red);
@@ -318,7 +326,9 @@ bool presolve_tool(const Model& model, const MipProblem& p, const Logger& log, S
 
 }  // namespace
 
-SolveResult solve(const Model& model, const SolverParams& params) {
+SolveResult solve(const Model& model, const SolverParams& params) { return solve(model, params, {}); }
+
+SolveResult solve(const Model& model, const SolverParams& params, const std::vector<double>& start) {
   Timer timer;
   Logger log(params.verbosity);
   SolveResult r;
@@ -344,13 +354,40 @@ SolveResult solve(const Model& model, const SolverParams& params) {
     }
     if (static_cast<Index>(opts.debug_point.size()) != p.num_cols()) opts.debug_point.clear();
   }
+  // User start: made feasible here (original columns), then followed through presolve as the first incumbent.
+  std::vector<double> start_x;
+  if (!start.empty()) {
+    StartOutcome so = prepare_start(p, start, params, timer);
+    log.log(1, "%s\n", so.message.c_str());
+    start_x = std::move(so.x);
+    opts.start = start_x;
+  }
   if (!params.presolve || !solve_presolved(p, params, log, timer, &mr, opts)) {
     // A failed presolved solve may still leave a valid bound (postsolve failure).
     const double presolved_bound = params.presolve && is_finite(mr.bound) ? mr.bound : -kInf;
-    mr = branch_and_bound(p, params, log, timer);
+    SearchOptions plain;
+    plain.start = start_x;
+    mr = branch_and_bound(p, params, log, timer, plain);
     if (presolved_bound > mr.bound && !(mr.has_solution && presolved_bound > mr.objective)) {
       mr.bound = presolved_bound;
     }
+  }
+  if (!start_x.empty()) {
+    // The start is feasible; the search may have lost it (presolve reductions can cut it off, and its
+    // objective then only served as a cutoff). Nothing better found means it is the answer.
+    const double so = p.objective(start_x);
+    if (!mr.has_solution || so < mr.objective) {
+      mr.has_solution = true;
+      mr.objective = so;
+      mr.x = start_x;
+      if (mr.status == Status::Infeasible) {
+        mr.status = Status::Optimal;
+        mr.bound = so;
+      } else if (mr.status == Status::InfeasibleOrUnbounded) {
+        mr.status = Status::Unbounded;
+      }
+    }
+    if (mr.status != Status::Unbounded) mr.bound = std::min(mr.bound, mr.objective);
   }
   r.status = mr.status;
   r.has_solution = mr.has_solution;

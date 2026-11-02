@@ -58,4 +58,8 @@ struct SolveResult {
 
 SolveResult solve(const Model& model, const SolverParams& params);
 
+// Solves with a starting solution: one value per model column, NaN = not given
+// (see start.hpp). An empty vector means no start.
+SolveResult solve(const Model& model, const SolverParams& params, const std::vector<double>& start);
+
 }  // namespace milp

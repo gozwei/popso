@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "milp/core/timer.hpp"
 
@@ -77,31 +78,63 @@ class PresolveWork {
       if (rlb_[i] > rub_[i]) return PresolveStatus::Infeasible;
     }
     bool probed = !opt_.probing;
+    int clique_runs = 0;
+    long long since_clique = 0;
     for (int round = 0; round < opt_.max_rounds + 10 && status_ == PresolveStatus::Reduced; ++round) {
       if (round >= opt_.max_rounds && probed) break;
       ++stats_.rounds;
       compact();
       long long ch = 0;
-      ch += column_pass();
-      if (status_ == PresolveStatus::Reduced) ch += row_pass(true);
-      if (status_ == PresolveStatus::Reduced && opt_.bound_tightening) ch += propagate();
-      if (status_ == PresolveStatus::Reduced) ch += column_pass();
-      if (status_ == PresolveStatus::Reduced && opt_.coef_tightening) ch += coef_tightening();
-      if (status_ == PresolveStatus::Reduced && opt_.dual_fixing) ch += dual_fixing();
-      if (status_ == PresolveStatus::Reduced && opt_.dominated_cols) ch += dominated_cols();
-      if (status_ == PresolveStatus::Reduced && opt_.parallel_rows) ch += parallel_rows();
-      if (status_ == PresolveStatus::Reduced && opt_.parallel_cols) ch += parallel_cols();
-      if (status_ == PresolveStatus::Reduced && opt_.aggregation) ch += aggregate();
-      if (status_ == PresolveStatus::Reduced && opt_.substitution) ch += substitute_equations();
+      // Each step is timed (verbosity 3 prints the totals).
+      auto step = [&](int k, bool on, auto&& f) {
+        if (!on || status_ != PresolveStatus::Reduced) return;
+        Timer t;
+        ch += f();
+        step_time_[k] += t.elapsed();
+      };
+      step(0, true, [&] { return column_pass(); });
+      step(1, true, [&] { return row_pass(true); });
+      step(2, opt_.bound_tightening, [&] { return propagate(); });
+      step(0, true, [&] { return column_pass(); });
+      step(3, opt_.coef_tightening, [&] { return coef_tightening(); });
+      step(4, opt_.dual_fixing, [&] { return dual_fixing(); });
+      step(5, opt_.dominated_cols, [&] { return dominated_cols(); });
+      step(6, opt_.parallel_rows, [&] { return parallel_rows(); });
+      step(7, opt_.parallel_cols, [&] { return parallel_cols(); });
+      step(8, opt_.aggregation, [&] { return aggregate(); });
+      step(9, opt_.substitution, [&] { return substitute_equations(); });
       log_.log(3, "Presolve round %d: %lld changes\n", round + 1, ch);
-      if ((ch == 0 || round + 1 >= opt_.max_rounds) && !probed && status_ == PresolveStatus::Reduced) {
+      since_clique += ch;
+      const bool last = round + 1 >= opt_.max_rounds;
+      if ((ch == 0 || last) && opt_.clique_extension && status_ == PresolveStatus::Reduced && clique_runs < 4 &&
+          (clique_runs == 0 || since_clique > 0)) {
+        // Clique extension whenever the other reductions are exhausted (and something changed since its last run):
+        // its fixings and dominated rows feed further rounds.
+        ++clique_runs;
+        since_clique = 0;
+        compact();
+        Timer tc;
+        ch = clique_extension();
+        step_time_[11] += tc.elapsed();
+        if (ch > 0 && !last) continue;
+      }
+      if ((ch == 0 || last) && !probed && status_ == PresolveStatus::Reduced) {
         // Probing once the cheap reductions are (nearly) exhausted, then a few more rounds.
         probed = true;
         compact();
+        Timer tp;
         ch = probing();
+        step_time_[10] += tp.elapsed();
         log_.log(3, "Presolve probing: %lld changes\n", ch);
       }
       if (ch == 0) break;
+    }
+    if (log_.verbosity() >= 3) {
+      static const char* names[] = {"columns", "rows", "propagate", "coef", "dual", "dominated", "parallel_rows",
+                                    "parallel_cols", "aggregate", "substitute", "probing", "cliqueext"};
+      std::string line = "Presolve step times:";
+      for (int k = 0; k < 12; ++k) line += " " + std::string(names[k]) + " " + std::to_string(step_time_[k]).substr(0, 5);
+      log_.log(3, "%s\n", line.c_str());
     }
     if (status_ == PresolveStatus::Reduced) column_pass();
     if (status_ == PresolveStatus::Reduced) row_pass(false);
@@ -442,13 +475,62 @@ class PresolveWork {
     return ch;
   }
 
+  // GCD tightening: in a row of integer columns with integral coefficients (|a| <= 1e9), the activity is a
+  // multiple of g = gcd(a): the sides are rounded to multiples of g (an equation with b not divisible by g is
+  // infeasible).
+  long long gcd_tightening() {
+    long long ch = 0;
+    for (Index i = 0; i < m_ && status_ == PresolveStatus::Reduced; ++i) {
+      if (!row_alive_[i] || row_size_[i] < 1) continue;
+      const bool has_lb = std::isfinite(rlb_[i]), has_ub = std::isfinite(rub_[i]);
+      if (!has_lb && !has_ub) continue;
+      long long g = 0;
+      for (const Entry& e : rows_[i]) {
+        if (!col_alive_[e.idx]) continue;
+        const double a = std::abs(e.val);
+        if (!is_int_[e.idx] || a > 1e9 || a != std::round(a)) {
+          g = -1;
+          break;
+        }
+        long long x = static_cast<long long>(a), y = g;
+        while (y != 0) {
+          const long long t = x % y;
+          x = y;
+          y = t;
+        }
+        g = x;
+      }
+      if (g <= 1) continue;
+      const double gd = static_cast<double>(g);
+      bool changed = false;
+      if (has_ub && std::abs(rub_[i]) < 1e12) {
+        const double v = gd * std::floor((rub_[i] + opt_.feas_tol) / gd);
+        if (v < rub_[i] - 1e-9) rub_[i] = v, changed = true;
+      }
+      if (has_lb && std::abs(rlb_[i]) < 1e12) {
+        const double v = gd * std::ceil((rlb_[i] - opt_.feas_tol) / gd);
+        if (v > rlb_[i] + 1e-9) rlb_[i] = v, changed = true;
+      }
+      if (rlb_[i] > rub_[i]) {
+        status_ = PresolveStatus::Infeasible;
+        log_.log(3, "Presolve: row %d has no integral solution (gcd %lld)\n", i, g);
+        return ch;
+      }
+      if (changed) {
+        ++stats_.coef_changes;
+        ++ch;
+      }
+    }
+    return ch;
+  }
+
   // Coefficient strengthening for integer columns in one-sided rows
   // (normalized to sum a_k x_k <= b with finite max activity M):
   //   a_j > 0, M - a_j < b:  a_j -= d, b -= d u_j  with d = b - (M - a_j)
   //   a_j < 0, M + a_j < b:  a_j += d, b += d l_j  with d = b - (M + a_j)
   long long coef_tightening() {
-    long long ch = 0;
-    for (Index i = 0; i < m_; ++i) {
+    long long ch = gcd_tightening();
+    for (Index i = 0; i < m_ && status_ == PresolveStatus::Reduced; ++i) {
       if (!row_alive_[i] || row_size_[i] < 2) continue;
       const bool has_lb = std::isfinite(rlb_[i]), has_ub = std::isfinite(rub_[i]);
       if (has_lb == has_ub) continue;
@@ -550,9 +632,89 @@ class PresolveWork {
           status_ = PresolveStatus::Unbounded;
           log_.log(3, "Presolve: column %d unbounded above by dual argument\n", j);
         }
+      } else {
+        // Dual bound strengthening: with c_j >= 0, x_j never needs to exceed the value at which every row
+        // locking it downwards holds for all values of the other columns (lowering x_j to it keeps those rows,
+        // only relaxes the others and does not increase the objective); symmetrically for c_j <= 0.
+        if (minact_.empty()) row_activities();
+        if (c >= 0.0 && std::isfinite(lb_[j])) ch += dual_bound(j, true);
+        else if (c < 0.0 && std::isfinite(ub_[j])) ch += dual_bound(j, false);  // one side per pass (snapshot)
       }
     }
+    minact_.clear();
     return ch;
+  }
+
+  // Row activity snapshot (minact_ / maxact_ with counts of infinite contributions).
+  void row_activities() {
+    minact_.assign(m_, 0.0);
+    maxact_.assign(m_, 0.0);
+    nmin_inf_.assign(m_, 0);
+    nmax_inf_.assign(m_, 0);
+    for (Index j = 0; j < n_; ++j) {
+      if (!col_alive_[j]) continue;
+      for (const Entry& e : cols_[j]) {
+        if (!row_alive_[e.idx]) continue;
+        const double bl = e.val > 0 ? lb_[j] : ub_[j], bh = e.val > 0 ? ub_[j] : lb_[j];
+        if (small_bound(bl)) minact_[e.idx] += e.val * bl; else ++nmin_inf_[e.idx];
+        if (small_bound(bh)) maxact_[e.idx] += e.val * bh; else ++nmax_inf_[e.idx];
+      }
+    }
+  }
+
+  // down: new upper bound of x_j from its down-locking rows (c_j >= 0); otherwise a lower bound from its
+  // up-locking rows (c_j <= 0). The snapshot activities are conservative: bounds only tighten during the pass.
+  int dual_bound(Index j, bool down) {
+    const double own = down ? lb_[j] : ub_[j];  // x_j's contribution at that bound is part of the snapshot
+    if (!small_bound(own)) return 0;
+    double v = down ? -kInf : kInf;
+    for (const Entry& e : cols_[j]) {
+      const Index i = e.idx;
+      if (!row_alive_[i]) continue;
+      const double a = e.val;
+      // Lowering x_j hurts a lower side for a > 0, an upper side for a < 0 (raising: the other way round).
+      const bool use_lb = down == (a > 0);
+      const double side = use_lb ? rlb_[i] : rub_[i];
+      if (!std::isfinite(side)) continue;
+      double w;
+      if (use_lb) {  // a x_j + minact(others) >= rlb
+        if (nmin_inf_[i] != 0) return 0;
+        w = (rlb_[i] - (minact_[i] - a * own)) / a;
+      } else {  // a x_j + maxact(others) <= rub
+        if (nmax_inf_[i] != 0) return 0;
+        w = (rub_[i] - (maxact_[i] - a * own)) / a;
+      }
+      v = down ? std::max(v, w) : std::min(v, w);
+    }
+    const double tol = 1e-9 * (1.0 + std::abs(v));
+    if (down) {
+      if (is_int_[j]) {
+        v = std::ceil(v - 1e-9 * (1.0 + std::abs(v)));
+      } else {
+        v += tol;
+        if (std::isfinite(ub_[j]) && v > ub_[j] - 1e-3 * std::max(1.0, std::abs(ub_[j]))) return 0;
+        if (std::abs(v) > kMaxContBound && v > lb_[j]) return 0;
+      }
+      v = std::max(v, lb_[j]);
+      if (!(v < ub_[j])) return 0;
+      if (log_.verbosity() >= 4) log_.log(4, "  dual bound: col %d ub %g -> %g\n", j, ub_[j], v);
+      ub_[j] = v;
+    } else {
+      if (is_int_[j]) {
+        v = std::floor(v + 1e-9 * (1.0 + std::abs(v)));
+      } else {
+        v -= tol;
+        if (std::isfinite(lb_[j]) && v < lb_[j] + 1e-3 * std::max(1.0, std::abs(lb_[j]))) return 0;
+        if (std::abs(v) > kMaxContBound && v < ub_[j]) return 0;
+      }
+      v = std::min(v, ub_[j]);
+      if (!(v > lb_[j])) return 0;
+      if (log_.verbosity() >= 4) log_.log(4, "  dual bound: col %d lb %g -> %g\n", j, lb_[j], v);
+      lb_[j] = v;
+    }
+    ++stats_.bound_changes;
+    ++stats_.dual_bounds;
+    return 1;
   }
 
   // Dominated columns: x_j dominates x_k if c_j <= c_k and moving a unit from x_k to x_j never hurts a row
@@ -615,7 +777,31 @@ class PresolveWork {
         }
         if (!dom) continue;
         double nub = ub_[k];
-        if (!j_unbounded) {
+        // With x_j = ub_j, lowering x_k to lb_k never hurts if c_k >= 0 and every row that locks x_k downwards
+        // still holds at x_k = lb_k for all values of the other columns: x_k = lb_k in some optimal solution
+        // either way (set covering: x_j covers every row of x_k at no more cost).
+        bool down_free = !j_unbounded && cost_[k] >= 0.0 && small_bound(ub_[j]);
+        for (const Entry& e : cols_[k]) {
+          if (!down_free) break;
+          const Index i = e.idx;
+          if (!row_alive_[i]) continue;
+          const double a = e.val;
+          const double aj = stamp_j[i] == j ? get_coef(i, j) : 0.0;
+          if (a > 0 && std::isfinite(rlb_[i])) {
+            const double jmin = aj > 0 ? lb_[j] : ub_[j];
+            const int inf = nmin_inf[i] - (aj != 0.0 && !small_bound(jmin) ? 1 : 0);
+            const double jc = aj != 0.0 && small_bound(jmin) ? aj * jmin : 0.0;
+            down_free = inf == 0 && minact[i] - jc + aj * ub_[j] >= rlb_[i] - 1e-9 * (1.0 + std::abs(rlb_[i]));
+          } else if (a < 0 && std::isfinite(rub_[i])) {
+            const double jmax = aj > 0 ? ub_[j] : lb_[j];
+            const int inf = nmax_inf[i] - (aj != 0.0 && !small_bound(jmax) ? 1 : 0);
+            const double jc = aj != 0.0 && small_bound(jmax) ? aj * jmax : 0.0;
+            down_free = inf == 0 && maxact[i] - jc + aj * ub_[j] <= rub_[i] + 1e-9 * (1.0 + std::abs(rub_[i]));
+          }
+        }
+        if (down_free) {
+          nub = lb_[k];
+        } else if (!j_unbounded) {
           // Bounds on x_k from its rows with x_j = ub_j (and the others at their activity bounds).
           for (const Entry& e : cols_[k]) {
             const Index i = e.idx;
@@ -1058,6 +1244,43 @@ class PresolveWork {
     return ch;
   }
 
+  // Clique extension of set-packing rows (clique_merge.hpp): fixings, added entries, dominated rows dropped.
+  long long clique_extension() {
+    MipProblem q;
+    std::vector<Index> cols, rows;
+    assemble(q, cols);
+    for (Index i = 0; i < m_; ++i) {
+      if (row_alive_[i]) rows.push_back(i);
+    }
+    static const double scale = [] {
+      const char* v = std::getenv("MILP_CLIQUE_EXT_WORK");
+      return v ? std::atof(v) : 1.0;
+    }();
+    const long long limit = static_cast<long long>(scale * (1.2e8 + 400.0 * q.A.nnz()));
+    Timer timer;
+    const CliqueExtension ce = find_clique_extensions(q, limit);
+    const CliqueExtendStats& cs = ce.stats;
+    stats_.clique_extended += cs.extended;
+    stats_.clique_dominated += cs.dominated;
+    stats_.clique_fixed += cs.fixed;
+    log_.log(3, "Clique extension: %d cliques, %d rows extended by %lld entries, %d dominated, %d fixed, work %lld, %.3fs\n",
+             cs.cliques, cs.extended, cs.added, cs.dominated, cs.fixed, cs.work, timer.elapsed());
+    long long ch = 0;
+    for (Index t : ce.fixed) ch += tighten(cols[t], lb_[cols[t]], 0.0, 0.0);
+    for (Index r : ce.removed) remove_row(rows[r]), ++ch;
+    for (const auto& [r, add] : ce.ext) {
+      const Index i = rows[r];
+      if (!row_alive_[i]) continue;
+      for (Index t : add) {
+        const Index j = cols[t];
+        if (col_alive_[j]) set_coef(i, j, 1.0);
+      }
+      rlb_[i] = -kInf;
+      ++ch;
+    }
+    return ch;
+  }
+
   void build() { assemble(out_.reduced_, out_.col_map_); }
 
   // The live problem as a MipProblem; cols receives the original index of each column.
@@ -1112,6 +1335,9 @@ class PresolveWork {
   std::vector<char> is_int_;
   std::vector<Index> mark_;  // scratch (new_entries)
   double offset_ = 0.0, display_sense_ = 1.0;
+  double step_time_[12] = {};
+  std::vector<double> minact_, maxact_;  // row activity snapshot (dual_fixing)
+  std::vector<int> nmin_inf_, nmax_inf_;
 };
 
 PresolveOptions PresolveOptions::from_env() {
@@ -1131,6 +1357,7 @@ PresolveOptions PresolveOptions::from_env() {
   if (off("dual")) o.dual_fixing = false;
   if (off("aggregation")) o.aggregation = false;
   if (off("cliques")) o.clique_merging = false;
+  if (off("cliqueext")) o.clique_extension = false;
   if (off("substitution")) o.substitution = false;
   if (off("probing")) o.probing = false;
   return o;
@@ -1163,9 +1390,15 @@ PresolveStatus Presolver::run(const MipProblem& in, const PresolveOptions& opt, 
   stats_.time = timer.elapsed();
   log.log(2,
           "Presolve details: %d rounds, %lld fixed cols, %lld removed rows, %lld bound changes, %lld coef changes, "
-          "%lld parallel rows, %lld parallel cols, %lld dominated cols, %lld aggregations, %lld substitutions\n",
+          "%lld parallel rows, %lld parallel cols, %lld dominated cols, %lld dual bounds, %lld aggregations, "
+          "%lld substitutions\n",
           stats_.rounds, stats_.fixed_cols, stats_.removed_rows, stats_.bound_changes, stats_.coef_changes,
-          stats_.parallel_rows, stats_.parallel_cols, stats_.dominated, stats_.aggregations, stats_.substitutions);
+          stats_.parallel_rows, stats_.parallel_cols, stats_.dominated, stats_.dual_bounds, stats_.aggregations,
+          stats_.substitutions);
+  if (opt.clique_extension) {
+    log.log(2, "Presolve cliques: %lld rows extended, %lld dominated rows, %lld fixed\n", stats_.clique_extended,
+            stats_.clique_dominated, stats_.clique_fixed);
+  }
   if (opt.probing) {
     log.log(2, "Presolve probing: %lld probes, %lld fixed, %lld bounds, %lld equivalences\n", stats_.probes,
             stats_.probing_fixed, stats_.probing_bounds, stats_.probing_equivs);

@@ -13,6 +13,7 @@
 //   - substitution of (implied) free columns and column singletons out of equations
 //   - probing on binaries: fixings, bound tightening, equivalences x = y / x = 1 - y
 
+#include <utility>
 #include <vector>
 
 #include "milp/core/log.hpp"
@@ -34,6 +35,7 @@ struct PresolveOptions {
   bool substitution = true;  // free column / column singleton substitution
   bool probing = true;
   bool clique_merging = true;
+  bool clique_extension = true;  // extend set-packing rows by the conflict graph of all rows
   double probing_effort = 1.0;  // scales the probing work limit
 
   // Defaults with switches from MILP_PRESOLVE_OFF, a comma-separated list of option names to disable
@@ -57,9 +59,11 @@ struct PresolveStats {
   long long parallel_rows = 0;
   long long parallel_cols = 0;
   long long dominated = 0;
+  long long dual_bounds = 0;  // dual bound strengthening
   long long aggregations = 0;
   long long substitutions = 0;
   long long probes = 0, probing_fixed = 0, probing_bounds = 0, probing_equivs = 0;
+  long long clique_extended = 0, clique_dominated = 0, clique_fixed = 0;
   int rounds = 0;
   double time = 0.0;
 };

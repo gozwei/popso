@@ -1,16 +1,19 @@
-// popso command-line interface: read an MPS model, solve it, report, and
+// popso command-line interface: read an MPS or LP model, solve it, report, and
 // optionally write a .sol file (common "name value" format).
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "milp/core/model.hpp"
 #include "milp/core/timer.hpp"
+#include "milp/io/lp_reader.hpp"
 #include "milp/io/mps_reader.hpp"
 #include "milp/io/solution.hpp"
 #include "milp/solver/solver.hpp"
@@ -19,9 +22,11 @@ namespace {
 
 void print_usage(std::FILE* out) {
   std::fprintf(out,
-               "usage: popso <model.mps> [options]\n"
+               "usage: popso <model.mps|model.lp> [options]\n"
                "options:\n"
                "  --sol <file>          write solution file (\"name value\" .sol format)\n"
+               "  --start <file>        starting solution (same format; may be partial)\n"
+               "  --format <mps|lp>     input format (default: from the file extension, .lp = LP, else MPS)\n"
                "  --time-limit <sec>    wall-clock time limit (default: none)\n"
                "  --threads <n>         number of threads (0 = all cores, default)\n"
                "  --verbosity <n>       0 silent, 1 summary (default), 2 progress, 3 debug\n"
@@ -49,6 +54,15 @@ double parse_double_arg(const char* opt, const char* s) {
   return v;
 }
 
+// Input format from --format, else from the extension (.lp, case-insensitive).
+bool is_lp_format(const std::string& format, const std::string& file) {
+  if (!format.empty()) return format == "lp";
+  if (file.size() < 3) return false;
+  std::string ext = file.substr(file.size() - 3);
+  for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return ext == ".lp";
+}
+
 long long parse_int_arg(const char* opt, const char* s) {
   char* end = nullptr;
   const long long v = std::strtoll(s, &end, 10);
@@ -59,7 +73,7 @@ long long parse_int_arg(const char* opt, const char* s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_path, sol_path;
+  std::string model_path, sol_path, start_path, format;
   milp::SolverParams params;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -75,6 +89,11 @@ int main(int argc, char** argv) {
       return 0;
     } else if (!std::strcmp(a, "--sol")) {
       sol_path = value();
+    } else if (!std::strcmp(a, "--start")) {
+      start_path = value();
+    } else if (!std::strcmp(a, "--format")) {
+      format = value();
+      if (format != "mps" && format != "lp") usage_error("format must be 'mps' or 'lp'");
     } else if (!std::strcmp(a, "--time-limit")) {
       params.time_limit = parse_double_arg(a, value());
       if (params.time_limit < 0) usage_error("time limit must be nonnegative");
@@ -118,7 +137,7 @@ int main(int argc, char** argv) {
   milp::Timer timer;
   milp::Model model;
   try {
-    model = milp::read_mps(model_path);
+    model = is_lp_format(format, model_path) ? milp::read_lp(model_path) : milp::read_mps(model_path);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "milp: error reading model: %s\n", e.what());
     return 1;
@@ -131,9 +150,19 @@ int main(int argc, char** argv) {
                 model.num_integers(), model.num_nonzeros(), read_time);
   }
 
+  std::vector<double> start;
+  if (!start_path.empty()) {
+    try {
+      start = milp::read_solution(start_path, model);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "popso: error reading start solution: %s\n", e.what());
+      return 1;
+    }
+  }
+
   milp::SolveResult result;
   try {
-    result = milp::solve(model, params);
+    result = milp::solve(model, params, start);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "milp: solver error: %s\n", e.what());
     return 1;

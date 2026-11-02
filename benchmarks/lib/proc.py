@@ -6,7 +6,8 @@ started by the benchmark tooling is memory-capped:
 * In-process (worker side): `limit_self(mb)` sets RLIMIT_AS / RLIMIT_DATA
   where the OS enforces them (Linux; macOS largely ignores them).
 * Parent side (portable, also macOS): `run_capped` polls the child's resident
-  set size via `ps` every 0.5 s and kills it when it exceeds the cap.
+  set size via `ps` every 0.5 s and kills it when it exceeds the cap. On
+  Windows it uses psutil if installed and otherwise only the wall-clock limit.
 """
 
 from __future__ import annotations
@@ -36,8 +37,24 @@ def limit_self(mb):
             pass
 
 
+def _rss_mb_psutil(pid):
+    import psutil  # optional; only used where `ps` is missing (Windows)
+    try:
+        p = psutil.Process(pid)
+        return sum(q.memory_info().rss for q in [p] + p.children()) / (1024.0 * 1024.0)
+    except psutil.Error:
+        return 0.0
+
+
 def _rss_mb(pid):
     """Resident set size (MB) of pid plus its direct children."""
+    if os.name == "nt":
+        # No `ps` / `pgrep`: use psutil if it is installed, otherwise no watchdog (the solver
+        # still gets --mem-limit and enforces it itself).
+        try:
+            return _rss_mb_psutil(pid)
+        except ImportError:
+            return 0.0
     try:
         out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5).stdout.split()
@@ -74,12 +91,13 @@ def run_capped(cmd, timeout, mem_mb=None, stdout=None, stderr=None, poll=0.5):
         if time.perf_counter() - t0 > timeout:
             reason = "timeout"
         if reason:
-            try:
-                for k in subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True,
-                                        text=True).stdout.split():
-                    os.kill(int(k), 9)
-            except (OSError, ValueError):
-                pass
+            if os.name != "nt":  # no pgrep on Windows; the solver starts no child processes
+                try:
+                    for k in subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True,
+                                            text=True).stdout.split():
+                        os.kill(int(k), 9)
+                except (OSError, ValueError):
+                    pass
             p.kill()
             p.wait()
             rc = None
