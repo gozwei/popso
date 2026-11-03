@@ -32,6 +32,8 @@ void print_usage(std::FILE* out) {
                "  --verbosity <n>       0 silent, 1 summary (default), 2 progress, 3 debug\n"
                "  --gap <rel>           relative MIP gap tolerance (default 1e-4)\n"
                "  --no-presolve         disable presolve\n"
+               "  --lp-method <m>       LP algorithm for pure LPs and the MIP root LP: auto (default),\n"
+               "                        simplex (dual simplex) or barrier (interior point + crossover)\n"
                "  --mem-limit <MB>      approximate search-tree memory cap (default 4096)\n"
                "  --seed <n>            random seed (default 0)\n"
                "  --node-limit <n>      stop after n branch-and-bound nodes (default: none)\n"
@@ -108,6 +110,12 @@ int main(int argc, char** argv) {
       if (params.mip_rel_gap < 0) usage_error("gap must be nonnegative");
     } else if (!std::strcmp(a, "--no-presolve")) {
       params.presolve = false;
+    } else if (!std::strcmp(a, "--lp-method")) {
+      const std::string m = value();
+      if (m == "auto") params.lp_method = milp::LpMethod::Auto;
+      else if (m == "simplex") params.lp_method = milp::LpMethod::Simplex;
+      else if (m == "barrier") params.lp_method = milp::LpMethod::Barrier;
+      else usage_error("lp-method must be 'auto', 'simplex' or 'barrier'");
     } else if (!std::strcmp(a, "--opportunistic")) {
       params.deterministic = false;
     } else if (!std::strcmp(a, "--racing")) {

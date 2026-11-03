@@ -68,7 +68,7 @@ def worker(solver, path, time_limit, threads, mem_mb):
         res["verify"] = {
             "feasible": v.feasible,
             "objective": v.objective,
-            "max_viol": max(v.max_bound_viol, v.max_int_viol, v.max_row_viol),
+            "max_viol": max(v.max_bound_viol, v.max_int_viol, v.max_row_viol, v.max_logic_viol),
             "worst": v.worst,
         }
     print(json.dumps(res))

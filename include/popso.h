@@ -24,6 +24,10 @@
  *    used from different threads concurrently. Note that the memory limit is
  *    also checked against the resident size of the whole process.
  *  - Changing the model discards the last result.
+ *  - Besides linear rows, a model may have semi-continuous and semi-integer
+ *    variables, SOS1/SOS2 constraints and indicator constraints. They are
+ *    reformulated with auxiliary binaries internally; solutions and queries
+ *    refer to the variables of the model only.
  *  - The library is silent by default (verbosity 0); the log goes to stdout.
  *
  * The header is C99 and C++ compatible. Link against the shared library
@@ -68,6 +72,12 @@ extern "C" {
 #define POPSO_CONTINUOUS 0
 #define POPSO_INTEGER 1
 #define POPSO_BINARY 2 /* integer with bounds clamped to [0, 1] */
+#define POPSO_SEMICONTINUOUS 3 /* x = 0 or lb <= x <= ub */
+#define POPSO_SEMIINTEGER 4    /* x = 0 or lb <= x <= ub, x integer */
+
+/* SOS types. */
+#define POPSO_SOS1 1 /* at most one member nonzero */
+#define POPSO_SOS2 2 /* at most two members nonzero, adjacent in the order of their weights */
 
 /* Objective sense. */
 #define POPSO_MINIMIZE 1
@@ -111,7 +121,11 @@ POPSO_API void popso_free(popso_model* m); /* NULL is ignored */
  * Parameters and the start solution are kept; the start is cleared if the
  * number of variables changes. */
 POPSO_API int popso_read_mps(popso_model* m, const char* filename);
-/* Writes the model as free MPS. */
+/* Replaces the model by the contents of a CPLEX LP-format file (same rules
+ * as popso_read_mps). */
+POPSO_API int popso_read_lp(popso_model* m, const char* filename);
+/* Writes the model as free MPS (with SC bounds, SOS and INDICATORS sections
+ * for the logical constraints). */
 POPSO_API int popso_write_mps(popso_model* m, const char* filename);
 
 /* ---- Building a model ------------------------------------------------- */
@@ -139,6 +153,18 @@ POPSO_API int popso_add_row(popso_model* m, int nnz, const int* cols, const doub
 POPSO_API int popso_add_rows(popso_model* m, int count, const int* starts, const int* cols, const double* vals,
                              const double* lb, const double* ub, const char* const* names);
 
+/* Adds an SOS constraint of type POPSO_SOS1 or POPSO_SOS2 over nnz distinct
+ * variables. weights (may be NULL: 1, 2, ..., nnz) order the members; they
+ * must be distinct. index (may be NULL) receives the SOS index. */
+POPSO_API int popso_add_sos(popso_model* m, int type, int nnz, const int* vars, const double* weights,
+                            const char* name, int* index);
+/* Adds an indicator constraint: if variable binvar (which must be binary)
+ * equals binval (0 or 1), then lb <= sum_k vals[k] * x[cols[k]] <= ub must
+ * hold; otherwise the row is ignored. index (may be NULL) receives the
+ * indicator's index. */
+POPSO_API int popso_add_indicator(popso_model* m, int binvar, int binval, int nnz, const int* cols,
+                                  const double* vals, double lb, double ub, const char* name, int* index);
+
 POPSO_API int popso_set_var_bounds(popso_model* m, int var, double lb, double ub);
 POPSO_API int popso_set_var_type(popso_model* m, int var, int vtype);
 POPSO_API int popso_set_row_bounds(popso_model* m, int row, double lb, double ub);
@@ -154,6 +180,8 @@ POPSO_API int popso_set_objective(popso_model* m, int nnz, const int* vars, cons
 
 POPSO_API int popso_num_vars(const popso_model* m);
 POPSO_API int popso_num_rows(const popso_model* m);
+POPSO_API int popso_num_sos(const popso_model* m);
+POPSO_API int popso_num_indicators(const popso_model* m);
 POPSO_API long long popso_num_nonzeros(popso_model* m);
 POPSO_API int popso_get_objective_sense(const popso_model* m);
 POPSO_API double popso_get_objective_constant(const popso_model* m);
@@ -180,7 +208,9 @@ POPSO_API int popso_find_var(popso_model* m, const char* name);
  *   mem_limit      approximate memory cap in MB (default 4096)
  *   node_limit     branch-and-bound node limit, -1 = none (default)
  *   presolve       1 = on (default), 0 = off
- *   racing         number of concurrently racing searches (default 1) */
+ *   racing         number of concurrently racing searches (default 1)
+ *   lp_method      LP algorithm for pure LPs and the MIP root LP: 0 auto (default),
+ *                  1 dual simplex, 2 barrier (interior point with crossover) */
 POPSO_API int popso_set_param(popso_model* m, const char* name, double value);
 POPSO_API int popso_get_param(const popso_model* m, const char* name, double* value);
 

@@ -16,6 +16,7 @@
 #include "milp/search/branch_and_bound.hpp"
 #include "milp/search/symmetry.hpp"
 #include "milp/search/mip_problem.hpp"
+#include "milp/solver/reformulate.hpp"
 #include "milp/solver/start.hpp"
 
 namespace milp {
@@ -35,6 +36,15 @@ const char* to_string(Status s) {
     case Status::NumericalError: return "NUMERIC";
   }
   return "UNKNOWN";
+}
+
+const char* to_string(LpMethod m) {
+  switch (m) {
+    case LpMethod::Auto: return "auto";
+    case LpMethod::Simplex: return "simplex";
+    case LpMethod::Barrier: return "barrier";
+  }
+  return "auto";
 }
 
 namespace {
@@ -324,18 +334,21 @@ bool presolve_tool(const Model& model, const MipProblem& p, const Logger& log, S
   return true;
 }
 
-}  // namespace
-
-SolveResult solve(const Model& model, const SolverParams& params) { return solve(model, params, {}); }
-
-SolveResult solve(const Model& model, const SolverParams& params, const std::vector<double>& start) {
-  Timer timer;
-  Logger log(params.verbosity);
+// Solves a plain MILP; `implications` (logical constraints without a big-M form) go into the
+// searched problem, and presolve is skipped when there are any.
+SolveResult solve_plain(const Model& model, const std::vector<Implication>& implications, const SolverParams& params_in,
+                        const std::vector<double>& start, const Timer& timer, const Logger& log) {
   SolveResult r;
   MipProblem p;
   if (!MipProblem::from_model(model, &p)) {
     r.status = Status::Infeasible;
     return r;
+  }
+  p.implications = implications;
+  SolverParams params = params_in;
+  if (!implications.empty() && params.presolve) {
+    log.log(1, "Presolve: skipped (%zu logical implications)\n", implications.size());
+    params.presolve = false;
   }
   const double sense = model.sense == ObjSense::Maximize ? -1.0 : 1.0;
   if (params.presolve && presolve_tool(model, p, log, &r)) return r;
@@ -401,6 +414,66 @@ SolveResult solve(const Model& model, const SolverParams& params, const std::vec
   r.stats.nodes = mr.nodes;
   r.stats.lp_iterations = mr.lp_iterations;
   r.stats.root_bound = sense * mr.root_bound;
+  return r;
+}
+
+// Values within the tolerance of zero that the logical constraints require to be zero (a semi-continuous
+// column below its lower bound, SOS members outside the nonzero pattern) are set to exactly 0, if that
+// does not make the point less feasible.
+void snap_logical(const Model& model, std::vector<double>& x) {
+  constexpr double kSnap = 1e-5;
+  std::vector<double> y = x;
+  for (Index j = 0; j < model.num_cols(); ++j) {
+    if (!is_semi_type(model.col_type[j]) || std::abs(y[j]) > kSnap) continue;
+    if (y[j] < model.col_lb[j] || y[j] > model.col_ub[j]) y[j] = 0.0;
+  }
+  for (const SosConstraint& s : model.sos) {
+    // Keep the largest member (SOS1) or the pair of neighbours with the largest values (SOS2).
+    const size_t k = s.cols.size();
+    std::vector<size_t> ord(k);
+    for (size_t t = 0; t < k; ++t) ord[t] = t;
+    std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return s.weights[a] < s.weights[b]; });
+    size_t keep = 0;
+    double best = -1.0;
+    const size_t span = s.type == 2 ? 2 : 1;
+    for (size_t t = 0; t + span <= k; ++t) {
+      double v = 0.0;
+      for (size_t u = t; u < t + span; ++u) v = std::max(v, std::abs(y[s.cols[ord[u]]]));
+      if (v > best) best = v, keep = t;
+    }
+    for (size_t t = 0; t < k; ++t) {
+      const Index j = s.cols[ord[t]];
+      if ((t < keep || t >= keep + span) && std::abs(y[j]) <= kSnap) y[j] = 0.0;
+    }
+  }
+  if (y != x && model.violation(y).max() <= std::max(1e-9, model.violation(x).max())) x = std::move(y);
+}
+
+}  // namespace
+
+SolveResult solve(const Model& model, const SolverParams& params) { return solve(model, params, {}); }
+
+SolveResult solve(const Model& model, const SolverParams& params, const std::vector<double>& start) {
+  Timer timer;
+  Logger log(params.verbosity);
+  if (!model.has_logical()) return solve_plain(model, {}, params, start, timer, log);
+  // Semi-continuous columns, SOS sets, indicator constraints: solved as a plain MILP with auxiliary
+  // binaries (reformulate.hpp). MILP_LOGIC_BIGM overrides params.logic_big_m (diagnostics).
+  const char* env_big_m = std::getenv("MILP_LOGIC_BIGM");
+  const LogicalReformulation R = reformulate_logical(model, env_big_m ? std::atof(env_big_m) : params.logic_big_m);
+  log.log(1, "Logical constraints: %d semi-continuous, %zu SOS, %zu indicator -> %d auxiliary columns, %d rows (%d with big-M), "
+          "%zu implications\n", model.num_semi(), model.sos.size(), model.indicators.size(), R.aux_cols, R.aux_rows,
+          R.big_m, R.implications.size());
+  const std::vector<double> st = start.empty() ? start : R.extend(start);
+  SolveResult r = solve_plain(R.model, R.implications, params, st, timer, log);
+  if (r.has_solution) {
+    r.x.resize(static_cast<size_t>(model.num_cols()));
+    snap_logical(model, r.x);
+    r.objective = model.objective_value(r.x);
+    const double viol = model.violation(r.x).max();
+    if (!(viol <= 1e-5)) log.log(1, "WARNING: solution violates the logical constraints by %.3g\n", viol);
+  }
+  r.stats.time = timer.elapsed();
   return r;
 }
 

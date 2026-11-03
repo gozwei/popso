@@ -48,6 +48,7 @@ bool local_branching(const MipProblem& p, const std::vector<double>& incumbent, 
   q.is_int = p.is_int;
   q.offset = p.offset;
   q.display_sense = p.display_sense;
+  q.implications = p.implications;
   q.row_lb = p.row_lb;
   q.row_ub = p.row_ub;
   q.A.num_major = n;

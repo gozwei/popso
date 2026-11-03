@@ -426,8 +426,13 @@ TEST(mps_errors) {
   CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj\nENDATA\n", "COLUMNS: expected"));
   CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nBOUNDS\n UP BND y 1\nENDATA\n",
                        "column 'y' in BOUNDS does not appear in COLUMNS"));
-  CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nBOUNDS\n SC BND x 1\nENDATA\n",
-                       "semi-continuous bounds (SC) are not supported"));
+  CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nSOS\n x 1\nENDATA\n", "member line before a set header"));
+  CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nSOS\n S1 SOS s\n y 1\nENDATA\n",
+                       "column 'y' in SOS does not appear"));
+  CHECK(error_contains("NAME t\nROWS\n N obj\n L c\nCOLUMNS\n x c 1\nINDICATORS\n IF c x 2\nENDATA\n",
+                       "the value must be 0 or 1"));
+  CHECK(error_contains("NAME t\nROWS\n N obj\n L c\nCOLUMNS\n x c 1\nINDICATORS\n IF obj x 1\nENDATA\n",
+                       "objective (N) row"));
   CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nBOUNDS\n XX BND x 1\nENDATA\n", "invalid bound type"));
   CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nBOUNDS\n UP BND x\nENDATA\n", "BOUNDS: expected"));
   CHECK(error_contains("NAME t\nROWS\n N obj\nCOLUMNS\n x obj 1\nQUADOBJ\n x x 1\nENDATA\n", "unsupported MPS section"));

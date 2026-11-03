@@ -32,11 +32,13 @@ struct CutLoopStats {
 // packing slower without helping the heuristics).
 // `dropped` (optional): receives the cuts removed from the LP for slack (globally valid; seed of
 // the node cut pool).
+// `cutoff_fn` (optional): the current cutoff for reduced-cost fixing in the LP between rounds.
 CutLoopStats root_cut_loop(const MipProblem& p, DualSimplex& lp, const SolverParams& params, const Logger& log,
                            const Timer& timer, double cutoff, CutData* data = nullptr, bool sub_mip = false,
                            std::vector<Cut>* dropped = nullptr,
                            const std::function<void(const DualSimplex&)>& on_lp = {},
-                           const std::atomic<bool>* stop = nullptr);
+                           const std::atomic<bool>* stop = nullptr,
+                           const std::function<double()>& cutoff_fn = {});
 
 struct CutLoopOptions {
   int max_rounds = 30;
@@ -70,6 +72,9 @@ struct CutLoopOptions {
   // Optional: no further round once set (a sub-MIP whose caller stops, e.g. the FJ thread's
   // mutation sub-MIPs when the root restarts; its join waited for a whole sub-MIP root before).
   const std::atomic<bool>* stop = nullptr;
+  // Optional: the current cutoff (objective without offset, +inf none): reduced-cost fixing in the LP
+  // between rounds (see cut_loop.cpp; the fixed bounds are restored at the end).
+  std::function<double()> cutoff_fn;
 };
 
 // The loop behind root_cut_loop. If `all_cuts` is given, every cut added to

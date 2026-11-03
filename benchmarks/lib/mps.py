@@ -9,7 +9,10 @@ spaces), optional .gz, NAME, OBJSENSE (inline or as a section; MIN/MAX/
 MINIMIZE/MAXIMIZE), OBJSENSE/OBJSENSE MAX, ROWS (N/L/G/E; first N row is the
 objective, other N rows are dropped), COLUMNS with integer MARKER blocks, RHS
 (RHS on the objective row = negated objective constant), RANGES, BOUNDS
-(UP/LO/FX/FR/MI/PL/BV/LI/UI), ENDATA.  Comment lines start with '*'.
+(UP/LO/FX/FR/MI/PL/BV/LI/UI, SC/SI semi-continuous / semi-integer), SOS
+(" S1 SOS name prio" or " S1 name" headers, "col weight" members),
+INDICATORS (" IF row col value": the row only has to hold when the column
+equals the value), ENDATA.  Comment lines start with '*'.
 
 Semantics (common MPS conventions, as in HiGHS/SCIP):
   * Default bounds [0, +inf].  EXCEPTION (verified to match HiGHS 1.15 and
@@ -24,6 +27,10 @@ Semantics (common MPS conventions, as in HiGHS/SCIP):
   * BV: integer, bounds [0, 1].  LI/UI: integer + lower/upper bound.
   * RANGES R on row with rhs b:  L: [b-|R|, b]; G: [b, b+|R|];
     E: R>0 -> [b, b+R], R<0 -> [b+R, b].
+  * SC bound: semi-continuous (semi-integer on an integer column) with the
+    value as upper bound: x = 0 or lb <= x <= ub.  SI: semi-integer.
+  * SOS1: at most one member nonzero; SOS2: at most two, adjacent in the
+    order of the weights.
 """
 
 from __future__ import annotations
@@ -60,6 +67,10 @@ class Model:
     row_cols: list = field(default_factory=list)
     row_vals: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    semi: list = field(default_factory=list)  # per column: semi-continuous / semi-integer
+    sos: list = field(default_factory=list)  # (name, type, [col], [weight])
+    # (name, binary col, value, lo, hi, [col], [val])
+    indicators: list = field(default_factory=list)
 
     @property
     def num_vars(self):
@@ -86,7 +97,7 @@ class Model:
         )
 
     def stats(self):
-        return {
+        st = {
             "num_vars": self.num_vars,
             "num_cons": self.num_cons,
             "num_nonzeros": self.num_nonzeros,
@@ -94,6 +105,13 @@ class Model:
             "num_binaries": self.num_binaries,
             "sense": "max" if self.sense < 0 else "min",
         }
+        if any(self.semi):
+            st["num_semi"] = sum(1 for v in self.semi if v)
+        if self.sos:
+            st["num_sos"] = len(self.sos)
+        if self.indicators:
+            st["num_indicators"] = len(self.indicators)
+        return st
 
 
 def _open(path):
@@ -122,6 +140,7 @@ def read_mps(path) -> Model:
     obj_rows_extra = set()
     col_obj = {}
     entries = []  # (row_name, col_idx, val)
+    ind_specs = []  # (row name, col idx, value)
 
     def col_id(name, integer):
         idx = m.col_index.get(name)
@@ -133,6 +152,7 @@ def read_mps(path) -> Model:
             m.lb.append(0.0)
             m.ub.append(INF)
             m.is_int.append(integer)
+            m.semi.append(False)
             lb_set.append(False)
             has_bound.append(False)
         return idx
@@ -153,7 +173,7 @@ def read_mps(path) -> Model:
                     section = "OBJSENSE"
                     if len(toks) > 1:
                         _set_sense(m, toks[1])
-                elif head in ("ROWS", "COLUMNS", "RHS", "RANGES", "BOUNDS"):
+                elif head in ("ROWS", "COLUMNS", "RHS", "RANGES", "BOUNDS", "SOS", "INDICATORS"):
                     section = head
                 elif head == "ENDATA":
                     break
@@ -161,8 +181,7 @@ def read_mps(path) -> Model:
                     section = "OBJNAME"
                     if len(toks) > 1:
                         m.obj_name = toks[1]
-                elif head in ("SOS", "QUADOBJ", "QMATRIX", "QSECTION", "QCMATRIX",
-                              "INDICATORS", "GENERAL", "PWLOBJ"):
+                elif head in ("QUADOBJ", "QMATRIX", "QSECTION", "QCMATRIX", "GENERAL", "PWLOBJ"):
                     raise MPSError(f"unsupported section {head}")
                 else:
                     raise MPSError(f"line {lineno}: unknown section {head!r}")
@@ -227,8 +246,60 @@ def read_mps(path) -> Model:
                     if rname not in m.row_index:
                         raise MPSError(f"line {lineno}: unknown row {rname}")
                     target[rname] = val
+            elif section == "SOS":
+                t0 = toks[0].upper()
+                is_header = t0 in ("S1", "S2") and (len(toks) == 1 or toks[1].upper() == "SOS"
+                                                     or not _is_number(toks[1]))
+                if is_header:
+                    k = 2 if len(toks) > 1 and toks[1].upper() == "SOS" else 1
+                    sname = toks[k] if len(toks) > k else f"SOS{len(m.sos) + 1}"
+                    m.sos.append((sname, int(t0[1]), [], []))
+                    continue
+                if not m.sos:
+                    raise MPSError(f"line {lineno}: SOS member before a set header")
+                if len(toks) == 1 and ":" in toks[0]:
+                    cname, w = toks[0].split(":", 1)
+                    w = _float(w)
+                elif len(toks) == 2:
+                    cname, w = toks[0], _float(toks[1])
+                elif len(toks) == 1:
+                    cname, w = toks[0], float(len(m.sos[-1][2]) + 1)
+                else:
+                    raise MPSError(f"line {lineno}: bad SOS line")
+                if cname not in m.col_index:
+                    raise MPSError(f"line {lineno}: unknown column {cname}")
+                m.sos[-1][2].append(m.col_index[cname])
+                m.sos[-1][3].append(w)
+            elif section == "INDICATORS":
+                if toks[0].upper() != "IF" or len(toks) not in (3, 4):
+                    raise MPSError(f"line {lineno}: bad INDICATORS line")
+                if toks[1] not in m.row_index or toks[2] not in m.col_index:
+                    raise MPSError(f"line {lineno}: unknown row or column")
+                val = int(_float(toks[3])) if len(toks) == 4 else 1
+                ind_specs.append((toks[1], m.col_index[toks[2]], val))
             elif section == "BOUNDS":
                 t = toks[0].upper()
+                if t in ("SC", "SI"):
+                    # semi-continuous / semi-integer; the value (if any) is the upper bound
+                    if len(toks) == 2:
+                        cname, val = toks[1], None
+                    elif len(toks) == 3:
+                        if toks[1] in m.col_index and _is_number(toks[2]):
+                            cname, val = toks[1], _float(toks[2])
+                        else:
+                            cname, val = toks[2], None
+                    else:
+                        cname, val = toks[2], _float(toks[3])
+                    if cname not in m.col_index:
+                        raise MPSError(f"line {lineno}: unknown column {cname}")
+                    j = m.col_index[cname]
+                    has_bound[j] = True
+                    m.semi[j] = True
+                    if t == "SI":
+                        m.is_int[j] = True
+                    if val is not None:
+                        m.ub[j] = INF if val >= 1e30 else val
+                    continue
                 novalue = t in ("FR", "MI", "PL", "BV")
                 if novalue:
                     if len(toks) == 2:
@@ -315,7 +386,30 @@ def read_mps(path) -> Model:
                     lo = b + r
         m.row_lo.append(lo)
         m.row_hi.append(hi)
+    if ind_specs:
+        # indicator rows are not ordinary rows
+        drop = set()
+        for rname, b, val in ind_specs:
+            i = m.row_index[rname]
+            drop.add(i)
+            m.indicators.append((rname, b, val, m.row_lo[i], m.row_hi[i], m.row_cols[i], m.row_vals[i]))
+        keep = [i for i in range(nrows) if i not in drop]
+        m.row_names = [m.row_names[i] for i in keep]
+        m.row_type = [m.row_type[i] for i in keep]
+        m.row_lo = [m.row_lo[i] for i in keep]
+        m.row_hi = [m.row_hi[i] for i in keep]
+        m.row_cols = [m.row_cols[i] for i in keep]
+        m.row_vals = [m.row_vals[i] for i in keep]
+        m.row_index = {n: k for k, n in enumerate(m.row_names)}
     return m
+
+
+def _is_number(tok):
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
 
 
 def _set_sense(m, tok):
@@ -341,6 +435,7 @@ class Verification:
     max_row_viol: float
     worst: str  # description of the worst violation
     missing: int  # number of variables missing from the solution
+    max_logic_viol: float = 0.0  # SOS sets and active indicator rows
 
     def to_dict(self):
         return dict(self.__dict__)
@@ -373,7 +468,9 @@ def verify(m: Model, values: dict, feastol=1e-6, inttol=1e-6) -> Verification:
         if not math.isfinite(xj):
             return Verification(False, math.nan, INF, INF, INF,
                                 f"non-finite value for {m.col_names[j]}", missing)
-        if xj < m.lb[j]:
+        if m.semi[j] and abs(xj) <= feastol:
+            pass  # semi-continuous at 0
+        elif xj < m.lb[j]:
             v = _scaled_viol(m.lb[j] - xj, m.lb[j])
             if v > mb:
                 mb = v
@@ -406,5 +503,27 @@ def verify(m: Model, values: dict, feastol=1e-6, inttol=1e-6) -> Verification:
                 mr = v
             if v > worst_v:
                 worst_v, worst = v, f"row {m.row_names[i]} activity {act} > {hi}"
-    feasible = mb <= feastol and mr <= feastol and mi <= inttol
-    return Verification(feasible, objective(m, x), mb, mi, mr, worst, missing)
+    ml = 0.0
+    for sname, t, cols, weights in m.sos:
+        vals = [abs(x[j]) for _, j in sorted(zip(weights, cols))]
+        if len(vals) <= t:
+            continue
+        if t == 1:
+            v = sorted(vals)[-2]
+        else:  # largest member outside the best pair of neighbours
+            v = min(max(vals[:k] + vals[k + 2:], default=0.0) for k in range(len(vals) - 1))
+        if v > ml:
+            ml = v
+        if v > worst_v:
+            worst_v, worst = v, f"SOS{t} {sname} violated by {v}"
+    for iname, b, val, lo, hi, cols, vals in m.indicators:
+        if abs(x[b] - val) >= 0.5:
+            continue
+        act = math.fsum(a * x[j] for j, a in zip(cols, vals))
+        v = max(_scaled_viol(lo - act, lo) if act < lo else 0.0, _scaled_viol(act - hi, hi) if act > hi else 0.0)
+        if v > ml:
+            ml = v
+        if v > worst_v:
+            worst_v, worst = v, f"indicator {iname} activity {act} outside [{lo}, {hi}]"
+    feasible = mb <= feastol and mr <= feastol and mi <= inttol and ml <= feastol
+    return Verification(feasible, objective(m, x), mb, mi, mr, worst, missing, ml)

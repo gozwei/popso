@@ -10,7 +10,10 @@
 // were tried as well: they gave similar bounds at a much higher cost.) Paths
 // also start from purely continuous rows (single-commodity balances reach the
 // integer capacity modules of multi-commodity models through the capacity
-// rows) and yield up to kCutsPerPath cuts from successive aggregations.
+// rows) and yield up to kCutsPerPath cuts from successive aggregations. Once no continuous column
+// is left to eliminate, the path continues through the integer column farthest from its bounds
+// (general integers first): on pure integer models (mzzv11) single rows give almost no c-MIR cut,
+// while aggregations linking a general integer's defining row to its capacity rows do.
 //
 // The base sum a_j x_j <= b is transformed so that every variable is nonnegative:
 //   continuous x_j = l_j + x'_j | u_j - x'_j | d + c y + x'_j (VLB) | d + c y - x'_j (VUB)
@@ -26,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 
@@ -116,6 +120,8 @@ class MirSeparator : public Separator {
 
   const SepaContext* ctx_ = nullptr;
   long long work_count_ = 0;
+  long long int_budget_ = 0;  // integer path steps only while work_count_ is below this (per call)
+  double int_work_per_nnz_ = [] { const char* v = std::getenv("MILP_MIR_INTAGG_WORK"); return v ? std::atof(v) : 20.0; }();
   Index n_ = 0;
   std::vector<double> agg_, icoef_, dense_;
   std::vector<Index> nz_, inz_, used_;
@@ -138,6 +144,13 @@ class MirSeparator : public Separator {
   // A flow cover replaces the c-MIR cut of an aggregation only if its efficacy is fc_win_ times higher
   // (MILP_FC_WIN; default never: flow covers only where c-MIR finds nothing, see aggregate_path).
   double fc_win_ = 1e30;
+  // Path aggregation eliminates integer columns when no continuous one is left (MILP_MIR_INTAGG=0: off).
+  bool int_elim_ = [] { const char* v = std::getenv("MILP_MIR_INTAGG"); return !(v && *v == '0'); }();
+  double int_elim_min_ = [] { const char* v = std::getenv("MILP_MIR_INTAGG_MIN"); return v ? std::atof(v) : 1e-6; }();
+  int int_elim_max_ = [] { const char* v = std::getenv("MILP_MIR_INTAGG_MAX"); return v ? std::atoi(v) : 1000; }();
+  // Only general integers are eliminated (MILP_MIR_INTAGG_GENERAL=0: binaries too; rococoC10 / ns1830653 roots
+  // gain from binaries, but mas76 / piperout-08 trees were 1.2-1.7x slower with the extra cuts).
+  bool int_elim_general_ = [] { const char* v = std::getenv("MILP_MIR_INTAGG_GENERAL"); return !(v && *v == '0'); }();
   struct SnfVar {
     int sign;          // +1: N1 (inflow), -1: N2 (outflow)
     double u;          // capacity: 0 <= y' <= u x
@@ -879,6 +892,7 @@ void MirSeparator::aggregate_path(Index i0, double sign, std::vector<Cut>& out) 
   row_used_[i0] = 1;
   add_row(i0, sign);
   int found = 0;
+  int int_steps = 0;  // integer columns eliminated on this path
   for (int naggr = 0;; ++naggr) {
     Cut cut;
     // A cut does not end the path: larger aggregations give cut-set like cuts over several
@@ -907,6 +921,20 @@ void MirSeparator::aggregate_path(Index i0, double sign, std::vector<Cut>& out) 
       if (j >= n_ || is_int(j) || agg_[j] == 0.0) continue;
       const double d = std::min(ctx_->x[j] - lower(j), upper(j) - ctx_->x[j]);
       if (d > dbest) dbest = d, jbest = j;
+    }
+    if (jbest < 0 && int_elim_ && ctx_->expensive && ctx_->round > 0 && work_count_ < int_budget_ && int_steps < int_elim_max_) {
+      ++int_steps;
+      // Root cut loop only (round > 0; node separation passes round 0: mas76 / neos5 trees slower with it).
+      // No continuous column left (pure integer models, mzzv11): eliminate the integer column
+      // farthest from its bounds instead (general integers only by default: their LP values act as
+      // quantities linking rows, e.g. x = sum_k c_k z_k with x in a capacity row).
+      double ibest = int_elim_min_;
+      for (Index j : nz_) {
+        if (j >= n_ || !is_int(j) || agg_[j] == 0.0 || (int_elim_general_ && upper(j) - lower(j) <= 1.0)) continue;
+        const double d = std::min(ctx_->x[j] - lower(j), upper(j) - ctx_->x[j]);
+        const double score = d + (upper(j) - lower(j) > 1.0 ? 1.0 : 0.0);
+        if (d > int_elim_min_ && score > ibest) ibest = score, jbest = j;
+      }
     }
     if (jbest < 0) return;
     // Pick a tight problem row containing it. A column without variable bounds is bounded through
@@ -1066,6 +1094,14 @@ void MirSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   }
   const long long nnz = static_cast<long long>(p.A.index.size());
   const long long budget = static_cast<long long>(kWorkPerNnz * static_cast<double>(std::max<long long>(nnz, 20000)));
+  int_budget_ = static_cast<long long>(int_work_per_nnz_ * static_cast<double>(std::max<long long>(nnz, 20000)));
+  {
+    // Pure integer models only (neos-4738912-atrato, mixed: 2.3x the root cuts for the same bound, tree 70 s ->
+    // TL); on mixed models paths through continuous columns already link the rows.
+    bool pure = true;
+    for (Index j = 0; j < n_ && pure; ++j) pure = p.is_int[j] || p.col_lb[j] == p.col_ub[j];
+    if (!pure) int_budget_ = 0;
+  }
   // Pass 0: rows with integer variables (or continuous ones with variable bounds); pass 1: purely
   // continuous rows (e.g. single-commodity flow balances), which reach integers by aggregation only.
   // Start rows used to be the first 5000 in index order: on large models (unitcal_7, 38k rows) the

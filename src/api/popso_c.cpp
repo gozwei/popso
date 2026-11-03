@@ -6,6 +6,7 @@
 
 #include "popso.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "milp/core/model.hpp"
+#include "milp/io/lp_reader.hpp"
 #include "milp/io/mps_reader.hpp"
 #include "milp/io/solution.hpp"
 #include "milp/solver/solver.hpp"
@@ -103,6 +105,8 @@ milp::VarType to_var_type(int t) {
     case POPSO_CONTINUOUS: return milp::VarType::Continuous;
     case POPSO_INTEGER: return milp::VarType::Integer;
     case POPSO_BINARY: return milp::VarType::Binary;
+    case POPSO_SEMICONTINUOUS: return milp::VarType::SemiContinuous;
+    case POPSO_SEMIINTEGER: return milp::VarType::SemiInteger;
     default: fail(POPSO_ERROR_INVALID_ARGUMENT, "invalid variable type " + std::to_string(t));
   }
 }
@@ -112,6 +116,8 @@ int from_var_type(milp::VarType t) {
     case milp::VarType::Continuous: return POPSO_CONTINUOUS;
     case milp::VarType::Integer: return POPSO_INTEGER;
     case milp::VarType::Binary: return POPSO_BINARY;
+    case milp::VarType::SemiContinuous: return POPSO_SEMICONTINUOUS;
+    case milp::VarType::SemiInteger: return POPSO_SEMIINTEGER;
   }
   return POPSO_CONTINUOUS;
 }
@@ -296,6 +302,28 @@ int popso_read_mps(popso_model* m, const char* filename) {
   });
 }
 
+int popso_read_lp(popso_model* m, const char* filename) {
+  return guarded(m, [&] {
+    check_file_readable(filename);
+    std::vector<std::string> warnings;
+    milp::Model md;
+    try {
+      md = milp::read_lp(filename, &warnings);
+    } catch (const milp::LpError& e) {
+      fail(POPSO_ERROR_PARSE, e.what());
+    }
+    if (m->params.verbosity >= 1) {
+      for (const std::string& w : warnings) std::printf("LP warning: %s\n", w.c_str());
+    }
+    if (md.num_cols() != m->model.num_cols()) m->start.clear();
+    m->model = std::move(md);
+    m->pend_row.clear();
+    m->pend_col.clear();
+    m->pend_val.clear();
+    touched(m);
+  });
+}
+
 int popso_write_mps(popso_model* m, const char* filename) {
   return guarded(m, [&] {
     if (!filename) fail(POPSO_ERROR_INVALID_ARGUMENT, "null file name");
@@ -374,6 +402,64 @@ int popso_add_rows(popso_model* m, int count, const int* starts, const int* cols
   });
 }
 
+int popso_add_sos(popso_model* m, int type, int nnz, const int* vars, const double* weights, const char* name,
+                  int* index) {
+  return guarded(m, [&] {
+    if (type != POPSO_SOS1 && type != POPSO_SOS2) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_sos: type must be 1 or 2");
+    if (nnz < 0 || (nnz > 0 && !vars)) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_sos: invalid members");
+    milp::SosConstraint s;
+    s.type = type;
+    s.name = name && *name ? std::string(name) : "SOS" + std::to_string(m->model.sos.size());
+    std::vector<char> seen(static_cast<size_t>(m->model.num_cols()), 0);
+    for (int k = 0; k < nnz; ++k) {
+      check_var(m, vars[k]);
+      if (seen[vars[k]]) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_sos: variable " + std::to_string(vars[k]) + " repeated");
+      seen[vars[k]] = 1;
+      const double w = weights ? weights[k] : static_cast<double>(k + 1);
+      if (!std::isfinite(w)) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_sos: weights must be finite");
+      s.cols.push_back(vars[k]);
+      s.weights.push_back(w);
+    }
+    std::vector<double> sorted = s.weights;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "add_sos: weights must be distinct");
+    m->model.sos.push_back(std::move(s));
+    touched(m);
+    if (index) *index = static_cast<int>(m->model.sos.size()) - 1;
+  });
+}
+
+int popso_add_indicator(popso_model* m, int binvar, int binval, int nnz, const int* cols, const double* vals, double lb,
+                        double ub, const char* name, int* index) {
+  return guarded(m, [&] {
+    check_var(m, binvar);
+    if (binval != 0 && binval != 1) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_indicator: binval must be 0 or 1");
+    const milp::Model& md = m->model;
+    if (!milp::is_integral_type(md.col_type[binvar]) || milp::is_semi_type(md.col_type[binvar]) ||
+        md.col_lb[binvar] < 0.0 || md.col_ub[binvar] > 1.0)
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "add_indicator: variable " + std::to_string(binvar) + " is not binary");
+    if (nnz < 0 || (nnz > 0 && (!cols || !vals))) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_indicator: invalid entries");
+    check_bounds(lb, ub, "add_indicator");
+    milp::IndicatorConstraint c;
+    c.binary = binvar;
+    c.value = binval;
+    c.name = name && *name ? std::string(name) : "IND" + std::to_string(md.indicators.size());
+    for (int k = 0; k < nnz; ++k) {
+      check_var(m, cols[k]);
+      if (!std::isfinite(vals[k])) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_indicator: coefficient must be finite");
+      if (vals[k] == 0.0) continue;
+      c.cols.push_back(cols[k]);
+      c.coefs.push_back(vals[k]);
+    }
+    c.lb = to_internal_bound(lb);
+    c.ub = to_internal_bound(ub);
+    m->model.indicators.push_back(std::move(c));
+    touched(m);
+    if (index) *index = static_cast<int>(m->model.indicators.size()) - 1;
+  });
+}
+
 int popso_set_var_bounds(popso_model* m, int var, double lb, double ub) {
   return guarded(m, [&] {
     check_var(m, var);
@@ -449,6 +535,8 @@ int popso_set_objective(popso_model* m, int nnz, const int* vars, const double* 
 
 int popso_num_vars(const popso_model* m) { return m ? m->model.num_cols() : -1; }
 int popso_num_rows(const popso_model* m) { return m ? m->model.num_rows() : -1; }
+int popso_num_sos(const popso_model* m) { return m ? static_cast<int>(m->model.sos.size()) : -1; }
+int popso_num_indicators(const popso_model* m) { return m ? static_cast<int>(m->model.indicators.size()) : -1; }
 
 long long popso_num_nonzeros(popso_model* m) {
   if (!m) return -1;
@@ -553,11 +641,13 @@ int popso_set_param(popso_model* m, const char* name, double value) {
       p.presolve = as_flag();
     } else if (n == "racing") {
       p.racing = static_cast<int>(as_int(1, 4096));
+    } else if (n == "lp_method") {
+      p.lp_method = static_cast<milp::LpMethod>(as_int(0, 2));
     } else {
       fail(POPSO_ERROR_INVALID_ARGUMENT,
            "unknown parameter '" + n +
                "' (known: time_limit, threads, mip_gap, mip_abs_gap, seed, deterministic, verbosity, mem_limit, "
-               "node_limit, presolve, racing)");
+               "node_limit, presolve, racing, lp_method)");
     }
   });
 }
@@ -578,6 +668,7 @@ int popso_get_param(const popso_model* m, const char* name, double* value) {
     else if (n == "node_limit") *value = static_cast<double>(p.node_limit);
     else if (n == "presolve") *value = p.presolve ? 1.0 : 0.0;
     else if (n == "racing") *value = p.racing;
+    else if (n == "lp_method") *value = static_cast<double>(static_cast<int>(p.lp_method));
     else fail(POPSO_ERROR_INVALID_ARGUMENT, "unknown parameter '" + n + "'");
   });
 }

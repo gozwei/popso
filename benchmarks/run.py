@@ -308,7 +308,7 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
     rec.update({"class": cls, "message": msg, **{k: v for k, v in details.items() if k != "verify"}})
     if "verify" in details:
         v = details["verify"]
-        rec["max_viol"] = max(v["max_bound_viol"], v["max_row_viol"], v["max_int_viol"])
+        rec["max_viol"] = max(v["max_bound_viol"], v["max_row_viol"], v["max_int_viol"], v.get("max_logic_viol", 0.0))
     if args.keep_sols:
         rec["sol_file"] = str(sol_path)
     return rec

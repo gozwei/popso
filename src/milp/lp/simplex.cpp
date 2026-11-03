@@ -615,6 +615,10 @@ bool DualSimplex::limits_hit(const LpOptions& opt, LpStatus* st) const {
     *st = LpStatus::TimeLimit;
     return true;
   }
+  if (opt.stop && opt.stop->load(std::memory_order_relaxed)) {
+    *st = LpStatus::TimeLimit;
+    return true;
+  }
   return false;
 }
 
@@ -725,6 +729,42 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
       boost_mul_ = kColdMul - 1.0;
     } else {
       perturb_costs(cold ? kColdMul : 1.0);
+    }
+  }
+  const Index dual_infeasible = opt.primal_first ? count_dual_infeasibilities(false) : 0;
+  if (dual_infeasible > 0) {
+    bool primal_feasible = true;
+    for (Index p = 0; p < m_ && primal_feasible; ++p) {
+      const Index j = basic_[p];
+      primal_feasible = x_[j] >= lb_[j] - opt.tol.primal_feas * ftol_[j] && x_[j] <= ub_[j] + opt.tol.primal_feas * ftol_[j];
+    }
+    if (primal_feasible) {
+      // Capped (Dantzig pricing without anti-degeneracy measures can stall): a few pivots per dual
+      // infeasibility, then the dual simplex takes over from the basis reached (rmatr200-p5's
+      // relaxation: 20k stalling primal pivots with the cap of the primal cleanup below).
+      const long long cap = std::min<long long>(1000 + m_ / 2, 1000 + 3LL * dual_infeasible);
+      LpOptions popt = opt;
+      popt.iteration_limit = opt.iteration_limit >= 0 ? std::min(opt.iteration_limit, cap) : cap;
+      const LpStatus st = primal_loop(popt);
+      if (st == LpStatus::IterationLimit && !(opt.iteration_limit >= 0 && opt.iteration_limit <= cap)) {
+        dse_.assign(m_, 1.0);  // the primal pivots do not maintain the weights
+      } else if (st != LpStatus::Optimal && st != LpStatus::NumericalError) {
+        return st;
+      }
+      if (st == LpStatus::NumericalError) {
+        refactor();
+        compute_duals();
+        compute_primal();
+      }
+      if (st != LpStatus::Optimal) {
+        // The dual simplex continues: exact DSE weights (unit weights made it far slower).
+        for (Index p = 0; p < m_; ++p) {
+          unit_btran(p);
+          double w = 0.0;
+          for (Index e = 0; e < rho_.count; ++e) w += rho_.dense[rho_.nz[e]] * rho_.dense[rho_.nz[e]];
+          dse_[p] = std::max(w, 1e-6);
+        }
+      }
     }
   }
   if (count_dual_infeasibilities(true) > 0) {

@@ -397,6 +397,45 @@
      "scip": "10.0",
      "pyscipopt": "6.3.0"
     }
+   },
+   {
+    "date": "2026-11-02",
+    "time_limit": 300.0,
+    "threads": 1,
+    "jobs": 1,
+    "mem_limit_mb": 2048,
+    "solvers": [
+     "scip"
+    ],
+    "instances": 8,
+    "versions": {
+     "python": "3.12.7",
+     "platform": "macOS-27.2-arm64-arm-64bit",
+     "machine": "arm64",
+     "highs": "1.15.1",
+     "scip": "10.0",
+     "pyscipopt": "6.3.0"
+    }
+   },
+   {
+    "date": "2026-11-02",
+    "time_limit": 240.0,
+    "threads": 1,
+    "jobs": 1,
+    "mem_limit_mb": 2048,
+    "solvers": [
+     "highs",
+     "scip"
+    ],
+    "instances": 4,
+    "versions": {
+     "python": "3.12.7",
+     "platform": "macOS-27.2-arm64-arm-64bit",
+     "machine": "arm64",
+     "highs": "1.15.1",
+     "scip": "10.0",
+     "pyscipopt": "6.3.0"
+    }
    }
   ]
  },
@@ -3602,6 +3641,182 @@
      "threads": 4,
      "jobs": 1,
      "mem_limit_mb": 2800,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "indsched_large_1": {
+   "file": "benchmarks/instances/indsched_large_1.mps",
+   "num_vars": 55,
+   "num_cons": 0,
+   "num_nonzeros": 0,
+   "num_integers": 45,
+   "num_binaries": 45,
+   "sense": "min",
+   "num_indicators": 90,
+   "status": "optimal",
+   "objective": 1178.9999999999998,
+   "bound": 1178.9999999999998,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 1178.9999999999998,
+     "bound": 1178.9999999999998,
+     "time": 0.03922429197700694,
+     "raw_status": "optimal",
+     "nodes": 90,
+     "verify": {
+      "feasible": true,
+      "objective": 1178.9999999999998,
+      "max_viol": 4.736951571734001e-15,
+      "worst": "indicator b2_5 activity -2.999999999999986 outside [-inf, -3.0]"
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "indsched_medium_1": {
+   "file": "benchmarks/instances/indsched_medium_1.mps",
+   "num_vars": 36,
+   "num_cons": 0,
+   "num_nonzeros": 0,
+   "num_integers": 28,
+   "num_binaries": 28,
+   "sense": "min",
+   "num_indicators": 56,
+   "status": "optimal",
+   "objective": 1570.0,
+   "bound": 1570.0,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 1570.0,
+     "bound": 1570.0,
+     "time": 0.0419758339994587,
+     "raw_status": "optimal",
+     "nodes": 332,
+     "verify": {
+      "feasible": true,
+      "objective": 1570.0,
+      "max_viol": 1.7763568394002505e-15,
+      "worst": "indicator a4_6 activity -7.999999999999986 outside [-inf, -8.0]"
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "indsched_small_1": {
+   "file": "benchmarks/instances/indsched_small_1.mps",
+   "num_vars": 21,
+   "num_cons": 0,
+   "num_nonzeros": 0,
+   "num_integers": 15,
+   "num_binaries": 15,
+   "sense": "min",
+   "num_indicators": 30,
+   "status": "optimal",
+   "objective": 1239.0,
+   "bound": 1239.0,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 1239.0,
+     "bound": 1239.0,
+     "time": 0.006401082966476679,
+     "raw_status": "optimal",
+     "nodes": 27,
+     "verify": {
+      "feasible": true,
+      "objective": 1239.0,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "indsched_tiny_1": {
+   "file": "benchmarks/instances/indsched_tiny_1.mps",
+   "num_vars": 10,
+   "num_cons": 0,
+   "num_nonzeros": 0,
+   "num_integers": 6,
+   "num_binaries": 6,
+   "sense": "min",
+   "num_indicators": 12,
+   "status": "optimal",
+   "objective": 383.0,
+   "bound": 383.0,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 383.0,
+     "bound": 383.0,
+     "time": 0.002707249950617552,
+     "raw_status": "optimal",
+     "nodes": 3,
+     "verify": {
+      "feasible": true,
+      "objective": 383.0,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
      "solvers": [
       "scip"
      ]
@@ -9414,6 +9629,190 @@
     }
    ]
   },
+  "pwlnet_large_1": {
+   "file": "benchmarks/instances/pwlnet_large_1.mps",
+   "num_vars": 576,
+   "num_cons": 64,
+   "num_nonzeros": 1116,
+   "num_integers": 12,
+   "num_binaries": 12,
+   "sense": "min",
+   "num_semi": 144,
+   "num_sos": 27,
+   "num_indicators": 12,
+   "status": "optimal",
+   "objective": 10790.413578367443,
+   "bound": 10790.413578367443,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 10790.413578367443,
+     "bound": 10790.413578367443,
+     "time": 5.095005917013623,
+     "raw_status": "optimal",
+     "nodes": 18178,
+     "verify": {
+      "feasible": true,
+      "objective": 10790.413578367443,
+      "max_viol": 1.7763568394002505e-14,
+      "worst": "row out9 activity 1.7763568394002505e-14 > 0.0"
+     },
+     "peak_rss_mb": 85.4
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "pwlnet_medium_1": {
+   "file": "benchmarks/instances/pwlnet_medium_1.mps",
+   "num_vars": 208,
+   "num_cons": 36,
+   "num_nonzeros": 392,
+   "num_integers": 8,
+   "num_binaries": 8,
+   "sense": "min",
+   "num_semi": 50,
+   "num_sos": 17,
+   "num_indicators": 8,
+   "status": "optimal",
+   "objective": 6077.840666666667,
+   "bound": 6077.840666666667,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 6077.840666666667,
+     "bound": 6077.840666666667,
+     "time": 0.15222454100148752,
+     "raw_status": "optimal",
+     "nodes": 726,
+     "verify": {
+      "feasible": true,
+      "objective": 6077.840666666667,
+      "max_viol": 2.3092638912203256e-14,
+      "worst": "SOS1 single10 violated by 2.3092638912203256e-14"
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "pwlnet_small_1": {
+   "file": "benchmarks/instances/pwlnet_small_1.mps",
+   "num_vars": 80,
+   "num_cons": 20,
+   "num_nonzeros": 145,
+   "num_integers": 5,
+   "num_binaries": 5,
+   "sense": "min",
+   "num_semi": 17,
+   "num_sos": 9,
+   "num_indicators": 5,
+   "status": "optimal",
+   "objective": 3072.9784094728802,
+   "bound": 3072.9784094728802,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 3072.9784094728802,
+     "bound": 3072.9784094728802,
+     "time": 0.012291541963350028,
+     "raw_status": "optimal",
+     "nodes": 63,
+     "verify": {
+      "feasible": true,
+      "objective": 3072.9784094728802,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "pwlnet_tiny_1": {
+   "file": "benchmarks/instances/pwlnet_tiny_1.mps",
+   "num_vars": 30,
+   "num_cons": 10,
+   "num_nonzeros": 51,
+   "num_integers": 3,
+   "num_binaries": 3,
+   "sense": "min",
+   "num_semi": 3,
+   "num_sos": 4,
+   "num_indicators": 3,
+   "status": "optimal",
+   "objective": 1463.331329078014,
+   "bound": 1463.331329078014,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "scip": {
+     "status": "optimal",
+     "objective": 1463.331329078014,
+     "bound": 1463.331329078014,
+     "time": 0.0050736250123009086,
+     "raw_status": "optimal",
+     "nodes": 19,
+     "verify": {
+      "feasible": true,
+      "objective": 1463.3313290780143,
+      "max_viol": 1.7763568394002505e-15,
+      "worst": "row out0 activity 1.7763568394002505e-15 > 0.0"
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 300.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
   "qap10": {
    "file": "benchmarks/miplib/qap10.mps",
    "num_vars": 4150,
@@ -10469,6 +10868,246 @@
      "jobs": 1,
      "mem_limit_mb": 2800,
      "solvers": [
+      "scip"
+     ]
+    }
+   ]
+  },
+  "semilot_large_1": {
+   "file": "benchmarks/instances/semilot_large_1.mps",
+   "num_vars": 150,
+   "num_cons": 20,
+   "num_nonzeros": 2080,
+   "num_integers": 47,
+   "num_binaries": 0,
+   "sense": "max",
+   "num_semi": 150,
+   "status": "optimal",
+   "objective": 223876.3976677503,
+   "bound": 223876.3976677503,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "highs": {
+     "status": "optimal",
+     "objective": 223876.3976677503,
+     "bound": 223876.3976677503,
+     "time": 1.2564624169608578,
+     "raw_status": "Optimal",
+     "nodes": 1037,
+     "verify": {
+      "feasible": true,
+      "objective": 223876.3976677503,
+      "max_viol": 7.447692644576002e-15,
+      "worst": "row res5 activity 8304.000000000062 > 8304.0"
+     },
+     "peak_rss_mb": 62.4
+    },
+    "scip": {
+     "status": "timelimit",
+     "objective": 223876.39766775025,
+     "bound": 223879.62412197213,
+     "time": 240.00113291601883,
+     "raw_status": "timelimit",
+     "nodes": 2276227,
+     "verify": {
+      "feasible": true,
+      "objective": 223876.39766775028,
+      "max_viol": 2.259333503348474e-16,
+      "worst": "row res17 activity 8051.000000000002 > 8051.0"
+     },
+     "peak_rss_mb": 349.1
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 240.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "highs",
+      "scip"
+     ]
+    }
+   ]
+  },
+  "semilot_medium_1": {
+   "file": "benchmarks/instances/semilot_medium_1.mps",
+   "num_vars": 60,
+   "num_cons": 10,
+   "num_nonzeros": 422,
+   "num_integers": 19,
+   "num_binaries": 0,
+   "sense": "max",
+   "num_semi": 60,
+   "status": "optimal",
+   "objective": 45132.83018897772,
+   "bound": 45132.83018897772,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "highs": {
+     "status": "optimal",
+     "objective": 45132.83018897772,
+     "bound": 45132.83018897772,
+     "time": 0.12723329197615385,
+     "raw_status": "Optimal",
+     "nodes": 1,
+     "verify": {
+      "feasible": true,
+      "objective": 45132.83018897772,
+      "max_viol": 5.6594105620190435e-14,
+      "worst": "var x13=57.000000000003226 > ub 57.0"
+     },
+     "peak_rss_mb": 0.0
+    },
+    "scip": {
+     "status": "optimal",
+     "objective": 45132.830188977605,
+     "bound": 45132.830188977605,
+     "time": 0.028857500001322478,
+     "raw_status": "optimal",
+     "nodes": 278,
+     "verify": {
+      "feasible": true,
+      "objective": 45132.83018897761,
+      "max_viol": 4.28501626276998e-16,
+      "worst": "row res3 activity 4245.000000000002 > 4245.0"
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 240.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "highs",
+      "scip"
+     ]
+    }
+   ]
+  },
+  "semilot_small_1": {
+   "file": "benchmarks/instances/semilot_small_1.mps",
+   "num_vars": 25,
+   "num_cons": 5,
+   "num_nonzeros": 82,
+   "num_integers": 4,
+   "num_binaries": 0,
+   "sense": "max",
+   "num_semi": 25,
+   "status": "optimal",
+   "objective": 12593.270143755622,
+   "bound": 12593.270143755622,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "highs": {
+     "status": "optimal",
+     "objective": 12593.270143755622,
+     "bound": 12593.27014375562,
+     "time": 0.02116979198763147,
+     "raw_status": "Optimal",
+     "nodes": 1,
+     "verify": {
+      "feasible": true,
+      "objective": 12593.270143755622,
+      "max_viol": 5.792959883904001e-16,
+      "worst": "row res3 activity 1570.000000000001 > 1570.0"
+     },
+     "peak_rss_mb": 0.0
+    },
+    "scip": {
+     "status": "optimal",
+     "objective": 12593.270143755615,
+     "bound": 12593.270143755615,
+     "time": 0.005982500035315752,
+     "raw_status": "optimal",
+     "nodes": 79,
+     "verify": {
+      "feasible": true,
+      "objective": 12593.270143755615,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 240.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "highs",
+      "scip"
+     ]
+    }
+   ]
+  },
+  "semilot_tiny_1": {
+   "file": "benchmarks/instances/semilot_tiny_1.mps",
+   "num_vars": 8,
+   "num_cons": 3,
+   "num_nonzeros": 17,
+   "num_integers": 0,
+   "num_binaries": 0,
+   "sense": "max",
+   "num_semi": 8,
+   "status": "optimal",
+   "objective": 3117.2322222222224,
+   "bound": 3117.2322222222224,
+   "agree": true,
+   "notes": [],
+   "solvers": {
+    "highs": {
+     "status": "optimal",
+     "objective": 3117.2322222222224,
+     "bound": 3117.2322222222224,
+     "time": 0.0077842919854447246,
+     "raw_status": "Optimal",
+     "nodes": 1,
+     "verify": {
+      "feasible": true,
+      "objective": 3117.2322222222224,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    },
+    "scip": {
+     "status": "optimal",
+     "objective": 3117.232222222222,
+     "bound": 3117.232222222222,
+     "time": 0.0021322499960660934,
+     "raw_status": "optimal",
+     "nodes": 9,
+     "verify": {
+      "feasible": true,
+      "objective": 3117.232222222222,
+      "max_viol": 0.0,
+      "worst": ""
+     },
+     "peak_rss_mb": 0.0
+    }
+   },
+   "ref_runs": [
+    {
+     "date": "2026-11-02",
+     "time_limit": 240.0,
+     "threads": 1,
+     "jobs": 1,
+     "mem_limit_mb": 2048,
+     "solvers": [
+      "highs",
       "scip"
      ]
     }

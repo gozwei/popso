@@ -20,6 +20,7 @@ struct Cut {
   const char* origin = "";  // separator name
   double efficacy = 0.0;    // (a x* - rhs) / ||a||, set by the pool
   double score = 0.0;
+  double objpar = 0.0, intsupport = 0.0;  // set by the pool
   int pool_id = -1;         // cut loop bookkeeping: index in the pool of dropped cuts
 
   double activity(const double* x) const {
@@ -73,6 +74,7 @@ struct SepaContext {
   const CutData& data;
   int round = 0;
   Index max_nnz = 0;  // > 0: cuts with more nonzeros are rejected by the pool (separators may skip them)
+  bool expensive = true;  // false: skip expensive separation variants (flat bound on a degenerate LP)
 };
 
 class Separator {
@@ -114,6 +116,14 @@ struct CutPoolOptions {
   double max_parallelism = 0.98;  // reject cuts with cos(angle) above this to a selected cut
   int max_cuts = 100;
   Index max_nnz = 1 << 30;
+  // Hybrid scoring (SCIP-like): score = efficacy / max efficacy + obj_weight * objective parallelism
+  // + int_weight * integral support; cuts scoring below good_score x the best score must also be at
+  // most max_parallelism_weak parallel to every selected cut. Off (hybrid = false): score =
+  // efficacy (1 + 0.1 objective parallelism) and max_parallelism for all.
+  bool hybrid = false;
+  double obj_weight = 0.1, int_weight = 0.1;
+  double good_score = 0.9;
+  double max_parallelism_weak = 0.98;
 };
 
 class CutPool {
@@ -130,6 +140,7 @@ class CutPool {
   const MipProblem& p_;
   CutPoolOptions opt_;
   std::vector<Cut> cuts_;
+  double cnorm_ = -1.0;  // ||c||^2, computed on the first add
 };
 
 }  // namespace milp

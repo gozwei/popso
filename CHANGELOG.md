@@ -2,6 +2,106 @@
 
 ## Unreleased
 
+**Barrier (interior-point) LP solver**
+- New LP algorithm, written from scratch like the rest: Mehrotra's predictor-corrector
+  primal-dual method with Gondzio's centrality correctors, on the presolved and scaled problem
+  (geometric scaling; free variables, ranges and two-sided bounds handled directly).
+- Linear algebra: an approximate minimum degree ordering (AMD) and a supernodal sparse Cholesky
+  factorization, multithreaded for large dense blocks. Each solve picks the cheaper of the normal
+  equations and the regularized augmented system (factored as a quasi-definite LDL^T, which suits
+  LPs with far more rows than columns and is the form a future QP solver needs). Dense columns in
+  the normal equations go through a Sherman–Morrison–Woodbury update; every solve is refined
+  iteratively.
+- Crossover to an optimal basis: dual and primal push phases, then a short simplex cleanup, so
+  the answer is an exact vertex as with the simplex.
+- `--lp-method auto|simplex|barrier` (C API parameter `lp_method`: 0, 1, 2; the Python bindings
+  also take the names). The method is used for a pure LP and for the root LP of a MIP. `auto`
+  (the default) runs the dual simplex and the barrier at the same time on large pure LPs and
+  takes the first to finish (not in `--deterministic` mode, where it stays with the simplex);
+  MIP root LPs stay with the simplex unless `barrier` is chosen.
+- On LP relaxations of 69 MIPLIB instances (4 threads), `auto` takes 27% less time than the
+  dual simplex alone in shifted geometric mean and 44% less in total; the barrier alone is about
+  as fast as HiGHS' interior-point solver (shifted geometric mean 0.40 s vs 0.43 s, with
+  crossover). Examples: chromaticindex512-7 20 s -> 1.6 s, dano3_3 6.2 s -> 2.7 s, qap10
+  3.4 s -> 1.1 s, rmatr200-p5 5.9 s -> 2.9 s, brazil3 2.4 s -> 0.8 s.
+
+**Model features**
+- Semi-continuous and semi-integer variables (x = 0 or lb <= x <= ub), SOS1 and SOS2
+  constraints, and indicator constraints (if a binary variable takes a given value, a linear
+  constraint must hold).
+- They are read from MPS files (`SC`/`SI` bounds, `SOS` section, `INDICATORS` section) and LP
+  files (`Semi-Continuous` section, `SOS` section with `S1::`/`S2::` entries, and indicator
+  constraints written `name: b = 1 -> x + y <= 5`). The MPS writer writes them, so models
+  round-trip.
+- C API: `POPSO_SEMICONTINUOUS` and `POPSO_SEMIINTEGER` variable types, `popso_add_sos`,
+  `popso_add_indicator`, `popso_num_sos`, `popso_num_indicators`, and `popso_read_lp` for LP
+  files. Python: `SEMICONTINUOUS`/`SEMIINTEGER` variable types, `Model.add_sos`,
+  `Model.add_indicator(b, 1, x + y <= 5)` and `popso.read_lp`.
+- How they are solved: the solver adds a binary variable for each semi-continuous variable, SOS
+  member or SOS2 segment and links it with big-M rows; an indicator constraint becomes a big-M
+  row. The big-M values come from the variable bounds, tightened by bound propagation over the
+  model rows. Presolve, cuts, heuristics and branching then work as for any MILP, and the
+  final solution is checked against the original constraints. When no finite bound exists (or
+  it would exceed 1e6), the constraint is not relaxed by a big-M: the solver branches on its
+  binary variable and enforces the constraint in that subtree. Presolve is skipped for such
+  models.
+- Testing: unit tests compare small models with optima found by enumeration, using both the
+  big-M form and branching only, and `benchmarks/tools/logical_fuzz.py` compares random small
+  models with SCIP. Three new generated benchmark families, `semilot` (minimum
+  lot sizes), `pwlnet` (transportation with piecewise-linear concave costs, plant opening and
+  single sourcing) and `indsched` (single-machine scheduling with indicator disjunctions and no
+  big-M), have reference answers from SCIP (and from HiGHS for `semilot`). The benchmark
+  checker verifies the new constraints.
+
+## v0.2.1 — 2026-11
+
+A patch release: faster root cuts on pure integer models and a robustness fix for deterministic
+parallel mode under tight memory limits.
+
+**Benchmarks**
+- 63-instance MIPLIB 2017 subset (120 s, 4 threads): 60 solved, shifted geometric mean 11.3 s
+  (v0.2.0: 12.4 s). See [BENCHMARKS.md](BENCHMARKS.md).
+
+**Solver**
+- Deterministic parallel mode (`--deterministic`) now drains the search tree reliably near the
+  memory cap (`--mem-limit`). Before, a parallel deterministic run could stop with `MEMORY_LIMIT`
+  where a 1-thread run under the same cap proved optimality. The work between two
+  synchronization points is now sized so that the tree stays below the cap. Reruns stay
+  identical, and runs that stay well below the cap are unchanged.
+
+**Root cuts**
+- c-MIR path aggregation continues through general integer columns on pure integer models (root cut loop,
+  work-capped, not on dual degenerate root LPs): mzzv11 / mzzv42z are now solved at the root (4 threads:
+  51 s -> 17 s and 15 s -> 3.3 s).
+- Clique cuts are extended to maximal cliques by zero-valued literals.
+- `benchmarks/tools/rootgap.py`: root gap closed per instance vs SCIP / HiGHS (node limit 1) and the known
+  optimum; the solver prints a machine-readable `ROOTSTAT` line after each root.
+
+## v0.2.0 — 2026-11
+
+popso becomes usable as a library and on all three major platforms: a C API and Python bindings,
+starting solutions, an LP-format reader, CI on Linux, macOS and Windows, a stronger presolve and a
+more robust LP factorization.
+
+**Benchmarks**
+- 63-instance MIPLIB 2017 subset (120 s, 4 threads): 60 solved (v0.1.0: 59), shifted geometric
+  mean 12.4 s (v0.1.0: 13.2 s); HiGHS solves 53, SCIP 50. 118 generated models (1 thread): 116
+  solved. See [BENCHMARKS.md](BENCHMARKS.md).
+
+**Solver**
+- Stronger presolve:
+  - clique extension: set-packing rows grow with conflicting binaries, dominated packing rows are
+    dropped, and binaries that conflict with a whole equality row are fixed;
+  - dual bound strengthening and GCD-based tightening of integer rows;
+  - a set-cover rule for dominated columns;
+  - faster probing that also tightens continuous bounds.
+
+  On the MIPLIB subset the presolved models now close more of the root gap on average than
+  SCIP's or HiGHS's presolve, and presolve takes about 30% less time than in v0.1.0.
+- LP factorization: an update that would make the factorization inaccurate (a very large row
+  multiplier in the Forrest–Tomlin update) now triggers a refactorization instead of carrying the
+  error forward.
+
 **Library API**
 - C API in `include/popso.h`, built as the shared library `popso` (`libpopso.so`,
   `libpopso.dylib`, `popso.dll`). It can build models (variables, sparse rows, objective) or read

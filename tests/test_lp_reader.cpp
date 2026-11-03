@@ -86,6 +86,18 @@ std::string model_diff(const Model& a, const Model& b, bool compare_name) {
     if (a.row_lb[i] != b.row_lb[i]) return r + "lower " + num(a.row_lb[i]) + " vs " + num(b.row_lb[i]);
     if (a.row_ub[i] != b.row_ub[i]) return r + "upper " + num(a.row_ub[i]) + " vs " + num(b.row_ub[i]);
   }
+  if (a.sos.size() != b.sos.size()) return "SOS count";
+  for (size_t s = 0; s < a.sos.size(); ++s) {
+    const SosConstraint &x = a.sos[s], &y = b.sos[s];
+    if (x.name != y.name || x.type != y.type || x.cols != y.cols || x.weights != y.weights) return "SOS " + x.name;
+  }
+  if (a.indicators.size() != b.indicators.size()) return "indicator count";
+  for (size_t q = 0; q < a.indicators.size(); ++q) {
+    const IndicatorConstraint &x = a.indicators[q], &y = b.indicators[q];
+    if (x.name != y.name || x.binary != y.binary || x.value != y.value || x.cols != y.cols || x.coefs != y.coefs ||
+        x.lb != y.lb || x.ub != y.ub)
+      return "indicator " + x.name;
+  }
   return "";
 }
 
@@ -380,9 +392,11 @@ TEST(lp_reader_errors) {
   CHECK(error_contains("min\n x + [ x ^ 2 ] / 2\nst\n x >= 1\nend\n", "<string>:2: quadratic terms"));
   CHECK(error_contains("min\n x\nst\n c: x ^ 2 <= 1\nend\n", "quadratic terms"));
   CHECK(error_contains("min\n x\nst\n x[1] >= 1\nend\n", "brackets are not allowed"));
-  CHECK(error_contains("min\n x\nst\n c: b = 1 -> x >= 1\nend\n", "indicator constraints"));
-  CHECK(error_contains("min\n x\nst\n x >= 1\nsemi-continuous\n x\nend\n", "<string>:6: semi-continuous"));
-  CHECK(error_contains("min\n x\nst\n x >= 1\nsos\n s1: S1:: x:1 y:2\nend\n", "SOS constraints are not supported yet"));
+  CHECK(error_contains("min\n x\nst\n c: b <-> x >= 1\nend\n", "equivalence constraints"));
+  CHECK(error_contains("min\n x\nst\n c: b = 2 -> x >= 1\nend\n", "the indicator value must be 0 or 1"));
+  CHECK(error_contains("min\n x\nst\n x >= 1\nsemi-continuous\n 3\nend\n", "<string>:6: expected a variable name"));
+  CHECK(error_contains("min\n x\nst\n x >= 1\nsos\n s1: x:1 y:2\nend\n", "expected 'S1::' or 'S2::'"));
+  CHECK(error_contains("min\n x\nst\n x >= 1\nsos\n s1: S1::\nend\n", "has no members"));
   CHECK(error_contains("min\n x\nst\n x >= 1\nlazy constraints\n x <= 2\nend\n", "lazy constraints are not supported yet"));
   CHECK(error_contains("min\n x\nst\n x >= 1\nuser cuts\n x <= 2\nend\n", "user cuts are not supported yet"));
   CHECK(error_contains("min\n x\nst\n x >= 1\ngeneral constraints\nend\n", "general constraints are not supported"));

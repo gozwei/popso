@@ -571,6 +571,95 @@ def build_randlp(rng, cols, rows, density):
     return m
 
 
+# ------------------------------------------------- logical constraints
+# Semi-continuous / semi-integer variables, SOS sets and indicator constraints.
+# HiGHS reads semi-continuous variables (MPS SC bounds) but not SOS or
+# indicators; SCIP reads all of them.
+
+def build_semilot(rng, n, m, frac_int=0.3, tight=0.35):
+    """Multi-resource production with minimum lot sizes: product j is either
+    not made or made in [l_j, u_j] (semi-continuous; semi-integer for a
+    fraction of the products, e.g. batches). Maximize profit."""
+    lo = rng.integers(5, 25, n)
+    up = lo + rng.integers(10, 60, n)
+    A = rng.integers(1, 10, (m, n)) * (rng.random((m, n)) < 0.7)
+    profit = A.sum(axis=0) * rng.uniform(0.6, 1.4, n) + rng.integers(1, 10, n)
+    md = _model("semilot")
+    x = []
+    for j in range(n):
+        vt = "SI" if rng.random() < frac_int else "SC"
+        x.append(md.add_var(lb=float(lo[j]), ub=float(up[j]), vtype=vt, obj=round(float(profit[j]), 2),
+                            name=f"x{j}"))
+    for i in range(m):
+        idx = np.nonzero(A[i])[0]
+        if len(idx) == 0:
+            continue
+        cap = math.floor(tight * float((A[i] * up).sum()))
+        md.add_constr(_lin(A[i, idx], [x[j] for j in idx]) <= cap, f"res{i}")
+    md.sense = "max"
+    return md
+
+
+def build_pwlnet(rng, sources, sinks, K=4, frac_single=0.3, frac_minship=0.3):
+    """Transportation with plant opening and economies of scale.
+
+    Plant i: binary open y_i with fixed cost; indicator y_i = 0 -> no shipments
+    from i; production cost piecewise-linear concave in the output (lambda
+    formulation with an SOS2 set over K+1 breakpoints). Arcs with a minimum
+    shipment are semi-continuous; single-sourced customers have an SOS1 set
+    over their incoming arcs. Minimize total cost."""
+    D = rng.integers(10, 40, sinks)
+    S = rng.integers(int(D.sum() * 1.5 / sources) + 1, int(D.sum() * 2.5 / sources) + 2, sources)
+    S = np.maximum(S, D.max())
+    cost = rng.integers(2, 20, (sources, sinks))
+    fixed = rng.integers(50, 200, sources)
+    md = _model("pwlnet")
+    y = [md.add_var(vtype="B", obj=float(fixed[i]), name=f"y{i}") for i in range(sources)]
+    x = [[None] * sinks for _ in range(sources)]
+    for i in range(sources):
+        for j in range(sinks):
+            ub = float(min(S[i], D[j]))
+            if rng.random() < frac_minship:
+                x[i][j] = md.add_var(lb=float(max(2, D[j] // 3)), ub=ub, vtype="SC", obj=float(cost[i, j]),
+                                     name=f"x{i}_{j}")
+            else:
+                x[i][j] = md.add_var(ub=ub, obj=float(cost[i, j]), name=f"x{i}_{j}")
+    for i in range(sources):
+        # concave cost: decreasing marginal cost per segment
+        bp = np.linspace(0, float(S[i]), K + 1)
+        marg = np.sort(rng.uniform(2.0, 12.0, K))[::-1]
+        cval = np.concatenate([[0.0], np.cumsum(marg * np.diff(bp))])
+        lam = [md.add_var(ub=1.0, obj=round(float(cval[k]), 3), name=f"l{i}_{k}") for k in range(K + 1)]
+        md.add_constr(_lin(np.ones(K + 1), lam) == 1, f"conv{i}")
+        md.add_constr(_lin(np.ones(sinks), x[i]) - _lin(np.round(bp, 3), lam) == 0, f"out{i}")
+        md.add_sos(lam, [float(k + 1) for k in range(K + 1)], sos_type=2, name=f"pwl{i}")
+        md.add_indicator(y[i], 0, _lin(np.ones(sinks), x[i]) <= 0, name=f"closed{i}")
+    for j in range(sinks):
+        col = [x[i][j] for i in range(sources)]
+        md.add_constr(_lin(np.ones(sources), col) >= float(D[j]), f"dem{j}")
+        if rng.random() < frac_single:
+            md.add_sos(col, [float(i + 1) for i in range(sources)], sos_type=1, name=f"single{j}")
+    return md
+
+
+def build_indsched(rng, n, pmax=20):
+    """Single machine, release dates, total weighted completion time; the job
+    order is modelled with indicator constraints (y_ij = 1 -> i before j,
+    y_ij = 0 -> j before i). Start times have no upper bound, so no big-M
+    is implied by the model."""
+    p = rng.integers(1, pmax + 1, n)
+    r = rng.integers(0, int(p.sum() * 0.6) + 1, n)
+    w = rng.integers(1, 10, n)
+    md = _model("indsched")
+    s = [md.add_var(lb=float(r[j]), obj=float(w[j]), name=f"s{j}") for j in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            yij = md.add_var(vtype="B", name=f"y{i}_{j}")
+            md.add_indicator(yij, 1, s[i] - s[j] <= -float(p[i]), name=f"b{i}_{j}")
+            md.add_indicator(yij, 0, s[j] - s[i] <= -float(p[j]), name=f"a{i}_{j}")
+    return md
+
+
 BUILDERS = {
     "knapsack": build_knapsack,
     "mkp": build_mkp,
@@ -592,4 +681,7 @@ BUILDERS = {
     "transinf": build_transinf,
     "transport": build_transport,
     "randlp": build_randlp,
+    "semilot": build_semilot,
+    "pwlnet": build_pwlnet,
+    "indsched": build_indsched,
 }

@@ -23,6 +23,10 @@ from .model import (
     MAXIMIZE,
     MINIMIZE,
     PARAMS,
+    SEMICONTINUOUS,
+    SEMIINTEGER,
+    SOS1,
+    SOS2,
     Constr,
     Constraint,
     LinExpr,
@@ -31,6 +35,7 @@ from .model import (
     PopsoError,
     Result,
     Var,
+    read_lp,
     read_mps,
     version,
 )
@@ -38,6 +43,7 @@ from .model import (
 __version__ = version()
 
 __all__ = [
-    "BINARY", "CONTINUOUS", "INF", "INTEGER", "MAXIMIZE", "MINIMIZE", "PARAMS", "Constr", "Constraint",
-    "LinExpr", "Model", "Params", "PopsoError", "Result", "Var", "library_path", "read_mps", "version",
+    "BINARY", "CONTINUOUS", "INF", "INTEGER", "MAXIMIZE", "MINIMIZE", "PARAMS", "SEMICONTINUOUS", "SEMIINTEGER",
+    "SOS1", "SOS2", "Constr", "Constraint", "LinExpr", "Model", "Params", "PopsoError", "Result", "Var",
+    "library_path", "read_lp", "read_mps", "version",
 ]

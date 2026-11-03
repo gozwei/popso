@@ -104,6 +104,14 @@ class TestModel(unittest.TestCase):
         self.assertAlmostEqual(r.objective, 1.4)
         self.assertAlmostEqual(r[x], 0.8)
         self.assertAlmostEqual(r[y], 0.6)
+        for method in ("barrier", "simplex", "auto"):
+            r = m.solve(lp_method=method)
+            self.assertEqual(r.status, "OPTIMAL")
+            self.assertAlmostEqual(r.objective, 1.4)
+            self.assertAlmostEqual(r[x], 0.8)
+        self.assertEqual(m.get_param("lp_method"), 0)
+        with self.assertRaises(ValueError):
+            m.set_param("lp_method", "interior")
         y.obj = 10
         x.vtype = "I"
         self.assertEqual(x.vtype, popso.INTEGER)
@@ -214,6 +222,51 @@ class TestModel(unittest.TestCase):
             m.add_var(obj=1)
             self.assertEqual(m.name, "ctx")
         self.assertIsNone(m._h)
+
+
+class TestLogical(unittest.TestCase):
+    def test_semicontinuous_sos_indicator(self):
+        # Facility: open costs 5; closed -> no production (indicator); production semi-continuous in {0} u [3, 8];
+        # demand 4 from production (cost 1) or purchases (cost 3). Open: 5 + 4 = 9 < 12.
+        m = popso.Model("logic")
+        y = m.add_var(vtype=popso.BINARY, obj=5, name="y")
+        p = m.add_var(lb=3, ub=8, vtype=popso.SEMICONTINUOUS, obj=1, name="p")
+        q = m.add_var(obj=3, name="q")
+        m.add_constr(p + q >= 4, name="dem")
+        self.assertEqual(m.add_indicator(y, 0, p <= 0, name="closed"), 0)
+        self.assertEqual(m.num_indicators, 1)
+        self.assertEqual(p.vtype, popso.SEMICONTINUOUS)
+        r = m.solve(threads=1)
+        self.assertEqual(r.status, "OPTIMAL")
+        self.assertAlmostEqual(r.objective, 9.0, places=6)
+        self.assertAlmostEqual(r[p], 4.0, places=6)
+        # Demand 2: production must be 0 or >= 3: buy 2 (6) or open and make 3 (8) -> 6.
+        m.constrs[0].set_bounds(2, popso.INF)
+        r = m.solve()
+        self.assertAlmostEqual(r.objective, 6.0, places=6)
+        self.assertAlmostEqual(r[p], 0.0, places=6)
+
+    def test_sos_and_lp_file(self):
+        m = popso.Model()
+        xs = m.add_vars(3, ub=2, obj=[3, 2, 1], names=["a", "b", "c"])
+        m.add_constr(xs[0] + xs[1] + xs[2] <= 3)
+        m.sense = popso.MAXIMIZE
+        self.assertEqual(m.add_sos(xs, weights=[1, 2, 3], type=popso.SOS2), 0)
+        self.assertEqual(m.num_sos, 1)
+        r = m.solve(threads=1)
+        self.assertAlmostEqual(r.objective, 3 * 2 + 2 * 1, places=6)  # a = 2, b = 1 (neighbours)
+        with self.assertRaises(popso.PopsoError):
+            m.add_sos(xs, type=3)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.lp")
+            with open(path, "w") as f:
+                f.write("max\n obj: 3 a + 2 b + c\nst\n c1: a + b + c <= 3\n i: z = 1 -> a <= 0.5\nbounds\n"
+                        " a <= 2\n b <= 2\n c <= 2\nsos\n s: S1:: a:1 b:2 c:3\nend\n")
+            m2 = popso.read_lp(path)
+            self.assertEqual((m2.num_sos, m2.num_indicators), (1, 1))
+            self.assertEqual(m2.var("z").vtype, popso.BINARY)
+            r2 = m2.solve(threads=1)
+            self.assertAlmostEqual(r2.objective, 6.0, places=6)  # a = 2 with z = 0
 
 
 if __name__ == "__main__":

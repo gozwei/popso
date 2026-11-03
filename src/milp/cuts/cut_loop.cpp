@@ -58,10 +58,15 @@ void drop_if_outside(const MipProblem& p, std::vector<double>& x) {
 CutLoopStats root_cut_loop(const MipProblem& p, DualSimplex& lp, const SolverParams& params, const Logger& log,
                            const Timer& timer, double cutoff, CutData* data, bool sub_mip,
                            std::vector<Cut>* dropped, const std::function<void(const DualSimplex&)>& on_lp,
-                           const std::atomic<bool>* stop) {
+                           const std::atomic<bool>* stop, const std::function<double()>& cutoff_fn) {
   if (cuts_disabled_by_env()) return CutLoopStats{};
   CutLoopOptions opt;
   opt.on_lp = on_lp;
+  // Reduced-cost fixing between rounds: opt-in (MILP_CUTLOOP_RCFIX=1). Small root gains only
+  // (mzzv42z, ns1830653), and Gomory cuts derived from the fixed bounds are valid below the cutoff
+  // only, which root restarts (cut rows become model rows) would have to respect.
+  static const bool rcfix = [] { const char* v = std::getenv("MILP_CUTLOOP_RCFIX"); return v && *v && *v != '0'; }();
+  if (rcfix) opt.cutoff_fn = cutoff_fn;
   opt.stop = stop;
   opt.zerohalf = !sub_mip;
   opt.tol = params.tol;
@@ -159,6 +164,12 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     for (Index l : len) max_row = std::max(max_row, l);
   }
   popt.max_nnz = std::max<Index>({50, n / 4 + 20, 2 * max_row});
+  if (const char* v = std::getenv("MILP_SEL_HYBRID")) popt.hybrid = *v && *v != '0';
+  if (const char* v = std::getenv("MILP_SEL_PAR")) popt.max_parallelism_weak = std::atof(v);
+  if (const char* v = std::getenv("MILP_SEL_PARGOOD")) popt.max_parallelism = std::atof(v);
+  if (const char* v = std::getenv("MILP_SEL_GOOD")) popt.good_score = std::atof(v);
+  if (const char* v = std::getenv("MILP_SEL_OBJW")) popt.obj_weight = std::atof(v);
+  if (const char* v = std::getenv("MILP_SEL_INTW")) popt.int_weight = std::atof(v);
   // Cut rows: up to max(1000, 2 m0); sparse cuts up to twice that while their nonzeros
   // stay below twice those of the problem (degenerate models may need a cut per bin and pattern).
   const Index max_cut_rows = std::max<Index>(1000, 2 * m0);
@@ -171,10 +182,14 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   const double itol = opt.tol.integrality;
   std::vector<double> debug_sol = load_debug_solution(n);
   drop_if_outside(p, debug_sol);
+  int rc_fixed_total = 0;  // reduced-cost fixings in the LP (below)
+  double rc_cutoff = kInf;
   auto record = [&](const std::vector<Cut>& cuts) {
     if (all_cuts) all_cuts->insert(all_cuts->end(), cuts.begin(), cuts.end());
     for (const Cut& c : cuts) {
       if (debug_sol.empty()) break;
+      // Reduced-cost fixings below the cutoff may exclude the debug solution legitimately.
+      if (rc_fixed_total > 0 && p.objective(debug_sol) - p.offset >= rc_cutoff - 1e-9) break;
       const double viol = c.activity(debug_sol.data()) - c.rhs;
       if (viol > 1e-6 * std::max(1.0, std::abs(c.rhs))) {
         log.log(0, "DEBUG-SOL: %s cut violated by the debug solution (%g)\n", c.origin, viol);
@@ -182,7 +197,57 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     }
   };
 
+  // Reduced-cost fixing in the LP between rounds against the current cutoff (incumbents found
+  // while the loop runs, e.g. by the FJ thread): nonbasic integers whose reduced cost exceeds the
+  // slack are fixed in the LP for the rest of the loop (as SCIP does at the root), so later
+  // rounds separate a tighter LP. Changing the opposite bound of a nonbasic column keeps the basis
+  // optimal; the original bounds are restored at the end. Cuts derived from these bounds (Gomory)
+  // are valid for solutions better than the cutoff, as the search's own reduced-cost fixings.
+  std::vector<std::pair<Index, std::pair<double, double>>> rc_saved;  // column, original bounds
+  std::vector<char> rc_changed(n, 0);
+  auto rc_fix = [&]() {
+    if (!opt.cutoff_fn) return;
+    static const char* diag = std::getenv("MILP_CL_CUTOFF");  // diagnostics: a known cutoff (internal sense, no offset)
+    const double co = diag ? std::min(std::atof(diag), opt.cutoff_fn()) : opt.cutoff_fn();
+    const double z = lp.objective(), slack = co - z;
+    if (!is_finite(co) || !(slack >= 0.0)) return;
+    rc_cutoff = std::min(rc_cutoff, co);
+    for (Index j = 0; j < n; ++j) {
+      if (!p.is_int[j]) continue;
+      const double lo = lp.col_lower(j), up = lp.col_upper(j);
+      if (lo == up) continue;
+      const VarStatus st = lp.status(j);
+      const double d = lp.reduced_cost(j);
+      double nlo = lo, nup = up;
+      if (st == VarStatus::AtLower && d > 1e-7 && is_finite(lo)) {
+        nup = std::min(up, lo + std::floor(slack / d + 1e-9));
+      } else if (st == VarStatus::AtUpper && d < -1e-7 && is_finite(up)) {
+        nlo = std::max(lo, up - std::floor(slack / -d + 1e-9));
+      }
+      if (nlo > lo + 0.5 || nup < up - 0.5) {
+        if (!rc_changed[j]) rc_changed[j] = 1, rc_saved.push_back({j, {lo, up}});
+        lp.set_col_bounds(j, nlo, nup);
+        ++rc_fixed_total;
+      }
+    }
+  };
+
   int degenerate_rounds = 0;  // rounds that ended on a dual degenerate LP
+  // Dual degeneracy: share of nonbasic structurals with zero reduced cost. On such LPs
+  // cuts often only move the solution to an alternative optimum for several rounds
+  // (bin packing like models with many identical bins) before the bound moves.
+  auto is_dual_degenerate = [&]() {
+    Index nonbasic = 0, degenerate = 0;
+    for (Index j = 0; j < n; ++j) {
+      if (lp.status(j) == VarStatus::Basic || lp.var_lower(j) == lp.var_upper(j)) continue;
+      ++nonbasic;
+      degenerate += std::abs(lp.reduced_cost(j)) <= 1e-9;
+    }
+    return nonbasic > 0 && degenerate >= 0.8 * nonbasic;
+  };
+  bool last_degenerate = is_dual_degenerate();
+  const bool initial_degenerate = last_degenerate;
+  log.log(2, "  initial LP %s dual degenerate\n", initial_degenerate ? "is" : "is not");
   std::vector<double> sep_time(seps.size(), 0.0);
   auto cheap = [&]() {
     return lp.iterations() - iters0 <= std::max<long long>(opt.cheap_work * (iters0 - iters_start), 20000);
@@ -191,6 +256,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     if (timer.elapsed() >= opt.time_limit) break;
     if (opt.stop && opt.stop->load()) break;
     if (round > opt.max_rounds && !cheap()) break;
+    rc_fix();
     const double* x = lp.x();
     bool frac = false;
     for (Index j = 0; j < n && !frac; ++j) {
@@ -201,6 +267,12 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     // Separate. Cuts dropped earlier for slack compete again when violated (on
     // degenerate LPs the solution otherwise cycles between alternative optima).
     SepaContext ctx{p, lp, x, m0, data, round, popt.max_nnz};
+    // On dual degenerate LPs (cuts mostly move the solution between alternative optima, many cheap
+    // rounds are typical) separators skip their expensive variants (c-MIR paths through integer
+    // columns): neos-3381206-awhea's flat rounds are capped by time, and once its bound moves the
+    // extra cuts derail it (root 100% -> 84% closed, solve 10 s -> TL; mzzv11 is not degenerate).
+    ctx.expensive = !initial_degenerate &&
+                    !(last_degenerate && obj - stats.bound_before <= 1e-9 * std::max(1.0, std::abs(obj)));
     CutPool pool(p, popt);
     std::vector<Cut> cand;
     int found[8] = {0}, raw[8] = {0}, from_pool = 0;
@@ -332,16 +404,8 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
       row_cuts.resize(w);
     }
 
-    // Dual degeneracy: share of nonbasic structurals with zero reduced cost. On such LPs
-    // cuts often only move the solution to an alternative optimum for several rounds
-    // (bin packing like models with many identical bins) before the bound moves.
-    Index nonbasic = 0, degenerate = 0;
-    for (Index j = 0; j < n; ++j) {
-      if (lp.status(j) == VarStatus::Basic || lp.var_lower(j) == lp.var_upper(j)) continue;
-      ++nonbasic;
-      degenerate += std::abs(lp.reduced_cost(j)) <= 1e-9;
-    }
-    const bool dual_degenerate = nonbasic > 0 && degenerate >= 0.8 * nonbasic;
+    const bool dual_degenerate = is_dual_degenerate();
+    last_degenerate = dual_degenerate;
     degenerate_rounds += dual_degenerate;
 
     if (log.verbosity() >= 2) {
@@ -399,6 +463,21 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
       len += std::snprintf(buf + len, sizeof(buf) - len, " %s %.2fs", seps[s]->name(), sep_time[s]);
     }
     log.log(2, "  separation time:%s; LP re-solves %.2fs\n", buf, lp_time);
+    // Cut rows left in the LP by separator (compare with other solvers' "cutting planes" statistics).
+    std::vector<std::pair<std::string, int>> by_origin;
+    for (const Cut& c : row_cuts) {
+      auto it = std::find_if(by_origin.begin(), by_origin.end(), [&](const auto& e) { return e.first == c.origin; });
+      if (it == by_origin.end()) by_origin.emplace_back(c.origin, 1);
+      else ++it->second;
+    }
+    std::string s;
+    for (const auto& [name, cnt] : by_origin) s += " " + name + " " + std::to_string(cnt);
+    log.log(2, "  cut rows by separator:%s\n", s.c_str());
+  }
+  if (!rc_saved.empty()) {
+    // Restore the bounds (boxed columns left at the wrong bound are flipped by the next solve).
+    for (const auto& [j, b] : rc_saved) lp.set_col_bounds(j, b.first, b.second);
+    log.log(2, "  cut loop reduced-cost fixing: %d bound changes on %zu columns\n", rc_fixed_total, rc_saved.size());
   }
   // Cuts that did not move the bound only make node LPs larger: drop them all.
   if (stats.rounds > 0 && lp.num_rows() > m0 &&
@@ -410,7 +489,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   }
   // Removing basic rows keeps the basis optimal; re-solve cheaply so that the
   // LP state is consistent for the caller.
-  if (stats.rounds > 0) solve();
+  if (stats.rounds > 0 || !rc_saved.empty()) solve();
   if (dropped_out) {
     for (Cut& c : dropped) c.pool_id = -1;
     *dropped_out = std::move(dropped);

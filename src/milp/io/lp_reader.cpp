@@ -53,7 +53,7 @@ double to_inf(double v) {
   return v;
 }
 
-enum class T : uint8_t { Name, Number, Le, Ge, Eq, Plus, Minus, Colon, Eof };
+enum class T : uint8_t { Name, Number, Le, Ge, Eq, Plus, Minus, Colon, Arrow, Eof };
 
 struct Token {
   T type;
@@ -118,6 +118,7 @@ class LpParser {
   double parse_signed_number(const char* what);
   void parse_constraint();
   void parse_bound();
+  void parse_sos(int default_type);
   void add_row(string_view name, uint32_t line, double lo, double hi);
 
   string_view text_;
@@ -137,6 +138,13 @@ class LpParser {
   std::vector<double> obj_, lb_, ub_;
   std::vector<VarType> type_;
   std::vector<char> lb_set_;
+  std::vector<char> semi_;  // listed in the semi-continuous section
+
+  // Indicator constraints; the one being parsed (ind_col_ >= 0) goes to indicators_ instead of the rows.
+  Index ind_col_ = -1;
+  int ind_value_ = 1;
+  std::vector<IndicatorConstraint> indicators_;
+  std::vector<SosConstraint> sos_;
 
   std::unordered_set<string_view> row_name_set_;
   std::vector<string_view> row_names_;
@@ -160,6 +168,7 @@ std::string LpParser::describe(const Token& t) {
     case T::Plus: return "'+'";
     case T::Minus: return "'-'";
     case T::Colon: return "':'";
+    case T::Arrow: return "'->'";
     case T::Eof: return "end of file";
   }
   return "?";
@@ -254,7 +263,7 @@ void LpParser::tokenize() {
       switch (c) {
         case '<':
           if (nx == '=') ++p;
-          else if (nx == '-' && p + 1 < end && p[1] == '>') fail("indicator constraints ('<->') are not supported yet");
+          else if (nx == '-' && p + 1 < end && p[1] == '>') fail("equivalence constraints ('<->') are not supported");
           t.type = T::Le;
           break;
         case '>':
@@ -271,8 +280,8 @@ void LpParser::tokenize() {
           break;
         case '+': t.type = T::Plus; break;
         case '-':
-          if (nx == '>') fail("indicator constraints ('->') are not supported yet");
-          t.type = T::Minus;
+          if (nx == '>') ++p, t.type = T::Arrow;
+          else t.type = T::Minus;
           break;
         case ':': t.type = T::Colon; break;
         case '[':
@@ -348,6 +357,7 @@ int LpParser::keyword(size_t i, Sec& sec, std::string& what) const {
   }
   if (iequals_any(w, {"sos", "sos1", "sos2"})) {
     sec = Sec::Sos;
+    what = std::string(w);
     return 1;
   }
   if (iequals(w, "end")) {
@@ -381,6 +391,7 @@ Index LpParser::col(string_view name) {
     ub_.push_back(kInf);
     type_.push_back(VarType::Continuous);
     lb_set_.push_back(0);
+    semi_.push_back(0);
   }
   return it->second;
 }
@@ -457,12 +468,25 @@ double LpParser::parse_signed_number(const char* what) {
 void LpParser::add_row(string_view name, uint32_t line, double lo, double hi) {
   if (lo == kInf || hi == -kInf)
     error_at(line, "invalid right-hand side in constraint" + (name.empty() ? std::string() : " '" + std::string(name) + "'"));
-  const Index r = static_cast<Index>(row_lb_.size());
   if (!name.empty() && !row_name_set_.insert(name).second)
     error_at(line, "duplicate constraint name '" + std::string(name) + "'");
-  row_names_.push_back(name);
-  row_lb_.push_back(lo);
-  row_ub_.push_back(hi);
+  IndicatorConstraint* ind = nullptr;
+  Index r = -1;
+  if (ind_col_ >= 0) {
+    indicators_.emplace_back();
+    ind = &indicators_.back();
+    ind->name = name.empty() ? "IND" + std::to_string(indicators_.size()) : std::string(name);
+    ind->binary = ind_col_;
+    ind->value = ind_value_;
+    ind->lb = lo;
+    ind->ub = hi;
+    ind_col_ = -1;
+  } else {
+    r = static_cast<Index>(row_lb_.size());
+    row_names_.push_back(name);
+    row_lb_.push_back(lo);
+    row_ub_.push_back(hi);
+  }
   // Sum duplicate terms; keep the order of first appearance.
   if (acc_.size() < col_names_.size()) {
     acc_.resize(col_names_.size(), 0.0);
@@ -478,7 +502,10 @@ void LpParser::add_row(string_view name, uint32_t line, double lo, double hi) {
     acc_[j] += v;
   }
   for (Index j : order) {
-    if (acc_[j] != 0.0) {
+    if (acc_[j] != 0.0 && ind) {
+      ind->cols.push_back(j);
+      ind->coefs.push_back(acc_[j]);
+    } else if (acc_[j] != 0.0) {
       trip_col_.push_back(j);
       trip_row_.push_back(r);
       trip_val_.push_back(acc_[j]);
@@ -497,6 +524,15 @@ void LpParser::parse_constraint() {
     pos_ += 2;
   }
   auto where = [&]() { return name.empty() ? std::string(" in constraint") : " in constraint '" + std::string(name) + "'"; };
+  // Indicator constraint: "[name:] b = 0|1 -> expr op rhs".
+  ind_col_ = -1;
+  if (is_var_name(pos_) && at(pos_ + 1).type == T::Eq && at(pos_ + 3).type == T::Arrow) {
+    if (at(pos_ + 2).type != T::Number || (at(pos_ + 2).value != 0.0 && at(pos_ + 2).value != 1.0))
+      error("the indicator value must be 0 or 1" + where());
+    ind_col_ = col(cur().text);
+    ind_value_ = static_cast<int>(at(pos_ + 2).value);
+    pos_ += 4;
+  }
   terms_.clear();
   double c1 = 0.0;
   int nvars1 = 0;
@@ -618,6 +654,7 @@ Model LpParser::parse() {
     error_at(toks_.front().line, "this looks like an lp_solve-format file; only the CPLEX LP format is supported");
 
   Sec sec = Sec::None;
+  int sos_type = 0;  // a "SOS1" / "SOS2" section header gives the type of entries without "S1::"
   bool seen_objective = false, seen_section = false;
   while (cur().type != T::Eof) {
     Sec s = Sec::None;
@@ -631,6 +668,7 @@ Model LpParser::parse() {
         break;
       }
       if (s == Sec::Unsupported) error_at(kw.line, what + " are not supported yet");
+      if (s == Sec::Sos) sos_type = iequals(what, "sos1") ? 1 : iequals(what, "sos2") ? 2 : 0;
       seen_section = true;
       if (s == Sec::Objective) {
         if (seen_objective) error_at(kw.line, "multiple objective sections are not supported");
@@ -659,15 +697,29 @@ Model LpParser::parse() {
         ++pos_;
         break;
       }
-      case Sec::Semi: error("semi-continuous variables are not supported yet");
-      case Sec::Sos: error("SOS constraints are not supported yet");
+      case Sec::Semi: {
+        if (!is_var_name(pos_)) error("expected a variable name in the semi-continuous section, found " + describe(cur()));
+        semi_[col(cur().text)] = 1;
+        ++pos_;
+        break;
+      }
+      case Sec::Sos: parse_sos(sos_type); break;
       default: error("unexpected " + describe(cur()));
     }
   }
   if (!seen_section) error_at(cur().line, "no objective or constraint section found (not an LP file?)");
 
+  // Indicator variables must be binary: undeclared (continuous) ones are made binary.
+  for (const IndicatorConstraint& c : indicators_) {
+    if (type_[c.binary] == VarType::Continuous && !semi_[c.binary]) type_[c.binary] = VarType::Binary;
+  }
   const size_t n = col_names_.size(), nr = row_lb_.size();
   for (size_t j = 0; j < n; ++j) {
+    if (semi_[j]) {
+      // Semi-continuous; semi-integer if also General or Binary.
+      type_[j] = type_[j] == VarType::Continuous ? VarType::SemiContinuous : VarType::SemiInteger;
+      continue;
+    }
     if (type_[j] == VarType::Binary) {
       lb_[j] = std::max(lb_[j], 0.0);
       ub_[j] = std::min(ub_[j], 1.0);
@@ -706,12 +758,50 @@ Model LpParser::parse() {
   m.row_lb = std::move(row_lb_);
   m.row_ub = std::move(row_ub_);
   m.A = SparseMatrix::from_triplets(static_cast<Index>(n), static_cast<Index>(nr), trip_col_, trip_row_, trip_val_);
+  m.sos = std::move(sos_);
+  m.indicators = std::move(indicators_);
   try {
     m.validate();
   } catch (const std::exception& e) {
     throw LpError(source_ + ": " + e.what());
   }
   return m;
+}
+
+// One SOS entry: "[name:] S1:: x1:w1 x2:w2 ..." (or "S2::"). In a "SOS1" / "SOS2" section the
+// type may be omitted. Each member is "variable:weight".
+void LpParser::parse_sos(int default_type) {
+  SosConstraint s;
+  auto type_spec = [&](size_t i) {
+    const Token& t = at(i);
+    return t.type == T::Name && t.text.size() == 2 && lower(t.text[0]) == 's' && (t.text[1] == '1' || t.text[1] == '2') &&
+           at(i + 1).type == T::Colon && at(i + 2).type == T::Colon;
+  };
+  const uint32_t line = cur().line;
+  if (!type_spec(pos_) && cur().type == T::Name && at(pos_ + 1).type == T::Colon && at(pos_ + 2).type != T::Number) {
+    s.name = std::string(cur().text);
+    pos_ += 2;
+  }
+  if (type_spec(pos_)) {
+    s.type = cur().text[1] - '0';
+    pos_ += 3;
+  } else if (default_type > 0) {
+    s.type = default_type;
+  } else {
+    error("expected 'S1::' or 'S2::' in SOS section, found " + describe(cur()));
+  }
+  if (s.name.empty()) s.name = "SOS" + std::to_string(sos_.size() + 1);
+  // Members: name ':' number, until the next entry (a name followed by ':' and not a number) or keyword.
+  while (cur().type == T::Name && at(pos_ + 1).type == T::Colon && at(pos_ + 2).type == T::Number &&
+         !at_keyword() && !type_spec(pos_)) {
+    s.cols.push_back(col(cur().text));
+    s.weights.push_back(at(pos_ + 2).value);
+    pos_ += 3;
+  }
+  if (s.cols.empty()) error_at(line, "SOS '" + s.name + "' has no members (expected 'variable:weight')");
+  if (cur().type != T::Eof && !at_keyword() && !(cur().type == T::Name && at(pos_ + 1).type == T::Colon))
+    error("unexpected " + describe(cur()) + " in SOS section");
+  sos_.push_back(std::move(s));
 }
 
 std::string read_file(const std::string& path) {

@@ -118,6 +118,19 @@ CONFIG = [
     ("randlp", "small", 1, dict(cols=50, rows=30, density=0.1)),
     ("randlp", "medium", 1, dict(cols=1000, rows=600, density=0.01)),
     ("randlp", "large", 1, dict(cols=8000, rows=5000, density=0.0015)),
+    # ---- logical constraints (semi-continuous, SOS, indicators)
+    ("semilot", "tiny", 1, dict(n=8, m=3)),
+    ("semilot", "small", 1, dict(n=25, m=5)),
+    ("semilot", "medium", 1, dict(n=60, m=10)),
+    ("semilot", "large", 1, dict(n=150, m=20)),
+    ("pwlnet", "tiny", 1, dict(sources=3, sinks=4)),
+    ("pwlnet", "small", 1, dict(sources=5, sinks=10)),
+    ("pwlnet", "medium", 1, dict(sources=8, sinks=20)),
+    ("pwlnet", "large", 1, dict(sources=12, sinks=40, K=6)),
+    ("indsched", "tiny", 1, dict(n=4)),
+    ("indsched", "small", 1, dict(n=6)),
+    ("indsched", "medium", 1, dict(n=8)),
+    ("indsched", "large", 1, dict(n=10)),
 ]
 
 

@@ -122,6 +122,65 @@ void CliqueSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   };
   std::vector<Index> adj_stamp(2 * static_cast<size_t>(n), -1);
   std::vector<std::vector<Index>> seen;  // sorted cliques already emitted
+  // Maximal cliques: a violated clique over the positive literals is extended by literals at
+  // value 0 adjacent to all its members (same violation, a stronger cut: SCIP's clique separator
+  // also returns maximal cliques). Full adjacency over the row cliques and probing conflicts,
+  // under a work budget per call.
+  static const bool extend = [] { const char* v = std::getenv("MILP_CLIQUE_EXTEND"); return !(v && *v == '0'); }();
+  const long long nnz = static_cast<long long>(p.A.index.size());
+  long long ext_work = 0;
+  const long long ext_budget = std::clamp<long long>(10 * nnz, 200000LL, 20000000LL);
+  std::vector<int> ext_stamp(2 * static_cast<size_t>(n), 0);
+  int ext_gen = 0;
+  auto degree = [&](Index u) {
+    long long d = probed ? cs[u + 1] - cs[u] : 0;
+    for (Index c : lit_cliques_[u]) d += static_cast<long long>(cliques_[c].size());
+    return d;
+  };
+  auto for_each_nbr = [&](Index u, auto&& fn) {
+    for (Index c : lit_cliques_[u]) {
+      for (Index v : cliques_[c]) {
+        if (v != u) fn(v);
+      }
+    }
+    if (probed) {
+      for (Index k = cs[u]; k < cs[u + 1]; ++k) fn(cl[k]);
+    }
+  };
+  constexpr long long kMaxExtDegree = 20000;
+  std::vector<Index> ext_cand, in_k;
+  auto extend_clique = [&](std::vector<Index>& K) {
+    if (ext_work >= ext_budget) return;
+    Index k0 = K[0];
+    long long d0 = degree(k0);
+    for (Index k : K) {
+      const long long d = degree(k);
+      if (d < d0) k0 = k, d0 = d;
+    }
+    if (d0 > kMaxExtDegree) return;
+    ext_work += d0;
+    // Candidates: neighbours of k0 not in K and not positive in x (those were tried by the greedy).
+    ++ext_gen;
+    for (Index k : K) ext_stamp[k] = ext_gen;
+    ext_cand.clear();
+    for_each_nbr(k0, [&](Index v) {
+      if (ext_stamp[v] == ext_gen || is_frac[v]) return;
+      ext_stamp[v] = ext_gen;
+      ext_cand.push_back(v);
+    });
+    std::sort(ext_cand.begin(), ext_cand.end());
+    for (Index w : ext_cand) {
+      if (ext_work >= ext_budget) break;
+      const long long dw = degree(w);
+      if (dw > kMaxExtDegree) continue;
+      ext_work += dw + static_cast<long long>(K.size());
+      ++ext_gen;
+      for_each_nbr(w, [&](Index v) { ext_stamp[v] = ext_gen; });
+      bool all = true;
+      for (Index k : K) all = all && (k == k0 || ext_stamp[k] == ext_gen);
+      if (all) K.push_back(w);
+    }
+  };
   int made = 0;
   // Greedy growth depends on the start, so seed it with every pair {u, v}
   // (u's strongest neighbours first) and keep the distinct violated cliques.
@@ -147,6 +206,7 @@ void CliqueSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
       std::sort(K.begin(), K.end());
       if (std::find(seen.begin(), seen.end(), K) != seen.end()) continue;
       seen.push_back(K);
+      if (extend) extend_clique(K);
       Cut c;
       c.origin = "clique";
       c.rhs = 1.0;

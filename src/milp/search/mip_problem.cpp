@@ -46,8 +46,36 @@ double MipProblem::max_violation(const std::vector<double>& x, double* int_viol)
     for (Index p = A.begin(j); p < A.end(j); ++p) act[A.index[p]] += A.value[p] * x[j];
   }
   for (Index i = 0; i < num_rows(); ++i) viol = std::max({viol, row_lb[i] - act[i], act[i] - row_ub[i]});
+  for (const Implication& im : implications) {
+    if (std::abs(x[im.z] - im.zval) < 0.5) viol = std::max(viol, std::abs(x[im.col]));
+  }
   if (int_viol) *int_viol = iv;
   return std::max(viol, iv);
+}
+
+bool MipProblem::apply_implications(std::vector<double>& lb, std::vector<double>& ub, std::vector<Index>* changed) const {
+  for (bool again = true; again;) {
+    again = false;
+    for (const Implication& im : implications) {
+      const Index z = im.z, c = im.col;
+      const bool z_fixed = lb[z] == ub[z] && std::abs(lb[z] - im.zval) < 0.5;
+      if (z_fixed) {
+        if (lb[c] > 0.0 || ub[c] < 0.0) return false;
+        if (lb[c] != 0.0 || ub[c] != 0.0) {
+          lb[c] = ub[c] = 0.0;
+          if (changed) changed->push_back(c);
+        }
+      } else if ((lb[c] > 0.0 || ub[c] < 0.0) && lb[z] <= im.zval && im.zval <= ub[z]) {
+        // col cannot be 0: z must take another value (z is binary here).
+        const double other = im.zval >= 0.5 ? 0.0 : 1.0;
+        if (other < lb[z] || other > ub[z]) return false;
+        lb[z] = ub[z] = other;
+        if (changed) changed->push_back(z);
+        again = true;
+      }
+    }
+  }
+  return true;
 }
 
 }  // namespace milp

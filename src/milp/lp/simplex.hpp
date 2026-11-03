@@ -10,6 +10,7 @@
 // Designed for branch-and-bound: bounds can be changed and the solve warm
 // started from the previous (dual feasible) basis.
 
+#include <atomic>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -38,6 +39,11 @@ struct LpOptions {
   Tolerances tol;
   int refactor_interval = 100;
   int verbosity = 0;
+  // Crossover cleanup: if the starting basis is primal feasible but not dual feasible, run primal
+  // simplex pivots first (instead of the dual phase 1, which would give up primal feasibility).
+  bool primal_first = false;
+  // Stops the solve (status TimeLimit) once set, e.g. when a concurrent method has finished.
+  const std::atomic<bool>* stop = nullptr;
 };
 
 class DualSimplex {

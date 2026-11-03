@@ -291,8 +291,12 @@ void check_cuts_valid(const MipProblem& p, const CutLoopOptions& opt, int* ncuts
   // Flow cover cuts are opt-in in the solver; the validity tests always include them.
 #ifdef _WIN32
   _putenv_s("MILP_FLOWCOVER", "1");
+  _putenv_s("MILP_MIR_INTAGG", "1");
+  _putenv_s("MILP_MIR_INTAGG_GENERAL", "0");  // integer path aggregation through binaries too
 #else
   setenv("MILP_FLOWCOVER", "1", 1);
+  setenv("MILP_MIR_INTAGG", "1", 1);
+  setenv("MILP_MIR_INTAGG_GENERAL", "0", 1);  // integer path aggregation through binaries too
 #endif
   DualSimplex lp;
   lp.load(p.A, p.cost, p.col_lb, p.col_ub, p.row_lb, p.row_ub);
@@ -362,6 +366,37 @@ TEST(cuts_clique_from_conflicts) {
   CutLoopStats st = cut_loop(p, lp, only(false, false, false, true), log, timer, kInf, &cuts);
   CHECK_NEAR(st.bound_before, -1.5, 1e-9);
   CHECK_NEAR(st.bound_after, -1.0, 1e-6);
+  for (const Cut& c : cuts) CHECK(cut_max_violation(p, c) <= 1e-9);
+}
+
+TEST(cuts_clique_extended_to_maximal) {
+  // max x0 + x1 + x2 - 0.1 x3, all pairs conflict (x3 with each other one too): LP x0 = x1 = x2 = 1/2,
+  // x3 = 0. The violated clique x0 + x1 + x2 <= 1 is extended by x3 (LP value 0) to a maximal one.
+  ModelBuilder b;
+  for (int j = 0; j < 4; ++j) b.add_col("x" + std::to_string(j), j < 3 ? 1.0 : -0.1, 0, 1, VarType::Binary);
+  for (int u = 0; u < 4; ++u) {
+    for (int v = u + 1; v < 4; ++v) {
+      Index row = b.add_row("p", -kInf, 1.0);
+      b.add_coef(row, u, 1.0);
+      b.add_coef(row, v, 1.0);
+    }
+  }
+  b.model().sense = ObjSense::Maximize;
+  MipProblem p = make_problem(b.build());
+  DualSimplex lp;
+  lp.load(p.A, p.cost, p.col_lb, p.col_ub, p.row_lb, p.row_ub);
+  Logger log(0);
+  Timer timer;
+  std::vector<Cut> cuts;
+  CutLoopStats st = cut_loop(p, lp, only(false, false, false, true), log, timer, kInf, &cuts);
+  CHECK_NEAR(st.bound_before, -1.5, 1e-9);
+  CHECK_NEAR(st.bound_after, -1.0, 1e-6);
+  REQUIRE(!cuts.empty());
+  size_t clique_len = 0;
+  for (const Cut& c : cuts) {
+    if (std::string(c.origin) == "clique") clique_len = std::max(clique_len, c.idx.size());
+  }
+  CHECK_EQ(clique_len, 4u);
   for (const Cut& c : cuts) CHECK(cut_max_violation(p, c) <= 1e-9);
 }
 

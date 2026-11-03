@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "popso"
-version = "0.1.0"
+version = "0.2.1"
 description = "Python bindings (ctypes) for the popso LP/MILP solver"
 license = {text = "Apache-2.0"}
 authors = [{name = "Marcin Polkowski"}]

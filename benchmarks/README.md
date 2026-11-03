@@ -76,7 +76,7 @@ Generation is deterministic (seed derived from family/size/seed via SHA-256;
 numpy `default_rng`).  Changing a family's code changes its instances, so
 re-run `reference.py` for it afterwards.
 
-118 instances: 84 generated (20 families) + 34 hand-written `lpsanity_*`.
+130 instances: 96 generated (23 families) + 34 hand-written `lpsanity_*`.
 Cells: `vars x cons` and the HiGHS 1.15 reference time (1 thread, gap 1e-9,
 2-6 solves running concurrently, Apple M-series); non-optimal status noted.
 
@@ -102,6 +102,14 @@ Cells: `vars x cons` and the HiGHS 1.15 reference time (1 thread, gap 1e-9,
 | transinf (LP-infeasible) |  | 40x13 | 1500x80 |  |  |
 | transport (LP) |  | 200x30 0.0s | 5000x150 0.0s | 45000x450 0.4s |  |
 | randlp (LP) |  | 50x30 0.0s | 1000x600 0.0s | 8000x5000 39.9s |  |
+| semilot (min lot sizes, SC/SI) | 8x3 0.0s | 25x5 0.0s | 60x10 0.1s | 150x20 1.3s |  |
+| pwlnet (SOS2 costs, SOS1, indicators)\* | 30x10+3 0.0s | 80x20+5 0.0s | 208x36+8 0.2s | 576x64+12 5.1s |  |
+| indsched (indicator disjunctions)\* | 10x0+12 0.0s | 21x0+30 0.0s | 36x0+56 0.0s | 55x0+90 0.0s |  |
+
+\* SCIP reference time: HiGHS reads semi-continuous variables but not SOS or
+indicator constraints (the 12 instances of the three logical-constraint
+families have SCIP references, `semilot` also HiGHS ones; they are not in
+the counts below; `+k`: k indicator constraints besides the rows).
 
 HiGHS time distribution over all 118: 72 <= 0.1 s, 11 in 0.1-1 s, 15 in
 1-10 s, 14 in 10-60 s, 3 in 60-120 s, 2 in 120-600 s, 1 time-out

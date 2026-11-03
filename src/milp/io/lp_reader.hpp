@@ -18,6 +18,14 @@
 //  - General/Generals/Gen/Integer/Integers: integer variables (default bounds
 //    [0, +inf)); Binary/Binaries/Bin: binary variables (bounds intersected
 //    with [0, 1]).
+//  - Semi-Continuous/Semis/Semi: semi-continuous variables (x = 0 or
+//    lb <= x <= ub, bounds from the Bounds section); semi-integer if also
+//    General or Binary.
+//  - SOS (or SOS1/SOS2): entries "[name:] S1:: x1:w1 x2:w2 ..." (S2:: for
+//    SOS2; in a SOS1/SOS2 section the type may be omitted).
+//  - Indicator constraints in the constraints section:
+//    "[name:] b = 1 -> expr op rhs" (or "b = 0 -> ..."). An indicator
+//    variable not declared integer is made binary.
 //  - End. Anything after End is ignored.
 //  - Comments start with a backslash and run to the end of the line. A first
 //    comment "\Problem name: <name>" sets the model name.
@@ -33,11 +41,10 @@
 //    constraints, bounds, then integer sections); variables that appear only
 //    in Bounds or General/Binary sections are created there.
 //
-// Not supported (rejected with a "not supported yet" error, never silently
-// misparsed): quadratic terms ('[' ... ']', '^'), indicator constraints
-// ('->'), semi-continuous variables, SOS, lazy constraints / user cuts,
-// general constraints and multiple objectives. Empty Semi-Continuous and SOS
-// sections (HiGHS writes them) are accepted.
+// Not supported (rejected with a "not supported" error, never silently
+// misparsed): quadratic terms ('[' ... ']', '^'), equivalence constraints
+// ('<->'), lazy constraints / user cuts, general constraints and multiple
+// objectives.
 //
 // Errors are thrown as LpError with "<source>:<line>: <message>". Warnings
 // go to `warnings` if given, otherwise to stderr (capped).

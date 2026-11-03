@@ -149,6 +149,12 @@ static void test_errors_and_params(void) {
   CHECK_OK(popso_set_param(m, "node_limit", 1000));
   CHECK_OK(popso_set_param(m, "mem_limit", 512));
   CHECK_OK(popso_set_param(m, "presolve", 0));
+  CHECK(popso_set_param(m, "lp_method", 3) == POPSO_ERROR_INVALID_ARGUMENT);
+  CHECK_OK(popso_get_param(m, "lp_method", &v));
+  CHECK(v == 0.0); /* auto */
+  CHECK_OK(popso_set_param(m, "lp_method", 2));
+  CHECK_OK(popso_get_param(m, "lp_method", &v));
+  CHECK(v == 2.0);
   CHECK_OK(popso_get_param(m, "threads", &v));
   CHECK(v == 2.0);
   CHECK_OK(popso_get_param(m, "verbosity", &v));
@@ -248,8 +254,85 @@ static void test_files_and_start(void) {
   remove(sol);
 }
 
+/* Semi-continuous variables, SOS constraints and indicator constraints.
+ * min x + 10 y + 3 b + 0.1 u + 0.2 v  s.t.  x + y >= 1, u + v >= 1 (u, v SOS1, the larger index preferred
+ * by cost), x semi-continuous in {0} u [2, 5]; indicator b = 0 -> x <= 0 (x needs b = 1).
+ * Optimum: x = 2, b = 1, u = 1: 2 + 3 + 0.1 = 5.1 (y = 1 instead costs 10). */
+static void test_logical(void) {
+  popso_model* m = popso_create();
+  int x, y, b, u, v, k, idx = -1, vt;
+  double obj, sol[5], lb, ub;
+  CHECK_OK(popso_add_var(m, 2.0, 5.0, 1.0, POPSO_SEMICONTINUOUS, "x", &x));
+  CHECK_OK(popso_add_var(m, 0.0, POPSO_INFINITY, 10.0, POPSO_CONTINUOUS, "y", &y));
+  CHECK_OK(popso_add_var(m, 0.0, 1.0, 3.0, POPSO_BINARY, "b", &b));
+  CHECK_OK(popso_add_var(m, 0.0, 4.0, 0.1, POPSO_CONTINUOUS, "u", &u));
+  CHECK_OK(popso_add_var(m, 0.0, 4.0, 0.2, POPSO_CONTINUOUS, "v", &v));
+  CHECK_OK(popso_get_var(m, x, &lb, &ub, NULL, &vt));
+  CHECK(vt == POPSO_SEMICONTINUOUS && lb == 2.0 && ub == 5.0);
+  {
+    const int c1[2] = {x, y}, c2[2] = {u, v};
+    const double one[2] = {1.0, 1.0};
+    CHECK_OK(popso_add_row(m, 2, c1, one, 1.0, POPSO_INFINITY, "dem", NULL));
+    CHECK_OK(popso_add_row(m, 2, c2, one, 1.0, POPSO_INFINITY, "uv", NULL));
+    CHECK_OK(popso_add_sos(m, POPSO_SOS1, 2, c2, NULL, "s", &idx));
+    CHECK(idx == 0 && popso_num_sos(m) == 1);
+  }
+  {
+    const double w[2] = {1.0, 1.0};
+    const int c2[2] = {u, v};
+    CHECK(popso_add_sos(m, 3, 2, c2, NULL, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT);
+    CHECK(popso_add_sos(m, POPSO_SOS2, 2, c2, w, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT); /* equal weights */
+  }
+  {
+    const double one = 1.0;
+    CHECK_OK(popso_add_indicator(m, b, 0, 1, &x, &one, -POPSO_INFINITY, 0.0, "off", &idx));
+    CHECK(idx == 0 && popso_num_indicators(m) == 1);
+    CHECK(popso_add_indicator(m, y, 1, 1, &x, &one, -POPSO_INFINITY, 0.0, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT);
+    CHECK(popso_add_indicator(m, b, 2, 1, &x, &one, -POPSO_INFINITY, 0.0, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT);
+  }
+  CHECK_OK(popso_set_param(m, "threads", 1));
+  CHECK_OK(popso_solve(m));
+  CHECK(popso_get_status(m) == POPSO_STATUS_OPTIMAL);
+  CHECK_OK(popso_get_objective(m, &obj));
+  CHECK_NEAR(obj, 5.1);
+  CHECK_OK(popso_get_solution(m, sol, 5));
+  CHECK_NEAR(sol[x], 2.0);
+  CHECK_NEAR(sol[b], 1.0);
+  CHECK_NEAR(sol[u], 1.0);
+  CHECK(fabs(sol[v]) <= 1e-9);
+  {
+    /* Round trip through MPS. */
+    const char* mps = POPSO_BINARY_DIR "/c_api_test_logical.mps";
+    popso_model* r = popso_create();
+    CHECK_OK(popso_write_mps(m, mps));
+    CHECK_OK(popso_read_mps(r, mps));
+    CHECK(popso_num_vars(r) == 5 && popso_num_rows(r) == 2 && popso_num_sos(r) == 1 && popso_num_indicators(r) == 1);
+    CHECK_OK(popso_solve(r));
+    CHECK_OK(popso_get_objective(r, &obj));
+    CHECK_NEAR(obj, 5.1);
+    popso_free(r);
+    remove(mps);
+  }
+  /* Semi-integer type through popso_set_var_type. */
+  CHECK_OK(popso_add_var(m, 3.0, 6.0, -1.0, POPSO_CONTINUOUS, "k", &k));
+  CHECK_OK(popso_set_var_type(m, k, POPSO_SEMIINTEGER));
+  {
+    const double half = 0.5;
+    CHECK_OK(popso_add_row(m, 1, &k, &half, -POPSO_INFINITY, 2.2, "kcap", NULL)); /* k <= 4.4 -> k = 4 */
+  }
+  CHECK_OK(popso_solve(m));
+  CHECK_OK(popso_get_objective(m, &obj));
+  CHECK_NEAR(obj, 1.1);
+  popso_free(m);
+  /* LP-format reader. */
+  m = popso_create();
+  CHECK(popso_read_lp(m, POPSO_BINARY_DIR "/c_api_test_missing.lp") == POPSO_ERROR_IO);
+  popso_free(m);
+}
+
 int main(void) {
   test_basics();
+  test_logical();
   test_build_and_solve();
   test_errors_and_params();
   test_infeasible_and_lp();

@@ -18,7 +18,7 @@ instances, and is faster overall, than the open-source solvers HiGHS and SCIP:
 
 | solver | solved | shifted geomean (s) |
 |---|---|---|
-| popso | 59/63 | 13.2 |
+| popso | 60/63 | 11.3 |
 | HiGHS 1.15 | 53/63 | 18.9 |
 | SCIP 10 | 50/63 | 21.3 |
 
@@ -50,7 +50,10 @@ macOS (clang) and Windows (MSVC).
 ```
 
 The solver reads a model in MPS format (free or fixed) or in the CPLEX LP format and prints
-a summary. The format is chosen by the file extension (`.lp` is LP, anything else MPS,
+a summary. Besides continuous, integer and binary variables, models may have
+semi-continuous and semi-integer variables, SOS1/SOS2 constraints and indicator
+constraints (MPS `SC`/`SI` bounds, `SOS` and `INDICATORS` sections; LP `Semi-Continuous` and
+`SOS` sections and `b = 1 -> ...` constraints). The format is chosen by the file extension (`.lp` is LP, anything else MPS,
 case-insensitive); `--format lp|mps` overrides it:
 
 ```
@@ -87,6 +90,7 @@ x1 1
 | `--mem-limit <MB>` | approximate memory cap for the search tree (default 4096) |
 | `--node-limit <n>` | stop after n branch-and-bound nodes |
 | `--no-presolve` | disable presolve |
+| `--lp-method <m>` | LP algorithm for a pure LP and the MIP root LP: `auto` (default), `simplex` or `barrier` |
 | `--verbosity <0-3>` | 0 silent, 1 summary (default), 2 progress, 3 debug |
 | `--version` | print the version |
 
@@ -120,7 +124,9 @@ if (popso_solve(m) == POPSO_OK && popso_has_solution(m)) {
 popso_free(m);
 ```
 
-Models can also be read with `popso_read_mps`. Functions return error codes, and
+Models can also be read with `popso_read_mps` or `popso_read_lp`. `popso_add_sos` and
+`popso_add_indicator` add SOS1/SOS2 and indicator constraints, and the variable types
+`POPSO_SEMICONTINUOUS` and `POPSO_SEMIINTEGER` make a variable 0 or within its bounds. Functions return error codes, and
 `popso_last_error` describes the last failure. Separate models can be solved from different threads
 at the same time. The library prints nothing unless you set the `verbosity` parameter.
 
@@ -143,6 +149,12 @@ r = m.solve(time_limit=10, threads=4)
 print(r.status, r.objective, r.bound, r[x], r["y"], r.nodes, r.time)
 
 m2 = popso.read_mps("model.mps")
+
+# Logical constraints
+b = m.add_var(vtype=popso.BINARY, name="b")
+z = m.add_var(lb=2, ub=8, vtype=popso.SEMICONTINUOUS, name="z")   # z = 0 or 2 <= z <= 8
+m.add_indicator(b, 0, z <= 0)                                     # b = 0 -> z <= 0
+m.add_sos([x, y, z], weights=[1, 2, 3], type=popso.SOS1)          # at most one nonzero
 ```
 
 To use it from a source checkout, add `python/` to `PYTHONPATH`. The library is then found in
@@ -157,7 +169,14 @@ pip install ./python
 ## What's inside
 
 - **LP:** bounded dual simplex with hyper-sparse LU factorization, Forrest–Tomlin updates and
-  dual steepest-edge pricing, plus a primal simplex for cleanup.
+  dual steepest-edge pricing, plus a primal simplex for cleanup. An interior-point (barrier)
+  method: Mehrotra predictor-corrector with Gondzio correctors, AMD ordering and a supernodal
+  sparse Cholesky factorization (normal equations or augmented system), and a crossover to an
+  optimal basis. Large pure LPs run both methods at the same time by default.
+- **Logical constraints:** semi-continuous and semi-integer variables, SOS1/SOS2 and
+  indicator constraints, reformulated with binaries and big-M rows whose coefficients come
+  from bound propagation; without finite bounds, branching on the binary enforces the
+  constraint in the subtree.
 - **Presolve:** singleton rows and columns, bound, coefficient and GCD tightening, parallel rows
   and columns, dual fixing and dual bound strengthening, dominated columns, aggregation and
   substitution, probing, clique merging and clique extension, with full postsolve.
@@ -188,14 +207,19 @@ pip install ./python
 
 - **Problem classes:** LP and MILP only. No quadratic objectives or constraints, no general
   nonlinear constraints.
-- **Model features:** no SOS constraints, indicator constraints, or semi-continuous or
-  semi-integer variables.
+- **Model features:** semi-continuous variables, SOS constraints and indicator constraints
+  are reformulated with binary variables (big-M rows where bounds allow). There is no
+  specialized branching on SOS sets, and presolve is skipped for models with constraints
+  that have no finite big-M. No other general constraints (abs, min/max, piecewise-linear
+  objectives).
 - **Input and interfaces:**
   - MPS and LP-format input only (no gzipped files).
   - The C API and the Python bindings have no callbacks. They return no LP dual values or reduced
     costs, and a running solve cannot be interrupted.
-- **LP algorithms:** dual simplex only. There is no barrier or interior-point method, so very
-  large LPs are slow.
+- **LP algorithms:** the barrier solver is new and not tuned yet; its factorization is slower
+  than in mature solvers. It has no homogeneous self-dual model: when it only suspects an
+  infeasible or unbounded LP, the simplex confirms it. MIP root LPs use the dual simplex unless
+  `--lp-method barrier` is given.
 - **Maturity:** this is young software. It is tuned on a limited benchmark set, and
   performance varies from instance to instance and with the random seed. Expect rough edges.
 

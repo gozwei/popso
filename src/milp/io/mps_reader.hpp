@@ -19,7 +19,14 @@
 //    blocks that have no entry in BOUNDS default to [0, 1] (the convention of
 //    HiGHS, SCIP and MIPLIB); any BOUNDS entry switches to the [0, +inf) default.
 //  - BOUNDS: UP, LO, FX, FR, MI (lb = -inf), PL (ub = +inf), BV (binary
-//    [0, 1]), LI/UI (integer + bound). SC is rejected as unsupported.
+//    [0, 1]), LI/UI (integer + bound), SC (semi-continuous, semi-integer on
+//    an integer column; the value, if given, is the upper bound), SI
+//    (semi-integer). A semi column is x = 0 or lb <= x <= ub.
+//  - SOS: set headers " S1 SOS <name> <priority>" (CPLEX) or " S1 <name>"
+//    (SCIP), then member lines "<column> <weight>" or "<column>:<weight>".
+//  - INDICATORS: " IF <row> <column> <value>"; the row becomes an indicator
+//    constraint (enforced when the column equals the value) instead of an
+//    ordinary row. A non-integer indicator column is made binary (warning).
 //    UP with a negative value on a column whose lower bound is 0 and was not
 //    set explicitly sets lb = -inf (with a warning).
 //  - |value| >= 1e30 in RHS/RANGES/BOUNDS is treated as infinite.
@@ -49,7 +56,9 @@ Model read_mps_string(const std::string& text, std::vector<std::string>* warning
 // Writes free MPS with full round-trip precision. Names that are empty or
 // contain whitespace are replaced (C<j> / R<i>, or whitespace -> '_').
 // Free rows (both bounds infinite) are written as extra N rows, which a
-// reader drops; they carry no constraint anyway.
+// reader drops; they carry no constraint anyway. Semi-continuous columns get
+// SC bounds, SOS sets an SOS section, and indicator constraints are written
+// as rows (after the ordinary ones) listed in an INDICATORS section.
 void write_mps(const Model& model, const std::string& path);
 std::string write_mps_string(const Model& model);
 

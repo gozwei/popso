@@ -20,6 +20,7 @@ struct MipResult {
   std::vector<double> x;
   long long nodes = 0;
   long long lp_iterations = 0;
+  long long mem_drains = 0;  // drain phases under the memory limit (SearchOptions::mem_limit_bytes)
   double root_lp_work = 0.0;  // root LP iterations (incl. the cut loop) x (rows + columns)
   double root_bound = -kInf;
   bool root_lns_ran = false, root_lns_improved = false;  // root LNS rounds ran / found a better incumbent

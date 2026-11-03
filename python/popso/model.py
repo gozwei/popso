@@ -12,21 +12,30 @@ INF = float("inf")
 CONTINUOUS = 0
 INTEGER = 1
 BINARY = 2
+SEMICONTINUOUS = 3  # x = 0 or lb <= x <= ub
+SEMIINTEGER = 4     # x = 0 or lb <= x <= ub, integer
+
+SOS1 = 1
+SOS2 = 2
 
 MINIMIZE = 1
 MAXIMIZE = -1
 
 _VTYPES = {
-    CONTINUOUS: CONTINUOUS, INTEGER: INTEGER, BINARY: BINARY,
-    "C": CONTINUOUS, "I": INTEGER, "B": BINARY,
-    "continuous": CONTINUOUS, "integer": INTEGER, "binary": BINARY,
+    CONTINUOUS: CONTINUOUS, INTEGER: INTEGER, BINARY: BINARY, SEMICONTINUOUS: SEMICONTINUOUS,
+    SEMIINTEGER: SEMIINTEGER,
+    "C": CONTINUOUS, "I": INTEGER, "B": BINARY, "S": SEMICONTINUOUS, "N": SEMIINTEGER,
+    "continuous": CONTINUOUS, "integer": INTEGER, "binary": BINARY, "semicontinuous": SEMICONTINUOUS,
+    "semiinteger": SEMIINTEGER,
 }
 _SENSES = {MINIMIZE: MINIMIZE, MAXIMIZE: MAXIMIZE, "min": MINIMIZE, "max": MAXIMIZE,
            "minimize": MINIMIZE, "maximize": MAXIMIZE}
 
 PARAMS = ("time_limit", "threads", "mip_gap", "mip_abs_gap", "seed", "deterministic", "verbosity",
-          "mem_limit", "node_limit", "presolve", "racing")
-_INT_PARAMS = {"threads", "seed", "verbosity", "mem_limit", "node_limit", "racing"}
+          "mem_limit", "node_limit", "presolve", "racing", "lp_method")
+_INT_PARAMS = {"threads", "seed", "verbosity", "mem_limit", "node_limit", "racing", "lp_method"}
+# lp_method also accepts these names.
+LP_METHODS = {"auto": 0, "simplex": 1, "barrier": 2}
 _BOOL_PARAMS = {"deterministic", "presolve"}
 
 
@@ -325,7 +334,8 @@ def _vtype(t):
     try:
         return _VTYPES[t]
     except (KeyError, TypeError):
-        raise ValueError("invalid variable type %r (use popso.CONTINUOUS, INTEGER or BINARY)" % (t,)) from None
+        raise ValueError("invalid variable type %r (use popso.CONTINUOUS, INTEGER, BINARY, SEMICONTINUOUS or "
+                         "SEMIINTEGER)" % (t,)) from None
 
 
 # ---------------------------------------------------------------- parameters and results
@@ -453,6 +463,14 @@ class Model:
         return lib.popso_num_nonzeros(self._h)
 
     @property
+    def num_sos(self):
+        return lib.popso_num_sos(self._h)
+
+    @property
+    def num_indicators(self):
+        return lib.popso_num_indicators(self._h)
+
+    @property
     def vars(self):
         return [Var(self, j) for j in range(self.num_vars)]
 
@@ -484,11 +502,17 @@ class Model:
         self._check(lib.popso_read_mps(self._h, _enc(os.fspath(filename))))
         return self
 
+    def read_lp(self, filename):
+        """Replaces the model by the contents of a CPLEX LP-format file."""
+        self._check(lib.popso_read_lp(self._h, _enc(os.fspath(filename))))
+        return self
+
     def write_mps(self, filename):
         self._check(lib.popso_write_mps(self._h, _enc(os.fspath(filename))))
 
     def add_var(self, lb=0.0, ub=INF, obj=0.0, vtype=CONTINUOUS, name=None):
-        """Adds a variable and returns it (vtype: CONTINUOUS, INTEGER, BINARY or "C"/"I"/"B")."""
+        """Adds a variable and returns it (vtype: CONTINUOUS, INTEGER, BINARY, SEMICONTINUOUS, SEMIINTEGER
+        or "C"/"I"/"B"/"S"/"N"). A semi-continuous variable is 0 or in [lb, ub]."""
         idx = ctypes.c_int()
         self._check(lib.popso_add_var(self._h, float(lb), float(ub), float(obj), _vtype(vtype), _enc(name),
                                       ctypes.byref(idx)))
@@ -553,6 +577,33 @@ class Model:
         self._check(lib.popso_add_row(self._h, n, _iarray(idx), _darray(val), lb, ub, _enc(name), ctypes.byref(out)))
         return Constr(self, out.value)
 
+    def add_sos(self, vars, weights=None, type=SOS1, name=None):
+        """Adds an SOS1 (at most one nonzero) or SOS2 (at most two nonzeros, adjacent in the order of the
+        weights) constraint over the variables; weights default to 1, 2, ... Returns its index."""
+        idx = [self._var_index(v) for v in vars]
+        w = None if weights is None else _darray([float(a) for a in weights])
+        if weights is not None and len(weights) != len(idx):
+            raise ValueError("one weight per variable needed")
+        out = ctypes.c_int()
+        self._check(lib.popso_add_sos(self._h, int(type), len(idx), _iarray(idx), w, _enc(name), ctypes.byref(out)))
+        return out.value
+
+    def add_indicator(self, binvar, value, lhs, lb=None, ub=None, name=None):
+        """Adds an indicator constraint: if the binary variable binvar equals value (0 or 1), the
+        constraint must hold. lhs, lb and ub as in add_constr, e.g. add_indicator(b, 1, x + y <= 5).
+        Returns its index."""
+        if isinstance(lhs, Constraint):
+            if lb is not None or ub is not None:
+                raise ValueError("lb/ub cannot be combined with a comparison")
+            lhs, lb, ub = lhs.expr, lhs.lb, lhs.ub
+        idx, val, const = self._coeffs(lhs)
+        lb = -INF if lb is None else float(lb) - const
+        ub = INF if ub is None else float(ub) - const
+        out = ctypes.c_int()
+        self._check(lib.popso_add_indicator(self._h, self._var_index(binvar), int(value), len(idx), _iarray(idx),
+                                            _darray(val), lb, ub, _enc(name), ctypes.byref(out)))
+        return out.value
+
     def set_objective(self, expr, sense=None):
         """Sets the objective (an expression, Var, number or {var: coef} dict) and optionally the sense."""
         if isinstance(expr, numbers.Real):
@@ -582,6 +633,10 @@ class Model:
             value = 1.0 if value else 0.0
         if value is None and name in ("time_limit",):
             value = INF
+        if name == "lp_method" and isinstance(value, str):
+            if value not in LP_METHODS:
+                raise ValueError("lp_method must be one of %s" % ", ".join(LP_METHODS))
+            value = LP_METHODS[value]
         self._check(lib.popso_set_param(self._h, _enc(name), float(value)))
 
     def get_param(self, name):
@@ -661,3 +716,8 @@ class Model:
 def read_mps(filename):
     """Reads an MPS file into a new Model."""
     return Model().read_mps(filename)
+
+
+def read_lp(filename):
+    """Reads a CPLEX LP-format file into a new Model."""
+    return Model().read_lp(filename)

@@ -50,6 +50,8 @@ def mps_to_lp(path: Path) -> str:
         lb = -math.inf if lb <= -1e30 else lb
         ub = math.inf if ub >= 1e30 else ub
         vtype = ("B" if (lb, ub) == (0.0, 1.0) else "I") if m.is_int[j] else "C"
+        if m.semi[j]:
+            vtype = "SI" if m.is_int[j] else "SC"
         cols.append((name, m.obj[j], lb, ub, vtype))
     rows = []
     for i, name in enumerate(m.row_names):
@@ -58,7 +60,14 @@ def mps_to_lp(path: Path) -> str:
         hi = math.inf if hi >= 1e30 else hi
         terms = [(m.col_names[j], v) for j, v in zip(m.row_cols[i], m.row_vals[i])]
         rows.append((name, lo, hi, terms))
-    return lp_text(m.name, "max" if m.sense == -1 else "min", m.obj_const, cols, rows)
+    sos = [(n, t, [m.col_names[j] for j in c], w) for n, t, c, w in m.sos]
+    inds = []
+    for n, b, val, lo, hi, c, v in m.indicators:
+        sense, rhs = ("E", lo) if lo == hi else (("L", hi) if lo == -math.inf else ("G", lo))
+        if lo != hi and lo != -math.inf and hi != math.inf:
+            raise ValueError(f"ranged indicator constraint {n} cannot be written in LP format")
+        inds.append((n, m.col_names[b], val, sense, rhs, [(m.col_names[j], a) for j, a in zip(c, v)]))
+    return lp_text(m.name, "max" if m.sense == -1 else "min", m.obj_const, cols, rows, sos, inds)
 
 
 def run_popso(popso: Path, model: Path, time_limit: float):

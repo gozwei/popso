@@ -320,7 +320,11 @@ bool CutPool::add(Cut c, const double* x) {
     norm += c.val[k] * c.val[k];
     objpar += c.val[k] * p_.cost[c.idx[k]];
   }
-  for (double v : p_.cost) cnorm += v * v;
+  if (cnorm_ < 0.0) {
+    cnorm_ = 0.0;  // once per pool (was recomputed for every candidate: O(n) each)
+    for (double v : p_.cost) cnorm_ += v * v;
+  }
+  cnorm = cnorm_;
   norm = std::sqrt(norm);
   const double viol = c.activity(x) - c.rhs;
   if (viol < opt_.min_violation * std::max(1.0, std::abs(c.rhs)) || norm <= 0.0) return false;
@@ -328,6 +332,10 @@ bool CutPool::add(Cut c, const double* x) {
   if (c.efficacy < opt_.min_efficacy) return false;
   objpar = cnorm > 0 ? std::abs(objpar) / (norm * std::sqrt(cnorm)) : 0.0;
   c.score = c.efficacy * (1.0 + 0.1 * objpar);
+  c.objpar = objpar;
+  Index nint = 0;
+  for (Index j : c.idx) nint += p_.is_int[j];
+  c.intsupport = static_cast<double>(nint) / static_cast<double>(c.idx.size());
   cuts_.push_back(std::move(c));
   return true;
 }
@@ -343,6 +351,17 @@ double norm2(const Cut& c) {
 }  // namespace
 
 std::vector<Cut> CutPool::select() {
+  double good = -kInf;
+  if (opt_.hybrid && !cuts_.empty()) {
+    double max_eff = 0.0;
+    for (const Cut& c : cuts_) max_eff = std::max(max_eff, c.efficacy);
+    double best = 0.0;
+    for (Cut& c : cuts_) {
+      c.score = c.efficacy / max_eff + opt_.obj_weight * c.objpar + opt_.int_weight * c.intsupport;
+      best = std::max(best, c.score);
+    }
+    good = opt_.good_score * best;
+  }
   std::sort(cuts_.begin(), cuts_.end(), [](const Cut& a, const Cut& b) { return a.score > b.score; });
   std::vector<Cut> sel;
   std::vector<double> norms;
@@ -370,8 +389,9 @@ std::vector<Cut> CutPool::select() {
       }
     }
     bool ok = true;
+    const double maxpar = c.score >= good ? opt_.max_parallelism : opt_.max_parallelism_weak;
     for (int s : touched) {
-      ok = ok && std::abs(dots[s]) / (nc * norms[s]) <= opt_.max_parallelism;
+      ok = ok && std::abs(dots[s]) / (nc * norms[s]) <= maxpar;
       dots[s] = 0.0;
     }
     touched.clear();

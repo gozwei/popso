@@ -25,6 +25,11 @@ enum class Status {
 
 const char* to_string(Status s);
 
+// Method for the LP of a pure LP model and for the root LP of a MIP. Auto picks the barrier for
+// large LPs where it was measured to win (see branch_and_bound.cpp, use_barrier_root).
+enum class LpMethod { Auto = 0, Simplex = 1, Barrier = 2 };
+const char* to_string(LpMethod m);
+
 struct SolverParams {
   double time_limit = kInf;   // seconds
   int threads = 0;            // 0 = hardware concurrency
@@ -37,6 +42,10 @@ struct SolverParams {
   int racing = 1;             // concurrent differently-seeded searches sharing incumbents (opportunistic mode)
   bool deterministic = false;  // reproducible parallel search (same seed + threads -> same result); slower
   bool presolve = true;
+  LpMethod lp_method = LpMethod::Auto;
+  // Logical constraints (semi-continuous, SOS, indicators): largest big-M coefficient of their
+  // reformulation; beyond it (or without finite bounds) they are enforced by branching. 0: always branching.
+  double logic_big_m = 1e6;
   Tolerances tol;
 };
 

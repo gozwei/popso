@@ -10,7 +10,11 @@ without any solver library:
     m.write("knap.mps")
 
 Variables have bounds (lb, ub; +-inf allowed), an objective coefficient and
-a type: "C" continuous, "I" integer, "B" binary (integer with bounds [0, 1]).
+a type: "C" continuous, "I" integer, "B" binary (integer with bounds [0, 1]),
+"SC" semi-continuous / "SI" semi-integer (x = 0 or lb <= x <= ub).
+Logical constraints: Model.add_sos(vars, weights, type=1|2) and
+Model.add_indicator(binvar, value, constraint) (the constraint must hold when
+binvar == value).
 Linear expressions support +, -, scalar * and quicksum(); comparing an
 expression with <=, >= or == gives a constraint for Model.add_constr.  All
 terms are moved to the left-hand side and constants to the right-hand side;
@@ -19,7 +23,11 @@ duplicate variables in one constraint are merged.
 The MPS writer emits fixed-column-style free MPS: integer columns inside
 MARKER INTORG/INTEND blocks, every integer column with explicit bounds
 (BV for binaries, LI for an integer with an infinite upper bound), so the
-file reads the same under all common MPS conventions.
+file reads the same under all common MPS conventions. Semi-continuous
+columns get an SC bound (semi-integer ones SI, inside the integer markers), SOS
+sets an SOS section (" S1 SOS name 1" + "col weight" lines) and indicator
+constraints are rows listed in an INDICATORS section (" IF row col value"),
+as CPLEX and SCIP read them.
 
 The LP writer (Model.to_lp, or Model.write("x.lp"); lp_text() for models
 from other sources) emits the CPLEX LP format: every variable is listed in
@@ -182,10 +190,12 @@ class Model:
         self.sense = "min"  # or "max"
         self.vars: list[Var] = []
         self.constrs: list[Constraint] = []
+        self.sos = []         # (name, type, [Var], [weight])
+        self.indicators = []  # (Var, value, Constraint)
 
     def add_var(self, lb=0.0, ub=INF, obj=0.0, vtype="C", name=None):
         vtype = str(vtype)
-        if vtype not in ("C", "I", "B"):
+        if vtype not in ("C", "I", "B", "SC", "SI"):
             raise ValueError(f"bad vtype {vtype!r}")
         if vtype == "B":
             lb, ub = max(0.0, float(lb)), min(1.0, float(ub))
@@ -200,6 +210,23 @@ class Model:
         con.index = len(self.constrs)
         con.name = name if name is not None else f"R{con.index}"
         self.constrs.append(con)
+        return con
+
+    def add_sos(self, vars_, weights=None, sos_type=1, name=None):
+        """SOS1 / SOS2 over vars_ (ordered by the weights, default 1, 2, ...)."""
+        if sos_type not in (1, 2):
+            raise ValueError("sos_type must be 1 or 2")
+        w = [float(a) for a in weights] if weights is not None else [float(k + 1) for k in range(len(vars_))]
+        if len(w) != len(vars_) or len(set(w)) != len(w):
+            raise ValueError("one distinct weight per member needed")
+        self.sos.append((name if name is not None else f"S{len(self.sos)}", sos_type, list(vars_), w))
+
+    def add_indicator(self, binvar, value, con, name=None):
+        """binvar == value (0 or 1) implies the constraint con."""
+        if not isinstance(con, Constraint) or value not in (0, 1) or binvar.vtype != "B":
+            raise TypeError("add_indicator expects a binary variable, 0/1 and expr <= / >= / == rhs")
+        con.name = name if name is not None else f"IND{len(self.indicators)}"
+        self.indicators.append((binvar, value, con))
         return con
 
     # ---- statistics
@@ -217,7 +244,7 @@ class Model:
 
     @property
     def num_int_vars(self):
-        return sum(1 for v in self.vars if v.vtype != "C")
+        return sum(1 for v in self.vars if v.vtype not in ("C", "SC"))
 
     # ---- MPS / LP output
     def write(self, path):
@@ -232,7 +259,10 @@ class Model:
         for c in self.constrs:
             lo, hi = {"L": (-INF, c.rhs), "G": (c.rhs, INF), "E": (c.rhs, c.rhs)}[c.sense]
             rows.append((c.name, lo, hi, [(v.name, a) for v, a in c.terms.items()]))
-        return lp_text(self.name, self.sense, 0.0, cols, rows)
+        sos = [(n, t, [v.name for v in vs], w) for n, t, vs, w in self.sos]
+        inds = [(c.name, b.name, val, c.sense, c.rhs, [(v.name, a) for v, a in c.terms.items()])
+                for b, val, c in self.indicators]
+        return lp_text(self.name, self.sense, 0.0, cols, rows, sos, inds)
 
     def to_mps(self):
         out = [f"NAME {self.name}"]
@@ -242,18 +272,20 @@ class Model:
             raise ValueError(f"bad sense {self.sense!r}")
         out.append("ROWS")
         out.append(" N  OBJ")
-        for c in self.constrs:
+        # indicator constraints are rows after the ordinary ones, listed in INDICATORS
+        allc = self.constrs + [c for _, _, c in self.indicators]
+        for c in allc:
             out.append(f" {c.sense}  {c.name:<8}")
         # column-wise matrix (entries in row order)
         cols = [[] for _ in self.vars]
-        for c in self.constrs:
+        for k, c in enumerate(allc):
             for v, a in c.terms.items():
                 if a != 0.0:
-                    cols[v.index].append((c.index, a))
+                    cols[v.index].append((k, a))
         out.append("COLUMNS")
         in_int = False
         for v in self.vars:
-            is_int = v.vtype != "C"
+            is_int = v.vtype not in ("C", "SC")
             if is_int != in_int:
                 out.append("    MARKER    'MARKER'                 "
                            + ("'INTORG'" if is_int else "'INTEND'"))
@@ -264,16 +296,26 @@ class Model:
             elif not entries:
                 out.append(f"    {v.name:<8}  {'OBJ':<8}  0")
             for i, a in entries:
-                out.append(f"    {v.name:<8}  {self.constrs[i].name:<8}  {_num(a)}")
+                out.append(f"    {v.name:<8}  {allc[i].name:<8}  {_num(a)}")
         if in_int:
             out.append("    MARKER    'MARKER'                 'INTEND'")
         out.append("RHS")
-        for c in self.constrs:
+        for c in allc:
             if c.rhs != 0.0:
                 out.append(f"    RHS1      {c.name:<8}  {_num(c.rhs)}")
         out.append("BOUNDS")
         for v in self.vars:
             out.extend(_bounds(v))
+        if self.sos:
+            out.append("SOS")
+            for n, t, vs, w in self.sos:
+                out.append(f" S{t} SOS  {n}  1")
+                for v, a in zip(vs, w):
+                    out.append(f"    {v.name:<8}  {_num(a)}")
+        if self.indicators:
+            out.append("INDICATORS")
+            for b, val, c in self.indicators:
+                out.append(f" IF  {c.name:<8}  {b.name:<8}  {val}")
         out.append("ENDATA")
         return "\n".join(out) + "\n"
 
@@ -285,6 +327,12 @@ def _bound(kind, name, val=None):
 
 def _bounds(v):
     lb, ub, n = v.lb, v.ub, v.name
+    if v.vtype in ("SC", "SI"):
+        # semi-continuous / semi-integer: lower bound, then SC with the upper bound
+        out = [] if lb == 0.0 else [_bound("LO", n, lb)]
+        # SI for semi-integer: HiGHS reads SC as semi-continuous even on an integer column
+        out.append(_bound(v.vtype, n, 1e30 if ub == INF else ub))
+        return out
     if v.vtype == "B" and lb == 0.0 and ub == 1.0:
         return [_bound("BV", n)]
     if lb == ub:
@@ -370,11 +418,13 @@ def _lp_wrap(head, parts, width=100):
     return lines
 
 
-def lp_text(name, sense, obj_const, cols, rows):
+def lp_text(name, sense, obj_const, cols, rows, sos=(), indicators=()):
     """CPLEX LP text.
 
-    cols: [(name, obj, lb, ub, vtype)] with vtype "C", "I" or "B";
-    rows: [(name, lo, hi, [(col name, coef)])] with lo/hi possibly infinite.
+    cols: [(name, obj, lb, ub, vtype)] with vtype "C", "I", "B", "SC" or "SI";
+    rows: [(name, lo, hi, [(col name, coef)])] with lo/hi possibly infinite;
+    sos: [(name, type, [col name], [weight])];
+    indicators: [(name, binary col name, value, sense "L"/"G"/"E", rhs, [(col name, coef)])].
     """
     if sense not in ("min", "max"):
         raise ValueError(f"bad sense {sense!r}")
@@ -401,10 +451,17 @@ def lp_text(name, sense, obj_const, cols, rows):
             out.extend(_lp_wrap(head, lhs + [">=", _lp_num(lo)]))
         else:  # ranged
             out.extend(_lp_wrap(head, [_lp_num(lo), "<="] + lhs + ["<=", _lp_num(hi)]))
+    for iname, bname, val, sense_, rhs, terms in indicators:
+        lhs = _lp_terms((_lp_name(c), a) for c, a in terms)
+        op = {"L": "<=", "G": ">=", "E": "="}[sense_]
+        out.extend(_lp_wrap(f" {_lp_name(iname)}: {_lp_name(bname)} = {val} ->", lhs + [op, _lp_num(rhs)]))
     out.append("Bounds")
     for cname, _, lb, ub, vtype in cols:
         n = _lp_name(cname)
         if vtype == "B" and lb == 0.0 and ub == 1.0:
+            continue
+        if vtype in ("SC", "SI"):
+            out.append(f" {_lp_num(lb)} <= {n} <= {_lp_num(ub)}")
             continue
         if lb == ub:
             out.append(f" {n} = {_lp_num(lb)}")
@@ -418,10 +475,15 @@ def lp_text(name, sense, obj_const, cols, rows):
             out.append(f" {n} >= {_lp_num(lb)}")
         else:
             out.append(f" {_lp_num(lb)} <= {n} <= {_lp_num(ub)}")
-    for title, kind in (("Generals", "I"), ("Binaries", "B")):
-        names = [_lp_name(c[0]) for c in cols if c[4] == kind]
+    for title, kinds in (("Generals", ("I", "SI")), ("Binaries", ("B",)), ("Semi-Continuous", ("SC", "SI"))):
+        names = [_lp_name(c[0]) for c in cols if c[4] in kinds]
         if names:
             out.append(title)
             out.extend(_lp_wrap("", names))
+    if sos:
+        out.append("SOS")
+        for sname, t, members, weights in sos:
+            parts = [f"{_lp_name(c)}:{_num(w)}" for c, w in zip(members, weights)]
+            out.extend(_lp_wrap(f" {_lp_name(sname)}: S{t}::", parts))
     out.append("End")
     return "\n".join(out) + "\n"

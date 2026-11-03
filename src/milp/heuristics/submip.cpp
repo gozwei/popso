@@ -48,7 +48,8 @@ bool solve_sub_mip(const MipProblem& p, const std::vector<double>& lb, const std
     const char* e = std::getenv("MILP_SUBMIP_PRESOLVE_NNZ");
     return e ? std::atoll(e) : 20000LL;
   }();
-  const bool presolve = !no_presolve && p.A.nnz() >= presolve_nnz;
+  // (Presolve does not know the implications of logical constraints.)
+  const bool presolve = !no_presolve && p.A.nnz() >= presolve_nnz && p.implications.empty();
   // Unbounded (or skipped): solve the unreduced problem, which classifies it precisely.
   const PresolveStatus ps = presolve ? pre.run(q, po, log) : PresolveStatus::Unbounded;
   if (ps == PresolveStatus::Infeasible) {
