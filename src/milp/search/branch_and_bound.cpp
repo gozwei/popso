@@ -4295,6 +4295,10 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     root_bound_ = bnd;
     log_.log(1, "Root LP: objective %.10g, %lld iterations, %.2fs\n", p_.display_sense * (obj + p_.offset), lp.iterations(),
              timer_.elapsed());
+    // An incumbent that arrived before the root LP ended (a user start, FJ, local MIP) may already close the gap
+    // at this bound: accept_incumbent tests the root bound only when a new incumbent arrives (MILP_ROOT_GAP_STOP).
+    static const bool root_gap_stop_lp = knob("MILP_ROOT_GAP_STOP", 1) > 0;
+    if (root_gap_stop_lp && !params_.deterministic && gap_closed(bnd)) trivial_solved(incumbent_.load(), true);
   }
   if (node.branch_var >= 0 && node.branch_dist > 0) {
     const double pobj = is_finite(node.parent_obj) ? node.parent_obj : node.bound;

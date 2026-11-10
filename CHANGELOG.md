@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.4 — 2026-11
+
+- The root stops at once when an incumbent found before the root LP ended (a user start, feasibility jump, the
+  local MIP) already meets the gap tolerance at the root bound; before, the test ran only when a new incumbent
+  arrived, and the search went on with the root heuristics, strong branching and the tree. Opportunistic mode.
+  Contributed by Clay Cantrell (#3).
+
 ## v0.8.3 — 2026-11
 
 - A user start that presolve's dual reductions cut off (its presolved image violates rows although the start is
