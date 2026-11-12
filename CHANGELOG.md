@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.10.2 — 2026-11
+
+- Nonconvex models: a first-solution heuristic before the search ("fix-and-solve"). The columns of a vertex cover
+  of the products' graph are fixed at a point's values, which leaves a model without nonconvex terms; its solution
+  is a solution of the model, and the solve repeats with another cover while the objective improves. Where the
+  fixed model is infeasible, the two sides alternate while minimizing the violation of the rows (slack columns),
+  from up to four starting points. A fifth of the time limit at most; `MILP_SPATIAL_FIX=0` turns it off. On
+  QPLIB's 261 nonconvex instances (120 s) popso now returns a solution on 135 (v0.10.1: 111); the number proven
+  optimal is unchanged (23).
+- Nonconvex models, opt-in: `MILP_SPATIAL_OBBT=1` tightens the factors' bounds over the relaxation before the
+  search (each factor minimized and maximized, with the objective cutoff of the solution in hand). Off by default:
+  no gain on QPLIB's nonconvex set.
+
 ## v0.10.1 — 2026-11
 
 - **Fix (wrong answer in v0.10.0):** in spatial branch-and-bound a product with an integer factor was judged at

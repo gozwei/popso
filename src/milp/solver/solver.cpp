@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1102,6 +1103,7 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
 // A model found not convex: an error, unless spatial branch-and-bound takes it from there (solve_model sets the flag
 // for the calling thread; the reason then goes to the debug log only).
 thread_local bool t_spatial_next = false;
+thread_local int t_spatial_fix_depth = 0;  // inside solve_spatial's fix-and-solve heuristic: no nesting
 void log_nonconvex(const Logger& log, const std::string& msg) {
   if (t_spatial_next) log.log(2, "Not convex: %s\n", msg.c_str());
   else log.log(1, "ERROR: %s\n", msg.c_str());
@@ -1724,31 +1726,35 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     why = "nothing nonconvex";
     return std::nullopt;
   }
-  // A solution against the model as given: no answer rather than a wrong one.
-  auto verify = [&](SolveResult& r) {
-    // The model as given, with its products computed from the factors: each row relative to the size of its terms.
-    // Integer columns are set to their rounded values first (integral within the tolerance is not enough when the
-    // other factor of a product is huge).
+  // The worst row violation of a point on the model as given, with its products computed from the factors: each row
+  // relative to the size of its terms. Integer columns are set to their rounded values first (integral within the
+  // tolerance is not enough when the other factor of a product is huge).
+  auto rel_violation = [&](std::vector<double>& x) {
     for (Index j = 0; j < n; ++j) {
-      if (model.col_type[j] != VarType::Continuous) r.x[j] = std::round(r.x[j]);
+      if (model.col_type[j] != VarType::Continuous) x[j] = std::round(x[j]);
     }
-    r.objective = model.objective_value(r.x);
-    const std::vector<double> act = model.row_activity(r.x);
+    const std::vector<double> act = model.row_activity(x);
     std::vector<double> scale(static_cast<size_t>(m), 1.0);
     for (size_t k = 0; k < model.qr_val.size(); ++k) {
       double& sc = scale[model.qr_row[k]];
-      sc = std::max(sc, std::abs(model.qr_val[k] * r.x[model.qr_i[k]] * r.x[model.qr_j[k]]));
+      sc = std::max(sc, std::abs(model.qr_val[k] * x[model.qr_i[k]] * x[model.qr_j[k]]));
     }
     double worst = 0.0;
     for (Index i = 0; i < m; ++i) {
       const double v = std::max((model.row_lb[i] - act[i]) / scale[i], (act[i] - model.row_ub[i]) / scale[i]);
       worst = v <= worst ? worst : std::isnan(v) ? kInf : v;
     }
-    for (const double v : r.x) {
+    for (const double v : x) {
       if (!std::isfinite(v)) worst = kInf;
     }
+    return worst;
+  };
+  // A solution against the model as given: no answer rather than a wrong one.
+  auto verify = [&](SolveResult& r) {
+    const double worst = rel_violation(r.x);
+    r.objective = model.objective_value(r.x);
     if (!(worst <= 1.5e-6) || !std::isfinite(r.objective)) {
-      // The products' tolerances added up in some row: no answer rather than a wrong one.
+      // The products' tolerances added up in some row.
       log.log(1, "ERROR: the solution violates a row of the model by %.2e (relative to the row's terms); discarded\n", worst);
       r.has_solution = false;
       r.x.clear();
@@ -2019,6 +2025,13 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     wcol[{i, j}] = w;
     return w;
   };
+  // The lifted model from the bounds lo / hi (again after the bounds have been tightened below).
+  auto lift = [&]() {
+  L = model;
+  terms.clear(), lifted.clear(), lifted_of.clear(), wcol.clear();
+  ti.clear(), tj.clear(), tv.clear();
+  rows_now = m;
+  open_factors = 0;
   // The rows that are not convex: their products by columns.
   {
     std::vector<Index> qr, qi, qj;
@@ -2059,6 +2072,8 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     V.insert(V.end(), tv.begin(), tv.end());
     L.A = SparseMatrix::from_triplets(L.num_cols(), rows_now, J, I, V);
   }
+  };
+  lift();
   size_t squares = 0;
   for (const Bilinear& b : terms) squares += b.x == b.y;
   log.log(1, "Nonconvex quadratic model: spatial branch-and-bound on %zu products (%zu squares) of %s%zu rows\n",
@@ -2068,10 +2083,251 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     log.log(1, "  %zu products have a factor without finite bounds: no McCormick rows there until branching bounds it\n",
             open_factors);
   }
+  // A first solution by fixing and solving (MILP_SPATIAL_FIX=0: off): the columns of a vertex cover of the products'
+  // graph fixed at a point's values leave a model without nonconvex terms (every product has a fixed factor), which
+  // the usual routes solve; its solution is a solution of the model. From there the cover changes (the columns
+  // fixed before are freed first) and the solve repeats while the objective improves. The first point is the
+  // optimum of the lifted model's continuous relaxation. A fifth of the time at most.
+  std::vector<double> found;
+  static const bool kFix = [] { const char* e = std::getenv("MILP_SPATIAL_FIX"); return !(e && e[0] == '0'); }();
+  if (kFix && t_spatial_fix_depth == 0 && static_cast<Index>(start.size()) != n) {
+    ++t_spatial_fix_depth;
+    const double t0 = timer.elapsed();
+    const double budget = t0 + 0.2 * std::max(0.0, params.time_limit - t0);
+    SolverParams hp = params;
+    hp.verbosity = 0;
+    std::vector<double> point;
+    {
+      Model R = L;
+      for (VarType& t : R.col_type) t = VarType::Continuous;
+      hp.time_limit = 0.25 * (budget - t0);
+      const SolveResult rr = solve(R, hp);
+      if (rr.has_solution) point.assign(rr.x.begin(), rr.x.begin() + n);
+    }
+    if (point.empty()) {
+      point.resize(static_cast<size_t>(n));
+      for (Index j = 0; j < n; ++j) {
+        point[j] = is_finite(lo[j]) && is_finite(hi[j]) ? 0.5 * (lo[j] + hi[j]) : std::clamp(0.0, lo[j], hi[j]);
+      }
+    }
+    std::vector<std::vector<Index>> adj(static_cast<size_t>(n));
+    std::vector<char> self(static_cast<size_t>(n), 0), factor(static_cast<size_t>(n), 0);
+    for (const Bilinear& b : terms) {
+      factor[b.x] = factor[b.y] = 1;
+      if (b.x == b.y) self[b.x] = 1;
+      else adj[b.x].push_back(b.y), adj[b.y].push_back(b.x);
+    }
+    std::vector<Index> order;
+    for (Index j = 0; j < n; ++j) {
+      if (factor[j]) order.push_back(j);
+    }
+    std::vector<char> cover(static_cast<size_t>(n), 0);
+    // The next cover: the free columns are an independent set of the graph, chosen greedily. Preferred: columns
+    // fixed in the last round, then continuous ones, then those in few products (flip: in many).
+    auto next_cover = [&](bool flip) {
+      std::stable_sort(order.begin(), order.end(), [&](Index a, Index c) {
+        if (cover[a] != cover[c]) return cover[a] > cover[c];
+        const bool ia = model.col_type[a] != VarType::Continuous, ic = model.col_type[c] != VarType::Continuous;
+        if (ia != ic) return ic;
+        return flip ? adj[a].size() > adj[c].size() : adj[a].size() < adj[c].size();
+      });
+      std::vector<char> free_col(static_cast<size_t>(n), 0);
+      for (const Index j : order) {
+        if (self[j]) continue;
+        bool ok = true;
+        for (const Index k : adj[j]) ok = ok && !free_col[k];
+        free_col[j] = ok;
+      }
+      for (Index j = 0; j < n; ++j) cover[j] = factor[j] && !free_col[j];
+    };
+    // The model with the cover fixed at the point. Elastic: the nonconvex rows get slack columns and the objective
+    // is the sum of the slacks (the distance to a feasible point; `slack` returns it).
+    bool all_rows = false;
+    auto solve_fixed = [&](bool elastic, std::vector<double>& x, double& slack) {
+      Model F = model;
+      F.col_lb = lo, F.col_ub = hi;
+      for (Index j = 0; j < n; ++j) {
+        if (!cover[j]) continue;
+        double v = std::clamp(point[j], lo[j], hi[j]);
+        if (model.col_type[j] != VarType::Continuous) v = std::clamp(std::round(v), std::ceil(lo[j] - 1e-9), std::floor(hi[j] + 1e-9));
+        F.col_lb[j] = F.col_ub[j] = v;
+      }
+      if (elastic) {
+        std::vector<Index> J, I;
+        std::vector<double> V;
+        for (Index j = 0; j < n; ++j) {
+          for (Index k = F.A.begin(j); k < F.A.end(j); ++k) J.push_back(j), I.push_back(F.A.index[k]), V.push_back(F.A.value[k]);
+        }
+        std::fill(F.obj.begin(), F.obj.end(), 0.0);
+        F.q_row.clear(), F.q_col.clear(), F.q_val.clear();
+        F.obj_offset = 0.0;
+        F.sense = ObjSense::Minimize;
+        Index col = n;
+        for (Index i = 0; i < m; ++i) {
+          if (!bad[i] && !all_rows) continue;
+          for (const double sgn : {1.0, -1.0}) {
+            if (sgn > 0 ? !is_finite(model.row_lb[i]) : !is_finite(model.row_ub[i])) continue;
+            F.col_names.push_back("_e" + std::to_string(col));
+            F.obj.push_back(1.0);
+            F.col_lb.push_back(0.0), F.col_ub.push_back(kInf);
+            F.col_type.push_back(VarType::Continuous);
+            J.push_back(col), I.push_back(i), V.push_back(sgn);
+            ++col;
+          }
+        }
+        F.A = SparseMatrix::from_triplets(col, m, J, I, V);
+      }
+      hp.time_limit = std::max(0.0, std::min(0.2 * (budget - t0), budget - timer.elapsed()));
+      SolveResult fr = solve(F, hp);
+      if (std::getenv("MILP_SPATIAL_DEBUG")) {
+        std::fprintf(stderr, "fix-and-solve%s: status %d, solution %d, objective %g, %.2fs\n", elastic ? " (elastic)" : "",
+                     static_cast<int>(fr.status), static_cast<int>(fr.has_solution), fr.objective, timer.elapsed() - t0);
+      }
+      if (!fr.has_solution || static_cast<Index>(fr.x.size()) < n) return false;
+      slack = elastic ? fr.objective : 0.0;
+      x.assign(fr.x.begin(), fr.x.begin() + n);
+      return true;
+    };
+    double best = kInf;
+    int rounds = 0;
+    std::vector<double> x;
+    // Up to four attempts while nothing is found: from the relaxation's point with slacks on the nonconvex rows,
+    // the same with slacks on every row (the fixed columns may violate linear rows), then from the middle of the
+    // bounds and from a random point.
+    std::mt19937_64 rng(20261112);
+    const std::vector<double> first = point;
+    for (int attempt = 0; attempt < 4 && found.empty() && timer.elapsed() < budget; ++attempt) {
+    all_rows = attempt >= 1;
+    if (attempt <= 1) point = first;
+    for (Index j = 0; attempt >= 2 && j < n; ++j) {
+      const double l = is_finite(lo[j]) ? lo[j] : std::min(first[j], hi[j]) - 1.0;
+      const double u = is_finite(hi[j]) ? hi[j] : std::max(first[j], lo[j]) + 1.0;
+      point[j] = attempt == 2 ? 0.5 * (l + u) : l + (u - l) * std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+    }
+    std::fill(cover.begin(), cover.end(), 0);
+    double slack = kInf, last_slack = kInf;
+    int stalls = 0;
+    for (int it = 0; it < 40 && timer.elapsed() < budget; ++it) {
+      const bool feasible_before = !found.empty();
+      if (it == 0 || slack <= 1e-7 || feasible_before) {
+        // The model itself over the free columns (the first round; from a point without slack; improvement rounds).
+        if (it == 0 || feasible_before) next_cover(false);
+        bool improved = false;
+        if (solve_fixed(false, x, slack)) {
+          const double viol = rel_violation(x);
+          const double obj = sense * model.objective_value(x);
+          if (std::getenv("MILP_SPATIAL_DEBUG")) std::fprintf(stderr, "  point: violation %g objective %g best %g\n", viol, obj, best);
+          if (viol <= 1e-6 && std::isfinite(obj) && (found.empty() || obj < best - 1e-9 * std::max(1.0, std::abs(best)))) {
+            best = obj, found = x, point = x, improved = true;
+            ++rounds;
+          }
+        }
+        if (feasible_before && !improved) break;
+        if (improved) continue;
+        slack = kInf;
+      }
+      // No feasible point yet: the other side's columns move to where the nonconvex rows are violated least.
+      if (it > 0) next_cover(stalls % 2 == 1);  // a stalled pair of covers: another one
+      if (!solve_fixed(true, x, slack)) break;
+      point = x;
+      stalls = slack < 0.999 * last_slack ? 0 : stalls + 1;
+      last_slack = std::min(last_slack, slack);
+      if (stalls >= 6) break;
+    }
+    }
+    --t_spatial_fix_depth;
+    if (!found.empty()) {
+      log.log(1, "  fix-and-solve: a solution with objective %.10g after %d rounds, %.1fs\n", sense * best, rounds,
+              timer.elapsed() - t0);
+    } else {
+      log.log(2, "  fix-and-solve: no solution, %.1fs\n", timer.elapsed() - t0);
+    }
+  }
+  // Bounds of the factors from the relaxation (MILP_SPATIAL_OBBT=1; off by default: no gain on QPLIB's nonconvex
+  // set, 23 proven with and without, times equal or a little longer): each factor minimized and maximized over
+  // the lifted model's continuous relaxation, with the objective no worse than the solution in hand. Tighter
+  // bounds give tighter McCormick rows, so the model is lifted again and the pass repeats (three passes, at most
+  // 300 factors and a tenth of the time left). The bounds hold for every solution at least as good as the one in
+  // hand, which is all the search looks for.
+  static const bool kObbt = [] { const char* e = std::getenv("MILP_SPATIAL_OBBT"); return e && e[0] == '1'; }();
+  if (kObbt && root_rows && t_spatial_fix_depth == 0) {
+    ++t_spatial_fix_depth;
+    const double t0 = timer.elapsed();
+    const double budget = t0 + 0.1 * std::max(0.0, params.time_limit - t0);
+    std::vector<char> factor(static_cast<size_t>(n), 0);
+    for (const Bilinear& b : terms) factor[b.x] = factor[b.y] = 1;
+    std::vector<Index> cols;
+    for (Index j = 0; j < n; ++j) {
+      if (factor[j] && lo[j] < hi[j]) cols.push_back(j);
+    }
+    const std::vector<double>& ref = found.empty() && static_cast<Index>(start.size()) == n ? start : found;
+    const bool linear_obj = L.q_val.empty();
+    size_t tightened = 0;
+    int passes = 0;
+    SolverParams op = params;
+    op.verbosity = 0;
+    op.threads = 1;
+    for (; passes < 3 && cols.size() <= 300 && timer.elapsed() < budget; ++passes) {
+      Model R = L;
+      for (VarType& t : R.col_type) t = VarType::Continuous;
+      if (!ref.empty() && linear_obj && static_cast<Index>(ref.size()) == n) {
+        // sense * objective <= that of the solution in hand (plus a margin), as a row.
+        const double val = sense * (model.objective_value(ref) - model.obj_offset);
+        const double rhs = val + 1e-6 * std::max(1.0, std::abs(val));
+        std::vector<Index> J, I;
+        std::vector<double> V;
+        for (Index j = 0; j < R.num_cols(); ++j) {
+          for (Index k = R.A.begin(j); k < R.A.end(j); ++k) J.push_back(j), I.push_back(R.A.index[k]), V.push_back(R.A.value[k]);
+          if (R.obj[j] != 0.0) J.push_back(j), I.push_back(R.num_rows()), V.push_back(sense * R.obj[j]);
+        }
+        R.row_lb.push_back(-kInf), R.row_ub.push_back(rhs);
+        R.row_names.push_back("_cutoff");
+        R.A = SparseMatrix::from_triplets(R.num_cols(), R.num_rows() + 1, J, I, V);
+      }
+      R.q_row.clear(), R.q_col.clear(), R.q_val.clear();
+      R.sense = ObjSense::Minimize;
+      R.obj_offset = 0.0;
+      std::fill(R.obj.begin(), R.obj.end(), 0.0);
+      size_t now = 0;
+      for (const Index j : cols) {
+        for (const double dir : {1.0, -1.0}) {
+          if (timer.elapsed() >= budget) break;
+          R.obj[j] = dir;
+          op.time_limit = budget - timer.elapsed();
+          const SolveResult rr = solve(R, op);
+          R.obj[j] = 0.0;
+          if (rr.status != Status::Optimal || !std::isfinite(rr.bound)) continue;
+          double b = rr.bound - 1e-6 * std::max(1.0, std::abs(rr.bound));  // widened by the solve's tolerance
+          const bool integer = model.col_type[j] != VarType::Continuous;
+          const double range = hi[j] - lo[j];
+          if (dir > 0) {
+            if (integer) b = std::ceil(b - 1e-6);
+            if (!ref.empty()) b = std::min(b, ref[j]);
+            if (b > lo[j] + (is_finite(range) ? 1e-3 * range : 0.0)) lo[j] = std::min(b, hi[j]), ++now;
+          } else {
+            b = -b;
+            if (integer) b = std::floor(b + 1e-6);
+            if (!ref.empty()) b = std::max(b, ref[j]);
+            if (b < hi[j] - (is_finite(range) ? 1e-3 * range : 0.0)) hi[j] = std::max(b, lo[j]), ++now;
+          }
+          R.col_lb[j] = lo[j], R.col_ub[j] = hi[j];
+        }
+      }
+      tightened += now;
+      if (now == 0) break;
+      quad_row_bounds(model, lo, hi);
+      lift();
+    }
+    --t_spatial_fix_depth;
+    if (tightened > 0) {
+      log.log(1, "  %zu factor bounds tightened over the relaxation in %d passes, %.1fs\n", tightened, passes,
+              timer.elapsed() - t0);
+    }
+  }
   std::vector<double> st;
-  if (static_cast<Index>(start.size()) == n) {
-    st = start;
-    for (const Bilinear& b : terms) st.push_back(start[b.x] * start[b.y]);
+  if (static_cast<Index>(start.size()) == n || !found.empty()) {
+    st = found.empty() ? start : found;
+    for (const Bilinear& b : terms) st.push_back(st[b.x] * st[b.y]);
   }
   SolveResult r = solve_oa_core(L, params, st, timer, log, tracer, &terms, &lifted);
   if (r.has_solution) {
