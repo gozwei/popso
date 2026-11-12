@@ -706,7 +706,7 @@ v0.8 adds quadratic constraints and second-order cones. These are measured on pu
 
 Setup:
 - Machine: AMD EPYC 4465P (12 cores, Linux), twelve 1-thread runs at a time.
-- popso v0.8.0: 1 thread, 120 s, gap 1e-6.
+- popso v0.9.0: 1 thread, 120 s, gap 1e-6.
 - SCIP 10.0: 1 thread, 300 s, feasibility tolerance 1e-9; a SCIP time counts as solved if it is at
   most 120 s.
 - HiGHS has no quadratic constraints; it appears only on the QPs (300 s).
@@ -721,12 +721,12 @@ Setup:
 
 | set | instances | popso solved (geomean s) | SCIP | HiGHS |
 |---|---|---|---|---|
-| QPLIB convex QCQP / MIQCQP | 27 | 21 (12.1) | 6 (90.2) | - |
-| QPLIB convex QP | 17 | 15 (4.0) | 0 (120.0) | 7/17 (45.1) |
-| QPLIB convex MIQP | 17 | 4 (45.0) | 0 (120.0) | - |
-| QPLIB nonconvex over binaries | 128 | 38 (48.0) | 8 (113.5) | - |
-| CBLIB MISOCP | 157 | 108 (14.4) | 87 (23.5) | - |
-| **all** | 346 | **186** (22.3) | 101 (55.2) | |
+| QPLIB convex QCQP / MIQCQP | 27 | 21 (11.0) | 6 (90.2) | - |
+| QPLIB convex QP | 17 | 15 (3.6) | 0 (120.0) | 7/17 (45.1) |
+| QPLIB convex MIQP | 17 | 4 (45.3) | 0 (120.0) | - |
+| QPLIB nonconvex over binaries | 128 | 39 (47.5) | 8 (113.5) | - |
+| CBLIB MISOCP | 157 | 117 (12.1) | 87 (23.5) | - |
+| **all** | 346 | **196** (20.3) | 101 (55.2) | |
 
 Shifted geometric means of the run times: shift 1 s, an unsolved instance counts as 120 s.
 
@@ -738,10 +738,10 @@ Notes:
 - **Nonconvex models over binaries:** with 300 s and 4 threads, popso proves 47 of the 128
   optimal and SCIP 13 (1 thread). Where both finish, their objectives are equal, and equal to
   QPLIB's. Where neither finishes, popso's solution is better on 68 of 70.
-- **CBLIB:** by family, popso solves more instances than SCIP in 11 of the 26 families and fewer
-  in 5: the layout families `no7` and `o7`, `shortfall`, `sssd-strong` and `uflquad-nopsc`.
-  On `b1bigflowc`, whose cones sit on free member columns defined by equations, popso finds no
-  solution for a long time.
+- **CBLIB:** by family, popso solves more instances than SCIP in 12 of the 26 families and fewer
+  in 3: the layout families `no7` and `o7`, and `shortfall`. v0.9 solves 117 (v0.8: 108): its
+  presolve for quadratic models turns the `uflquad-nopsc` constraints into their perspective
+  cones, and integral points are completed by the conic method with the integers fixed.
 - **QPs:** popso tries the conic method first and falls back to the QP barrier. SCIP finishes none
   of the 17 within 300 s; HiGHS finishes 7, with the same objectives where both finish (to 1e-5).
 
@@ -749,49 +749,49 @@ Notes:
 
 | instance | set | popso | SCIP | HiGHS |
 |---|---|---|---|---|
-| QPLIB_10001 | QCQP | **7.5** | 13.7 | - |
-| QPLIB_10002 | QCQP | **27.0** | 41.7 | - |
-| QPLIB_10003 | QCQP | 78.7 | TL | - |
+| QPLIB_10001 | QCQP | **5.7** | 13.7 | - |
+| QPLIB_10002 | QCQP | **21.5** | 41.7 | - |
+| QPLIB_10003 | QCQP | 81.0 | TL | - |
 | QPLIB_10004 | QCQP | TL | TL | - |
 | QPLIB_10005 | QCQP | TL | TL | - |
 | QPLIB_10006 | QCQP | TL | TL | - |
 | QPLIB_10007 | QCQP | TL | TL | - |
-| QPLIB_10008 | QCQP | **58.8** | 96.9 | - |
-| QPLIB_10009 | QCQP | 31.8 | **25.4** | - |
-| QPLIB_10010 | QCQP | 32.8 | **14.9** | - |
-| QPLIB_10011 | QCQP | 80.9 | TL | - |
-| QPLIB_10012 | QCQP | 59.2 | TL | - |
-| QPLIB_2456 | QCQP | 0.8 | TL | - |
-| QPLIB_2468 | QCQP | 3.0 | TL | - |
+| QPLIB_10008 | QCQP | **52.3** | 96.9 | - |
+| QPLIB_10009 | QCQP | 28.4 | **25.4** | - |
+| QPLIB_10010 | QCQP | 32.7 | **14.9** | - |
+| QPLIB_10011 | QCQP | 66.3 | TL | - |
+| QPLIB_10012 | QCQP | 51.2 | TL | - |
+| QPLIB_2456 | QCQP | 0.6 | TL | - |
+| QPLIB_2468 | QCQP | 2.7 | TL | - |
 | QPLIB_2482 | QCQP | 0.1 | TL | - |
-| QPLIB_2519 | QCQP | 0.6 | TL | - |
-| QPLIB_2626 | QCQP | 2.2 | TL | - |
+| QPLIB_2519 | QCQP | 0.3 | TL | - |
+| QPLIB_2626 | QCQP | 0.9 | TL | - |
 | QPLIB_2676 | QCQP | **0.1** | 57.8 | - |
 | QPLIB_2784 | QCQP | 0.2 | TL | - |
-| QPLIB_2862 | QCQP | 4.9 | TL | - |
+| QPLIB_2862 | QCQP | 4.2 | TL | - |
 | QPLIB_3029 | QCQP | 0.2 | TL | - |
 | QPLIB_3088 | QCQP | 0.2 | TL | - |
-| QPLIB_3105 | QCQP | 3.1 | TL | - |
-| QPLIB_3185 | QCQP | 1.4 | TL | - |
-| QPLIB_3312 | QCQP | 14.6 | TL | - |
+| QPLIB_3105 | QCQP | 4.1 | TL | - |
+| QPLIB_3185 | QCQP | 1.5 | TL | - |
+| QPLIB_3312 | QCQP | 9.4 | TL | - |
 | QPLIB_3678 | QCQP | TL | TL | - |
 | QPLIB_7579 | QCQP | TL | TL | - |
-| QPLIB_10034 | QP | 24.1 | - | TL |
-| QPLIB_10038 | QP | 40.6 | - | TL |
-| QPLIB_8495 | QP | 1.6 | - | TL |
+| QPLIB_10034 | QP | 21.4 | - | TL |
+| QPLIB_10038 | QP | 37.2 | - | TL |
+| QPLIB_8495 | QP | 1.0 | - | TL |
 | QPLIB_8500 | QP | TL | - | TL |
-| QPLIB_8515 | QP | 0.2 | - | TL |
-| QPLIB_8559 | QP | **14.7** | - | 30.5 |
-| QPLIB_8567 | QP | **10.3** | - | 28.0 |
+| QPLIB_8515 | QP | 0.1 | - | TL |
+| QPLIB_8559 | QP | **9.2** | - | 30.5 |
+| QPLIB_8567 | QP | **11.2** | - | 28.0 |
 | QPLIB_8602 | QP | TL | - | TL |
-| QPLIB_8616 | QP | **0.2** | - | 26.0 |
-| QPLIB_8785 | QP | 4.5 | - | TL |
-| QPLIB_8790 | QP | 0.6 | - | TL |
-| QPLIB_8792 | QP | **0.4** | - | 3.1 |
-| QPLIB_8845 | QP | 0.3 | - | TL |
-| QPLIB_8906 | QP | 0.6 | - | **0.2** |
-| QPLIB_8938 | QP | **0.2** | - | 76.0 |
-| QPLIB_8991 | QP | **0.2** | - | 2.0 |
+| QPLIB_8616 | QP | **0.1** | - | 26.0 |
+| QPLIB_8785 | QP | 4.1 | - | TL |
+| QPLIB_8790 | QP | 0.4 | - | TL |
+| QPLIB_8792 | QP | **0.3** | - | 3.1 |
+| QPLIB_8845 | QP | 0.2 | - | TL |
+| QPLIB_8906 | QP | 0.4 | - | **0.2** |
+| QPLIB_8938 | QP | **0.1** | - | 76.0 |
+| QPLIB_8991 | QP | **0.1** | - | 2.0 |
 | QPLIB_9002 | QP | 1.2 | - | TL |
 | QPLIB_10050 | MIQP | 0.3 | TL | - |
 | QPLIB_10056 | MIQP | 0.2 | TL | - |
@@ -799,7 +799,7 @@ Notes:
 | QPLIB_3547 | MIQP | TL | TL | - |
 | QPLIB_3694 | MIQP | TL | TL | - |
 | QPLIB_3698 | MIQP | TL | TL | - |
-| QPLIB_3708 | MIQP | 7.3 | TL | - |
+| QPLIB_3708 | MIQP | 8.7 | TL | - |
 | QPLIB_3792 | MIQP | TL | TL | - |
 | QPLIB_3861 | MIQP | TL | TL | - |
 | QPLIB_3871 | MIQP | TL | TL | - |
@@ -810,7 +810,7 @@ Notes:
 | QPLIB_5543 | MIQP | TL | TL | - |
 | QPLIB_5577 | MIQP | TL | TL | - |
 | QPLIB_5924 | MIQP | TL | TL | - |
-| QPLIB_0067 | binary | **13.3** | 14.3 | - |
+| QPLIB_0067 | binary | **9.2** | 14.3 | - |
 | QPLIB_0633 | binary | TL | TL | - |
 | QPLIB_0752 | binary | TL | TL | - |
 | QPLIB_10040 | binary | 0.2 | TL | - |
@@ -818,33 +818,33 @@ Notes:
 | QPLIB_10042 | binary | 0.1 | TL | - |
 | QPLIB_10043 | binary | 0.5 | TL | - |
 | QPLIB_10044 | binary | 1.0 | TL | - |
-| QPLIB_10045 | binary | 2.2 | TL | - |
-| QPLIB_10046 | binary | 0.1 | TL | - |
-| QPLIB_10047 | binary | 2.1 | TL | - |
-| QPLIB_10048 | binary | 41.6 | TL | - |
+| QPLIB_10045 | binary | 2.3 | TL | - |
+| QPLIB_10046 | binary | 0.2 | TL | - |
+| QPLIB_10047 | binary | 2.2 | TL | - |
+| QPLIB_10048 | binary | 37.5 | TL | - |
 | QPLIB_10049 | binary | 2.2 | TL | - |
 | QPLIB_10051 | binary | 2.2 | TL | - |
-| QPLIB_10052 | binary | 1.2 | TL | - |
-| QPLIB_10053 | binary | 1.0 | TL | - |
-| QPLIB_10054 | binary | 22.3 | TL | - |
-| QPLIB_10055 | binary | 0.8 | TL | - |
-| QPLIB_10057 | binary | 0.5 | TL | - |
-| QPLIB_10058 | binary | 67.3 | TL | - |
+| QPLIB_10052 | binary | 0.7 | TL | - |
+| QPLIB_10053 | binary | 0.7 | TL | - |
+| QPLIB_10054 | binary | 19.7 | TL | - |
+| QPLIB_10055 | binary | 0.5 | TL | - |
+| QPLIB_10057 | binary | 0.3 | TL | - |
+| QPLIB_10058 | binary | 64.2 | TL | - |
 | QPLIB_10059 | binary | TL | TL | - |
 | QPLIB_10060 | binary | 0.6 | TL | - |
 | QPLIB_10061 | binary | TL | TL | - |
-| QPLIB_10062 | binary | 2.5 | TL | - |
+| QPLIB_10062 | binary | 2.6 | TL | - |
 | QPLIB_10063 | binary | TL | TL | - |
-| QPLIB_10064 | binary | 2.9 | TL | - |
-| QPLIB_10065 | binary | 1.2 | TL | - |
+| QPLIB_10064 | binary | 2.7 | TL | - |
+| QPLIB_10065 | binary | 1.3 | TL | - |
 | QPLIB_10066 | binary | 0.4 | TL | - |
-| QPLIB_10067 | binary | 0.6 | TL | - |
+| QPLIB_10067 | binary | 0.5 | TL | - |
 | QPLIB_10068 | binary | TL | TL | - |
 | QPLIB_10070 | binary | TL | TL | - |
 | QPLIB_10071 | binary | 0.4 | TL | - |
-| QPLIB_10072 | binary | 0.4 | TL | - |
+| QPLIB_10072 | binary | 0.5 | TL | - |
 | QPLIB_10073 | binary | 0.8 | TL | - |
-| QPLIB_10074 | binary | 10.4 | TL | - |
+| QPLIB_10074 | binary | 9.0 | TL | - |
 | QPLIB_1976 | binary | TL | TL | - |
 | QPLIB_2017 | binary | TL | TL | - |
 | QPLIB_2022 | binary | TL | TL | - |
@@ -857,7 +857,7 @@ Notes:
 | QPLIB_2073 | binary | TL | TL | - |
 | QPLIB_2077 | binary | TL | TL | - |
 | QPLIB_2085 | binary | TL | TL | - |
-| QPLIB_2087 | binary | TL | TL | - |
+| QPLIB_2087 | binary | 100.8 | TL | - |
 | QPLIB_2096 | binary | TL | TL | - |
 | QPLIB_2315 | binary | TL | TL | - |
 | QPLIB_2357 | binary | TL | TL | - |
@@ -870,7 +870,7 @@ Notes:
 | QPLIB_3307 | binary | TL | TL | - |
 | QPLIB_3347 | binary | TL | TL | - |
 | QPLIB_3361 | binary | TL | TL | - |
-| QPLIB_3380 | binary | 68.0 | TL | - |
+| QPLIB_3380 | binary | 67.8 | TL | - |
 | QPLIB_3402 | binary | TL | TL | - |
 | QPLIB_3413 | binary | TL | TL | - |
 | QPLIB_3506 | binary | TL | TL | - |
@@ -885,25 +885,25 @@ Notes:
 | QPLIB_3705 | binary | TL | TL | - |
 | QPLIB_3706 | binary | TL | TL | - |
 | QPLIB_3709 | binary | TL | TL | - |
-| QPLIB_3714 | binary | **28.5** | 79.8 | - |
+| QPLIB_3714 | binary | **30.0** | 79.8 | - |
 | QPLIB_3738 | binary | TL | TL | - |
 | QPLIB_3745 | binary | TL | TL | - |
 | QPLIB_3750 | binary | TL | TL | - |
 | QPLIB_3751 | binary | TL | TL | - |
 | QPLIB_3752 | binary | TL | TL | - |
 | QPLIB_3757 | binary | TL | TL | - |
-| QPLIB_3762 | binary | **50.8** | 76.4 | - |
+| QPLIB_3762 | binary | **50.3** | 76.4 | - |
 | QPLIB_3772 | binary | TL | TL | - |
 | QPLIB_3775 | binary | TL | TL | - |
 | QPLIB_3803 | binary | TL | TL | - |
-| QPLIB_3815 | binary | 91.5 | **55.6** | - |
+| QPLIB_3815 | binary | 88.5 | **55.6** | - |
 | QPLIB_3822 | binary | TL | TL | - |
 | QPLIB_3832 | binary | TL | TL | - |
 | QPLIB_3834 | binary | TL | TL | - |
 | QPLIB_3838 | binary | TL | TL | - |
 | QPLIB_3841 | binary | TL | TL | - |
 | QPLIB_3850 | binary | TL | TL | - |
-| QPLIB_3852 | binary | **59.5** | 75.4 | - |
+| QPLIB_3852 | binary | **61.2** | 75.4 | - |
 | QPLIB_3860 | binary | TL | TL | - |
 | QPLIB_3865 | binary | TL | TL | - |
 | QPLIB_3877 | binary | TL | TL | - |
@@ -912,17 +912,17 @@ Notes:
 | QPLIB_3931 | binary | TL | TL | - |
 | QPLIB_5721 | binary | TL | TL | - |
 | QPLIB_5725 | binary | TL | TL | - |
-| QPLIB_5755 | binary | 2.4 | TL | - |
+| QPLIB_5755 | binary | 3.4 | TL | - |
 | QPLIB_5875 | binary | TL | TL | - |
 | QPLIB_5881 | binary | TL | TL | - |
 | QPLIB_5882 | binary | TL | TL | - |
 | QPLIB_5909 | binary | TL | TL | - |
 | QPLIB_5922 | binary | TL | TL | - |
 | QPLIB_5935 | binary | TL | TL | - |
-| QPLIB_5944 | binary | **59.5** | 68.2 | - |
+| QPLIB_5944 | binary | **54.2** | 68.2 | - |
 | QPLIB_5962 | binary | TL | TL | - |
 | QPLIB_5971 | binary | TL | TL | - |
-| QPLIB_5980 | binary | 107.4 | TL | - |
+| QPLIB_5980 | binary | 96.6 | TL | - |
 | QPLIB_6324 | binary | TL | TL | - |
 | QPLIB_6487 | binary | TL | TL | - |
 | QPLIB_6597 | binary | TL | TL | - |
@@ -931,81 +931,81 @@ Notes:
 | QPLIB_6764 | binary | TL | TL | - |
 | QPLIB_6799 | binary | TL | TL | - |
 | QPLIB_6941 | binary | TL | TL | - |
-| QPLIB_7127 | binary | **0.5** | 20.1 | - |
-| QPLIB_7139 | binary | 59.0 | TL | - |
+| QPLIB_7127 | binary | **0.4** | 20.1 | - |
+| QPLIB_7139 | binary | 54.3 | TL | - |
 | QPLIB_7144 | binary | TL | TL | - |
 | QPLIB_7149 | binary | TL | TL | - |
 | QPLIB_7154 | binary | TL | TL | - |
 | QPLIB_7159 | binary | TL | TL | - |
 | QPLIB_7164 | binary | TL | TL | - |
-| achtziger_stolpe06-6.1flowc | CBLIB | 0.5 | TL | - |
+| achtziger_stolpe06-6.1flowc | CBLIB | 0.3 | TL | - |
 | achtziger_stolpe06-6.2flowc | CBLIB | TL | TL | - |
 | achtziger_stolpe06-6.5bflowc | CBLIB | TL | TL | - |
-| achtziger_stolpe06-6.5flowc | CBLIB | TL | TL | - |
+| achtziger_stolpe06-6.5flowc | CBLIB | 64.1 | TL | - |
 | achtziger_stolpe07-5.1flowc | CBLIB | TL | TL | - |
 | achtziger_stolpe07-5.2bflowc | CBLIB | TL | TL | - |
 | achtziger_stolpe07-5.2flowc | CBLIB | TL | TL | - |
-| achtziger_stolpe07-5.3flowc | CBLIB | 6.6 | TL | - |
+| achtziger_stolpe07-5.3flowc | CBLIB | 4.1 | TL | - |
 | b1bigflowc | CBLIB | TL | TL | - |
 | classical_200_0 | CBLIB | TL | TL | - |
 | classical_200_1 | CBLIB | TL | TL | - |
 | classical_50_0 | CBLIB | TL | TL | - |
-| classical_50_1 | CBLIB | 45.1 | TL | - |
-| classical_50_2 | CBLIB | 37.3 | TL | - |
+| classical_50_1 | CBLIB | 33.3 | TL | - |
+| classical_50_2 | CBLIB | 31.6 | TL | - |
 | classical_50_3 | CBLIB | TL | TL | - |
-| classical_50_4 | CBLIB | 74.5 | TL | - |
-| clay0203h | CBLIB | 1.6 | **1.3** | - |
-| clay0203m | CBLIB | 1.3 | **0.6** | - |
-| clay0204h | CBLIB | 8.6 | **7.6** | - |
-| clay0204m | CBLIB | 5.5 | **1.5** | - |
-| clay0205h | CBLIB | 41.4 | **30.7** | - |
-| clay0205m | CBLIB | 69.0 | **9.7** | - |
-| clay0303h | CBLIB | 2.2 | TL | - |
-| clay0303m | CBLIB | 2.1 | **1.1** | - |
-| clay0304h | CBLIB | 8.5 | TL | - |
-| clay0304m | CBLIB | 12.3 | **3.8** | - |
-| clay0305h | CBLIB | 85.4 | **34.2** | - |
-| clay0305m | CBLIB | TL | 14.1 | - |
-| du-opt | CBLIB | 4.9 | **3.1** | - |
-| du-opt5 | CBLIB | 5.3 | **1.4** | - |
+| classical_50_4 | CBLIB | 77.1 | TL | - |
+| clay0203h | CBLIB | 2.1 | **1.3** | - |
+| clay0203m | CBLIB | 1.2 | **0.6** | - |
+| clay0204h | CBLIB | 10.0 | **7.6** | - |
+| clay0204m | CBLIB | 4.5 | **1.5** | - |
+| clay0205h | CBLIB | 42.3 | **30.7** | - |
+| clay0205m | CBLIB | 66.0 | **9.7** | - |
+| clay0303h | CBLIB | 3.0 | TL | - |
+| clay0303m | CBLIB | 1.9 | **1.1** | - |
+| clay0304h | CBLIB | 8.2 | TL | - |
+| clay0304m | CBLIB | 12.1 | **3.8** | - |
+| clay0305h | CBLIB | 104.1 | **34.2** | - |
+| clay0305m | CBLIB | 105.5 | **14.1** | - |
+| du-opt | CBLIB | **3.0** | 3.1 | - |
+| du-opt5 | CBLIB | 6.5 | **1.4** | - |
 | estein4_A | CBLIB | 0.1 | TL | - |
-| estein4_B | CBLIB | **0.2** | 0.9 | - |
+| estein4_B | CBLIB | **0.1** | 0.9 | - |
 | estein4_C | CBLIB | 0.1 | TL | - |
 | estein4_nr22 | CBLIB | 0.1 | TL | - |
-| estein5_A | CBLIB | 4.2 | TL | - |
-| estein5_B | CBLIB | 1.4 | TL | - |
-| estein5_C | CBLIB | 1.3 | TL | - |
-| estein5_nr1 | CBLIB | 1.7 | TL | - |
-| estein5_nr21 | CBLIB | 2.4 | TL | - |
+| estein5_A | CBLIB | 1.6 | TL | - |
+| estein5_B | CBLIB | 1.2 | TL | - |
+| estein5_C | CBLIB | 1.2 | TL | - |
+| estein5_nr1 | CBLIB | 1.6 | TL | - |
+| estein5_nr21 | CBLIB | 1.5 | TL | - |
 | ex1223a | CBLIB | **0.0** | 0.0 | - |
 | fac3 | CBLIB | 0.1 | TL | - |
 | flay02h | CBLIB | 0.2 | TL | - |
 | flay02m | CBLIB | 0.1 | TL | - |
-| flay03h | CBLIB | 0.9 | TL | - |
-| flay03m | CBLIB | 0.3 | TL | - |
-| flay04h | CBLIB | 8.7 | TL | - |
-| flay04m | CBLIB | 6.9 | TL | - |
+| flay03h | CBLIB | 2.3 | TL | - |
+| flay03m | CBLIB | 0.7 | TL | - |
+| flay04h | CBLIB | 14.4 | TL | - |
+| flay04m | CBLIB | 18.3 | TL | - |
 | flay05h | CBLIB | TL | TL | - |
 | flay05m | CBLIB | TL | TL | - |
 | flay06h | CBLIB | TL | TL | - |
 | flay06m | CBLIB | TL | TL | - |
 | gbd | CBLIB | **0.0** | 0.0 | - |
 | m3 | CBLIB | **0.1** | 0.2 | - |
-| m6 | CBLIB | **1.7** | 1.8 | - |
-| m7 | CBLIB | 4.3 | **3.2** | - |
-| m7_ar25_1 | CBLIB | 4.1 | **2.8** | - |
-| m7_ar2_1 | CBLIB | 9.7 | **6.8** | - |
-| m7_ar3_1 | CBLIB | 10.7 | **5.6** | - |
-| m7_ar4_1 | CBLIB | 2.6 | **2.6** | - |
-| m7_ar5_1 | CBLIB | 16.4 | **10.5** | - |
-| netmod_dol2 | CBLIB | **22.0** | 25.3 | - |
-| netmod_kar1 | CBLIB | **3.9** | 8.2 | - |
-| netmod_kar2 | CBLIB | **4.6** | 7.8 | - |
+| m6 | CBLIB | **1.6** | 1.8 | - |
+| m7 | CBLIB | 4.6 | **3.2** | - |
+| m7_ar25_1 | CBLIB | 5.9 | **2.8** | - |
+| m7_ar2_1 | CBLIB | 9.6 | **6.8** | - |
+| m7_ar3_1 | CBLIB | 9.1 | **5.6** | - |
+| m7_ar4_1 | CBLIB | 2.7 | **2.6** | - |
+| m7_ar5_1 | CBLIB | 18.8 | **10.5** | - |
+| netmod_dol2 | CBLIB | **23.5** | 25.3 | - |
+| netmod_kar1 | CBLIB | **1.9** | 8.2 | - |
+| netmod_kar2 | CBLIB | **2.1** | 7.8 | - |
 | no7_ar25_1 | CBLIB | TL | 44.2 | - |
-| no7_ar2_1 | CBLIB | 85.7 | **21.1** | - |
+| no7_ar2_1 | CBLIB | 76.6 | **21.1** | - |
 | no7_ar3_1 | CBLIB | TL | 73.1 | - |
 | no7_ar4_1 | CBLIB | TL | TL | - |
-| no7_ar5_1 | CBLIB | 97.3 | **62.0** | - |
+| no7_ar5_1 | CBLIB | 88.6 | **62.0** | - |
 | nvs03 | CBLIB | **0.0** | 0.0 | - |
 | o7 | CBLIB | TL | TL | - |
 | o7_2 | CBLIB | TL | TL | - |
@@ -1018,83 +1018,83 @@ Notes:
 | o9_ar4_1 | CBLIB | TL | TL | - |
 | pp-n10-d10 | CBLIB | **0.0** | 0.1 | - |
 | pp-n10-d10000 | CBLIB | **0.0** | 3.3 | - |
-| pp-n100-d10 | CBLIB | **3.1** | 5.4 | - |
+| pp-n100-d10 | CBLIB | **2.4** | 5.4 | - |
 | pp-n100-d10000 | CBLIB | TL | TL | - |
 | pp-n1000-d10 | CBLIB | TL | TL | - |
 | pp-n1000-d10000 | CBLIB | TL | TL | - |
 | robust_100_0 | CBLIB | TL | TL | - |
 | robust_100_1 | CBLIB | TL | TL | - |
-| robust_50_0 | CBLIB | **0.9** | 1.3 | - |
+| robust_50_0 | CBLIB | **1.1** | 1.3 | - |
 | robust_50_1 | CBLIB | 1.8 | TL | - |
-| robust_50_2 | CBLIB | 1.7 | TL | - |
-| robust_50_3 | CBLIB | 2.5 | TL | - |
-| robust_50_4 | CBLIB | 21.0 | TL | - |
+| robust_50_2 | CBLIB | 1.8 | TL | - |
+| robust_50_3 | CBLIB | 3.2 | TL | - |
+| robust_50_4 | CBLIB | 15.5 | TL | - |
 | shortfall_100_0 | CBLIB | TL | TL | - |
 | shortfall_100_1 | CBLIB | TL | TL | - |
 | shortfall_50_0 | CBLIB | TL | 35.2 | - |
-| shortfall_50_1 | CBLIB | 38.9 | **3.9** | - |
-| shortfall_50_2 | CBLIB | 45.4 | **6.1** | - |
-| shortfall_50_3 | CBLIB | 119.0 | **26.5** | - |
-| shortfall_50_4 | CBLIB | 87.2 | **11.6** | - |
+| shortfall_50_1 | CBLIB | 37.1 | **3.9** | - |
+| shortfall_50_2 | CBLIB | 57.0 | **6.1** | - |
+| shortfall_50_3 | CBLIB | 115.5 | **26.5** | - |
+| shortfall_50_4 | CBLIB | 90.3 | **11.6** | - |
 | slay04h | CBLIB | **0.5** | 1.7 | - |
 | slay04m | CBLIB | **0.3** | 0.5 | - |
-| slay05h | CBLIB | **0.9** | 1.1 | - |
+| slay05h | CBLIB | 1.3 | **1.1** | - |
 | slay05m | CBLIB | **0.5** | 0.6 | - |
-| slay06h | CBLIB | **3.8** | 4.4 | - |
-| slay06m | CBLIB | **1.2** | 1.3 | - |
-| slay07h | CBLIB | 10.2 | **3.6** | - |
-| slay07m | CBLIB | 1.2 | **1.0** | - |
-| slay08h | CBLIB | 9.3 | **6.3** | - |
-| slay08m | CBLIB | 2.1 | **1.6** | - |
-| slay09h | CBLIB | 35.7 | **15.1** | - |
-| slay09m | CBLIB | 5.9 | **1.2** | - |
-| slay10h | CBLIB | 100.2 | TL | - |
-| slay10m | CBLIB | 36.4 | **12.4** | - |
-| sssd-strong-15-4 | CBLIB | 7.1 | **3.3** | - |
-| sssd-strong-15-8 | CBLIB | **16.9** | 23.4 | - |
-| sssd-strong-20-4 | CBLIB | 2.4 | **1.7** | - |
-| sssd-strong-20-8 | CBLIB | **11.7** | 78.0 | - |
-| sssd-strong-25-4 | CBLIB | **0.5** | 5.1 | - |
-| sssd-strong-25-8 | CBLIB | TL | TL | - |
-| sssd-strong-30-4 | CBLIB | 8.8 | **5.0** | - |
+| slay06h | CBLIB | **1.4** | 4.4 | - |
+| slay06m | CBLIB | **0.8** | 1.3 | - |
+| slay07h | CBLIB | 5.2 | **3.6** | - |
+| slay07m | CBLIB | 1.1 | **1.0** | - |
+| slay08h | CBLIB | 11.1 | **6.3** | - |
+| slay08m | CBLIB | **1.2** | 1.6 | - |
+| slay09h | CBLIB | **11.5** | 15.1 | - |
+| slay09m | CBLIB | 4.3 | **1.2** | - |
+| slay10h | CBLIB | 57.9 | TL | - |
+| slay10m | CBLIB | 21.1 | **12.4** | - |
+| sssd-strong-15-4 | CBLIB | 7.7 | **3.3** | - |
+| sssd-strong-15-8 | CBLIB | **10.5** | 23.4 | - |
+| sssd-strong-20-4 | CBLIB | **0.9** | 1.7 | - |
+| sssd-strong-20-8 | CBLIB | **25.4** | 78.0 | - |
+| sssd-strong-25-4 | CBLIB | 30.5 | **5.1** | - |
+| sssd-strong-25-8 | CBLIB | 84.3 | TL | - |
+| sssd-strong-30-4 | CBLIB | 5.6 | **5.0** | - |
 | sssd-strong-30-8 | CBLIB | TL | 69.0 | - |
-| sssd-weak-15-4 | CBLIB | 5.1 | **3.7** | - |
-| sssd-weak-15-8 | CBLIB | **8.0** | 13.3 | - |
-| sssd-weak-20-4 | CBLIB | **0.8** | 3.5 | - |
-| sssd-weak-20-8 | CBLIB | 43.2 | **38.7** | - |
-| sssd-weak-25-4 | CBLIB | 1.9 | **1.8** | - |
-| sssd-weak-25-8 | CBLIB | 102.4 | TL | - |
-| sssd-weak-30-4 | CBLIB | **6.7** | 8.1 | - |
-| sssd-weak-30-8 | CBLIB | 75.0 | TL | - |
+| sssd-weak-15-4 | CBLIB | 5.8 | **3.7** | - |
+| sssd-weak-15-8 | CBLIB | 14.6 | **13.3** | - |
+| sssd-weak-20-4 | CBLIB | **0.4** | 3.5 | - |
+| sssd-weak-20-8 | CBLIB | **29.9** | 38.7 | - |
+| sssd-weak-25-4 | CBLIB | **1.4** | 1.8 | - |
+| sssd-weak-25-8 | CBLIB | 46.3 | TL | - |
+| sssd-weak-30-4 | CBLIB | 8.3 | **8.1** | - |
+| sssd-weak-30-8 | CBLIB | 50.1 | TL | - |
 | tls12 | CBLIB | TL | TL | - |
 | tls2 | CBLIB | **0.1** | 0.4 | - |
-| tls4 | CBLIB | **5.7** | 7.1 | - |
+| tls4 | CBLIB | 11.4 | **7.1** | - |
 | tls5 | CBLIB | TL | TL | - |
 | tls6 | CBLIB | TL | TL | - |
 | tls7 | CBLIB | TL | TL | - |
 | turbine07 | CBLIB | 0.1 | **0.0** | - |
 | turbine07GF | CBLIB | **0.0** | 0.0 | - |
 | turbine07_aniso | CBLIB | 0.1 | TL | - |
-| turbine07_lowb | CBLIB | **0.5** | 1.9 | - |
-| turbine07_lowb_aniso | CBLIB | 2.5 | **0.5** | - |
-| turbine54 | CBLIB | 1.2 | **0.4** | - |
-| turbine54GF | CBLIB | 0.0 | **0.0** | - |
-| uflquad-nopsc-10-100 | CBLIB | 29.7 | **7.4** | - |
-| uflquad-nopsc-10-150 | CBLIB | 46.3 | **7.2** | - |
-| uflquad-nopsc-20-100 | CBLIB | TL | 41.7 | - |
-| uflquad-nopsc-20-150 | CBLIB | TL | 64.5 | - |
-| uflquad-nopsc-30-100 | CBLIB | TL | 61.4 | - |
-| uflquad-nopsc-30-150 | CBLIB | TL | 54.0 | - |
-| uflquad-nopsc-30-200 | CBLIB | TL | TL | - |
+| turbine07_lowb | CBLIB | **0.7** | 1.9 | - |
+| turbine07_lowb_aniso | CBLIB | 0.7 | **0.5** | - |
+| turbine54 | CBLIB | 1.0 | **0.4** | - |
+| turbine54GF | CBLIB | **0.0** | 0.0 | - |
+| uflquad-nopsc-10-100 | CBLIB | **0.8** | 7.4 | - |
+| uflquad-nopsc-10-150 | CBLIB | **2.4** | 7.2 | - |
+| uflquad-nopsc-20-100 | CBLIB | **5.0** | 41.7 | - |
+| uflquad-nopsc-20-150 | CBLIB | **6.4** | 64.5 | - |
+| uflquad-nopsc-30-100 | CBLIB | **13.7** | 61.4 | - |
+| uflquad-nopsc-30-150 | CBLIB | **4.2** | 54.0 | - |
+| uflquad-nopsc-30-200 | CBLIB | 26.3 | TL | - |
 | uflquad-nopsc-30-300 | CBLIB | TL | TL | - |
-| uflquad-psc-10-100 | CBLIB | 4.0 | **2.6** | - |
-| uflquad-psc-10-150 | CBLIB | 7.0 | **5.8** | - |
-| uflquad-psc-20-100 | CBLIB | **16.1** | 21.0 | - |
-| uflquad-psc-20-150 | CBLIB | **23.0** | 39.5 | - |
-| uflquad-psc-30-100 | CBLIB | **18.8** | 32.7 | - |
-| uflquad-psc-30-150 | CBLIB | **2.4** | 27.1 | - |
-| uflquad-psc-30-200 | CBLIB | 24.7 | TL | - |
-| uflquad-psc-30-300 | CBLIB | TL | TL | - |
+| uflquad-psc-10-100 | CBLIB | **0.8** | 2.6 | - |
+| uflquad-psc-10-150 | CBLIB | **4.2** | 5.8 | - |
+| uflquad-psc-20-100 | CBLIB | **6.8** | 21.0 | - |
+| uflquad-psc-20-150 | CBLIB | **5.6** | 39.5 | - |
+| uflquad-psc-30-100 | CBLIB | **26.0** | 32.7 | - |
+| uflquad-psc-30-150 | CBLIB | **2.3** | 27.1 | - |
+| uflquad-psc-30-200 | CBLIB | 27.6 | TL | - |
+| uflquad-psc-30-300 | CBLIB | 113.3 | TL | - |
 
 </details>
 

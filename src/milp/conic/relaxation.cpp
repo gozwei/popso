@@ -239,4 +239,73 @@ bool conic_relaxation(const MipProblem& p, ConicProblem& out, std::string* why, 
   return true;
 }
 
+// Cones that fixed columns flatten: the head equal to a member (plus or minus) over the free columns and the
+// constants, as in a rotated cone x^2 <= c u z with z fixed at 0, whose norm form is ||(x, w u)|| <= w u; or a head
+// fixed at 0. Such a cone has no interior (the interior-point method fails on it: CBLIB
+// achtziger_stolpe06-6.2flowc, "numerical error" for every integer assignment) and is linear: every other member
+// is 0. Members over one free column are fixed that way and the row is removed from q; a row this does not settle
+// stays as it is. False if a member cannot be 0 (the fixings are infeasible).
+bool flatten_fixed_cones(MipProblem& q) {
+  auto fixed = [&](Index j) { return q.col_lb[j] == q.col_ub[j]; };
+  // expr = constant + its free terms (merged by column); returns the constant.
+  auto split = [&](const std::vector<std::pair<Index, double>>& e, double c0, std::map<Index, double>& free_terms) {
+    for (const auto& [j, v] : e) {
+      if (fixed(j)) c0 += v * q.col_lb[j];
+      else free_terms[j] += v;
+    }
+    for (auto it = free_terms.begin(); it != free_terms.end();) it = it->second == 0.0 ? free_terms.erase(it) : std::next(it);
+    return c0;
+  };
+  std::vector<QuadRow> kept;
+  for (QuadRow& r : q.quad_rows) {
+    bool flat = false, settled = false;
+    if (r.cone && r.cone_gamma == 0.0) {
+      std::map<Index, double> hf;
+      const double hc = split(r.cone_h, r.cone_h0, hf);
+      size_t same = r.cone_a.size();
+      for (size_t m = 0; m < r.cone_a.size() && same == r.cone_a.size(); ++m) {
+        for (const double sg : {1.0, -1.0}) {
+          std::map<Index, double> d = hf;
+          double dc = hc;
+          for (const auto& [j, v] : r.cone_a[m]) {
+            if (fixed(j)) dc -= sg * v * q.col_lb[j];
+            else d[j] -= sg * v;
+          }
+          dc -= sg * r.cone_b[m];
+          bool zero = std::abs(dc) <= 1e-12;
+          for (const auto& [j, v] : d) zero = zero && std::abs(v) <= 1e-12;
+          if (zero) same = m;
+        }
+      }
+      if (hf.empty() && std::abs(hc) <= 1e-12) same = r.cone_a.size() + 1;  // the head itself is 0: every member is
+      flat = same != r.cone_a.size();
+      if (flat) {
+        settled = true;
+        std::vector<std::pair<Index, double>> fixes;
+        for (size_t m = 0; m < r.cone_a.size() && settled; ++m) {
+          if (m == same) continue;
+          std::map<Index, double> mf;
+          const double mc = split(r.cone_a[m], r.cone_b[m], mf);
+          if (mf.empty()) {
+            if (std::abs(mc) > 1e-9) return false;
+          } else if (mf.size() == 1) {
+            fixes.emplace_back(mf.begin()->first, -mc / mf.begin()->second);
+          } else {
+            settled = false;
+          }
+        }
+        for (size_t k = 0; k < fixes.size() && settled; ++k) {
+          const auto [j, v] = fixes[k];
+          if (fixed(j)) settled = std::abs(q.col_lb[j] - v) <= 1e-9;  // fixed by an earlier member or row
+          else if (v < q.col_lb[j] - 1e-9 || v > q.col_ub[j] + 1e-9) return false;
+          else q.col_lb[j] = q.col_ub[j] = std::clamp(v, q.col_lb[j], q.col_ub[j]);
+        }
+      }
+    }
+    if (!(flat && settled)) kept.push_back(std::move(r));
+  }
+  q.quad_rows = std::move(kept);
+  return true;
+}
+
 }  // namespace milp

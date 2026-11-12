@@ -33,6 +33,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -338,6 +339,11 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
         cmd += ["--gap", f"{args.gap:g}"]
     if args.mem_limit and not args.no_solver_mem_flag:
         cmd += ["--mem-limit", str(args.mem_limit)]
+    start_path = Path(args.starts) / f"{name}.sol" if args.starts else None
+    if start_path is not None and start_path.exists():
+        cmd += ["--start", str(start_path)]
+    else:
+        start_path = None
     prof_path = tmpdir / f"{name}.profile.json"
     if args.trace:
         if prof_path.exists():
@@ -354,6 +360,8 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
     rec = {"instance": name, "file": repo_rel(path), "time": wall, "returncode": rc,
            "peak_rss_mb": round(peak, 1), "status": None, "objective": None, "class": None,
            "message": ""}
+    if args.starts:
+        rec["start"] = start_path is not None
     ref = refs.get(name)
     if ref:
         rec["ref_status"], rec["ref_objective"] = ref["status"], ref["objective"]
@@ -419,6 +427,11 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
         pass
     if args.keep_sols:
         rec["sol_file"] = str(sol_path)
+    if args.save_sols and sol.values and "verify" in details and cls not in (WRONG, ERROR):
+        # A verified feasible point (optimal or not): a start file for later runs (--starts).
+        Path(args.save_sols).mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(sol_path, Path(args.save_sols) / f"{name}.sol")
+        rec["saved_sol"] = True
     return rec
 
 
@@ -515,6 +528,12 @@ def main(argv=None):
     ap.add_argument("--tag", default="", help="label appended to the result file name")
     ap.add_argument("--no-save", action="store_true", help="do not write result files")
     ap.add_argument("--keep-sols", action="store_true", help="keep .sol/.log under results/tmp")
+    ap.add_argument("--starts", metavar="DIR",
+                    help="warm starts: an instance with a file DIR/<instance>.sol gets it as --start <file> "
+                         "(the others run without a start; the record's \"start\" says which)")
+    ap.add_argument("--save-sols", metavar="DIR",
+                    help="copy every verified feasible solution to DIR/<instance>.sol (start files for --starts, "
+                         "e.g. from a short run of this solver or of benchmarks/tools/highs_cli.py)")
     ap.add_argument("--trace", action="store_true",
                     help="popso only: pass --profile and record each run's incumbents over time and its primal "
                          "integral over the time limit (mean primal gap to the reference objective, lib/primal.py)")

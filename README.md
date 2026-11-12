@@ -29,7 +29,7 @@ On the 43 harder instances of the same collection that no solver finishes in 2 m
 benchmark set (2 minutes, another machine) it solves 89, HiGHS 74 and SCIP 65. On 346 models with
 quadratic constraints, second-order cones or nonconvex quadratics over binaries from
 [QPLIB](https://qplib.zib.de) and [CBLIB](https://cblib.zib.de) (2 minutes, 1 thread, another
-machine) it solves 186 and SCIP 101.
+machine) it solves 196 and SCIP 101.
 
 These numbers come from single runs and have caveats. See **[BENCHMARKS.md](BENCHMARKS.md)** for
 the setup, per-instance results, the hard instances, the full benchmark set, the generated benchmark

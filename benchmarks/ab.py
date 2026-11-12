@@ -40,6 +40,8 @@ from pathlib import Path
 
 BENCH = Path(__file__).resolve().parent
 RUN = BENCH / "run.py"
+sys.path.insert(0, str(BENCH))
+from lib.primal import pgap as primal_gap  # noqa: E402
 
 
 def run_side(solver, extra, seed, args, label, env_extra=""):
@@ -58,6 +60,8 @@ def run_side(solver, extra, seed, args, label, env_extra=""):
         cmd.append("--trace")
     for st in args.set:
         cmd += ["--set", st]
+    if args.starts:
+        cmd += ["--starts", args.starts]
     cmd += args.instances
     print(f"[ab] {label} seed {seed}: {' '.join(cmd[2:5])} ...", flush=True)
     env = dict(os.environ)
@@ -106,6 +110,7 @@ def main():
     ap.add_argument("--primal", action="store_true",
                     help="popso only: also compare the primal integral (run.py --trace): mean primal gap over the "
                          "time limit per side, B - A with a 90%% bootstrap interval")
+    ap.add_argument("--starts", metavar="DIR", help="warm starts for both sides (run.py --starts)")
     ap.add_argument("instances", nargs="*")
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",")]
@@ -115,6 +120,7 @@ def main():
     solved = {"A": 0, "B": 0}
     wrong = {"A": [], "B": []}
     pint = {"A": defaultdict(list), "B": defaultdict(list)}  # primal integrals per instance (--primal)
+    fgap = {"A": defaultdict(list), "B": defaultdict(list)}  # final primal gaps per instance (--primal)
     plan = []
     for k, seed in enumerate(seeds):
         sides = [("A", args.a, args.a_args, args.a_env), ("B", args.b, args.b_args, args.b_env)]
@@ -152,6 +158,9 @@ def main():
             times[side][name].append(min(r["time"], args.time_limit) if ok else args.time_limit)
             if r.get("primal_integral") is not None:
                 pint[side][name].append(r["primal_integral"])
+            if r.get("ref_objective") is not None and r["class"] != "WRONG":
+                z = r.get("objective_recomputed", r.get("objective"))
+                fgap[side][name].append(primal_gap(z, r["ref_objective"]))
 
     names = sorted(set(times["A"]) & set(times["B"]))
     if not names:
@@ -217,6 +226,31 @@ def main():
         print("  largest improvements: " + ", ".join(f"{n} {pa[n]:.3f}->{pb[n]:.3f}" for n in ch[:5] if pb[n] < pa[n]))
         print("  largest losses:       " + ", ".join(f"{n} {pa[n]:.3f}->{pb[n]:.3f}" for n in ch[::-1][:5] if pb[n] > pa[n]))
 
+    final = None
+    fnames = sorted(n for n in names if fgap["A"][n] and fgap["B"][n])
+    if args.primal and fnames:
+        # The primal gap of the final solution (0 at the reference objective, 1 without a solution), mean over
+        # seeds: what a time-limited run delivers. Instances differing by less than 1e-6 count as equal.
+        fa = {n: sum(fgap["A"][n]) / len(fgap["A"][n]) for n in fnames}
+        fb = {n: sum(fgap["B"][n]) / len(fgap["B"][n]) for n in fnames}
+        ma, mb = sum(fa.values()) / len(fnames), sum(fb.values()) / len(fnames)
+        diffs = []
+        for _ in range(2000):
+            sample = [rng.choice(fnames) for _ in fnames]
+            diffs.append(sum(fb[n] - fa[n] for n in sample) / len(sample))
+        diffs.sort()
+        flo, fhi = diffs[int(0.05 * len(diffs))], diffs[int(0.95 * len(diffs))]
+        b_better = sum(fb[n] < fa[n] - 1e-6 for n in fnames)
+        a_better = sum(fa[n] < fb[n] - 1e-6 for n in fnames)
+        final = {"A": ma, "B": mb, "diff": mb - ma, "ci90": [flo, fhi], "instances": len(fnames),
+                 "b_better": b_better, "a_better": a_better, "per_instance": {n: (fa[n], fb[n]) for n in fnames}}
+        print(f"\nfinal primal gap (mean over {len(fnames)} instances with a reference objective):")
+        print(f"  A {ma:.5f}  B {mb:.5f}  B - A {mb - ma:+.5f}   90% CI [{flo:+.5f}, {fhi:+.5f}]   "
+              f"B better on {b_better}, A better on {a_better}")
+        ch = sorted(fnames, key=lambda n: fb[n] - fa[n])
+        print("  largest improvements: " + ", ".join(f"{n} {fa[n]:.4f}->{fb[n]:.4f}" for n in ch[:5] if fb[n] < fa[n] - 1e-6))
+        print("  largest losses:       " + ", ".join(f"{n} {fa[n]:.4f}->{fb[n]:.4f}" for n in ch[::-1][:5] if fb[n] > fa[n] + 1e-6))
+
     for side in ("A", "B"):
         for name, seed, msg in wrong[side]:
             print(f"!!! WRONG {side} {name} seed {seed}: {msg}")
@@ -224,7 +258,7 @@ def main():
         Path(args.out).write_text(json.dumps({
             "a": args.a, "b": args.b, "a_args": args.a_args, "b_args": args.b_args, "seeds": seeds,
             "ratio": ratio, "ci90": [lo, hi], "per_instance": per, "wrong": wrong, "solved": solved,
-            **({"primal": primal} if primal else {})}, indent=1))
+            **({"primal": primal} if primal else {}), **({"final_gap": final} if final else {})}, indent=1))
     sys.exit(1 if wrong["B"] else 0)
 
 

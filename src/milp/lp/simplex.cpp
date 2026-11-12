@@ -1544,9 +1544,16 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
 LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
   const double ptol = opt.tol.primal_feas;
   const double dtol = opt.tol.dual_feas;
+  // Dantzig pricing with the largest-pivot ratio test can cycle on a degenerate vertex (clay0305h with implied
+  // bounds: one node LP, dual infeasible after phase 1, ran 4 million pivots into the time limit). Past a generous
+  // count of pivots in one call the rule is Bland's: the first eligible entering variable, and among the smallest
+  // ratios the leaving variable of the lowest index. MILP_PRIMAL_BLAND=0: off.
+  static const bool kBland = [] { const char* v = std::getenv("MILP_PRIMAL_BLAND"); return !(v && v[0] == '0'); }();
+  const long long bland_at = total_iterations_ + 5000 + 5LL * (n_ + m_);
   for (;;) {
     LpStatus lim;
     if (limits_hit(opt, &lim)) return lim;
+    const bool bland = kBland && total_iterations_ > bland_at;
     if (lu_.num_updates() >= opt.refactor_interval || lu_.wants_refactor()) {
       refactor();
       compute_primal();
@@ -1563,7 +1570,10 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
       if (st == VarStatus::AtLower) infeas = -dj;
       else if (st == VarStatus::AtUpper) infeas = dj;
       else infeas = std::abs(dj);
-      if (infeas > best && infeas > dtol * dftol_[j]) best = infeas, q = j;
+      if (infeas > best && infeas > dtol * dftol_[j]) {
+        best = infeas, q = j;
+        if (bland) break;
+      }
     }
     if (q < 0) {
       if (!kPrimalDse) dse_.assign(m_, 1.0);
@@ -1605,7 +1615,13 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
       if (a > 1e-9 && is_finite(wlb_[j])) ratio = (x_[j] - wlb_[j]) / a, lower = true;
       else if (a < -1e-9 && is_finite(wub_[j])) ratio = (wub_[j] - x_[j]) / -a, lower = false;
       else continue;
-      if (ratio <= theta_max && std::abs(a) > best_a) best_a = std::abs(a), r = p, theta = ratio, leave_lower = lower;
+      if (ratio > theta_max) continue;
+      if (bland) {
+        const double rt = std::max(ratio, 0.0);
+        if (r < 0 || rt < theta || (rt == theta && j < basic_[r])) r = p, theta = rt, leave_lower = lower;
+      } else if (std::abs(a) > best_a) {
+        best_a = std::abs(a), r = p, theta = ratio, leave_lower = lower;
+      }
     }
     if (r < 0) return fail("primal ratio test");
     theta = std::max(theta, 0.0);

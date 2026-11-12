@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.9.0 — 2026-11
+
+- Mixed-integer models with quadratic constraints get a light presolve before the convexity check and the cone
+  detection. Cone members that are only copies of other columns (a continuous column whose one linear row is an
+  equality with one other column, as conic benchmark format conversions define every member) are replaced by
+  those columns in the quadratic rows (pure scalings only, so a cone stays a cone); and a constraint `sum q x^2 <= c t` whose `x` are
+  switched off by one binary `y` (`x <= u y`, `x >= 0`) becomes the rotated cone `sum q x^2 <= c t y` (the
+  perspective reformulation: the same integer points, a tighter relaxation; fixed columns in such a row's
+  quadratic terms are folded first). The model keeps its columns and rows, and the solution is checked against
+  the model as given, with a solve of the model as given if the check fails. `MILP_QUAD_PRESOLVE=0` turns it off.
+  Bounds of the columns in quadratic rows can also be tightened from the linear rows
+  (`MILP_QUAD_PRESOLVE_BOUNDS=1`; off by default: no gain on CBLIB overall).
+- Rotated cones switched by a binary (`x^2 <= c u z`, `z` binary) are enforced as implications (`z = 0` fixes
+  `x = 0`; an integral point that violates one is branched on `z`) where no row with a big-M says so: tangent
+  cuts reach `x = 0` only in the limit there. `MILP_OA_CONE_IMPL=0` turns it off.
+- An integral node point that violates the quadratic constraints after a round of tangent cuts has its continuous
+  part solved by the conic interior-point method with the integers fixed: a feasible point becomes an incumbent
+  candidate and gives tangent cuts at the subproblem's optimum, an infeasible assignment gives cuts from the
+  infeasibility certificate. Cones that the fixings flatten (no interior) are handled as the linear constraints
+  they are. `MILP_OA_INT_NLP=0` turns it off.
+- `--deterministic` with quadratic constraints: the tangent cuts of a node are rows of that node's LP while it
+  is processed (they reach the shared cut pool at the next synchronization point as before), so integral points
+  that violate the constraints are cut off at the node, as in the default mode.
+- The QP barrier accepts a point by each row's own violation (relative to that row's side), no longer relative
+  to the largest side of all rows.
+- Probing no longer runs away on continuous columns whose domains have shrunk to rounding errors: two such
+  columns could tighten each other by 1e-18 per step without end, and the record of the steps took the memory
+  (neos-5104907-jarama: 9 to 15 GB after the root, now 1.8 GB). Such a column counts as fixed, and one probe's
+  chain of bound changes is capped.
+- The simplex's primal loop switches to Bland's rule after many pivots in one call: with Dantzig pricing it
+  could cycle on a degenerate vertex (one node LP of CBLIB's clay0305h ran into the time limit).
+- Two opt-in settings for runs that start with an incumbent (issue #4): `MILP_ROOT_LNS_FIRST=1` runs the root's
+  neighbourhood searches before the dives, `MILP_ROOT_LNS_ADAPT=f` lets them continue while they improve the
+  incumbent, up to the fraction `f` of the time left. Neither is a default: on the warm-start benchmark set
+  their effect is inside the run-to-run noise.
+- Benchmark harness: `run.py --save-sols DIR` keeps verified feasible solutions as start files, `run.py --starts
+  DIR` and `ab.py --starts DIR` run with them (warm-start benchmarks; `benchmarks/sets/warmstart.txt`), and
+  `ab.py --primal` also compares the primal gap of the final solutions.
+
 ## v0.8.4 — 2026-11
 
 - The root stops at once when an incumbent found before the root LP ended (a user start, feasibility jump, the

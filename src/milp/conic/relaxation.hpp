@@ -34,4 +34,12 @@ struct ConicMap {
 // False, with the reason in *why, if a row's factorization finds it not positive semidefinite.
 bool conic_relaxation(const MipProblem& p, ConicProblem& out, std::string* why = nullptr, ConicMap* map = nullptr);
 
+// Cones that fixed columns flatten: the head equal to a member (plus or minus) over the free columns and the
+// constants, as in a rotated cone x^2 <= c u z with z fixed at 0, whose norm form is ||(x, w u)|| <= w u; or a head
+// fixed at 0. Such a cone has no interior (the interior-point method fails on it: CBLIB
+// achtziger_stolpe06-6.2flowc, "numerical error" for every integer assignment) and is linear: every other member
+// is 0. Members over one free column are fixed that way and the row is removed from q; a row this does not settle
+// stays as it is. False if a member cannot be 0 (the fixings are infeasible).
+bool flatten_fixed_cones(MipProblem& q);
+
 }  // namespace milp

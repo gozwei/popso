@@ -34,8 +34,9 @@
 #include "milp/search/mip_problem.hpp"
 #include "milp/solver/duals.hpp"
 #include "milp/solver/postsolve.hpp"
-#include "milp/solver/square_terms.hpp"
+#include "milp/solver/quad_presolve.hpp"
 #include "milp/solver/reformulate.hpp"
+#include "milp/solver/square_terms.hpp"
 #include "milp/solver/start.hpp"
 
 namespace milp {
@@ -1096,32 +1097,17 @@ std::optional<SolveResult> solve_linearized(const Model& model, bool objective, 
 SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
                           const Timer& timer, const Logger& log, IncumbentTracer* tracer);
 
-SolveResult solve_oa(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
-                     const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
-  static const LinearizeOptions opts;
-  const auto lr = solve_linearized(model, linearize_objective(model, opts), start, log,
-                                   [&](const Model& lm, const std::vector<double>& st) {
-                                     if (lm.has_quadratic_rows()) return solve_oa_core(lm, params_in, st, timer, log, tracer);
-                                     if (lm.has_quadratic()) return solve_quadratic(lm, params_in, st, timer, log, tracer);
-                                     return solve_plain(lm, {}, params_in, st, timer, log, nullptr, tracer, true);
-                                   });
-  if (lr) return *lr;
-  return solve_oa_core(model, params_in, start, timer, log, tracer);
-}
-
-SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
-                          const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
-  SolveResult r;
-  if (model.has_logical()) throw std::runtime_error("quadratic constraints with logical constraints are not supported yet");
-  const double sense = model.sense == ObjSense::Maximize ? -1.0 : 1.0;
+// The quadratic rows of `model` as the search's QuadRows (their linear parts, terms and sides; `quad` flags the
+// rows), each checked for convexity or recognized as a cone (detect_cone). False, with the reason, if one is neither.
+bool build_quad_rows(const Model& model, std::vector<char>& quad, std::vector<QuadRow>& rows, size_t& cones,
+                     std::string& why) {
   const Index n = model.num_cols(), m = model.num_rows();
-  std::vector<char> quad(static_cast<size_t>(m), 0);
+  quad.assign(static_cast<size_t>(m), 0);
   for (size_t k = 0; k < model.qr_val.size(); ++k) {
     if (model.qr_val[k] != 0.0) quad[model.qr_row[k]] = 1;
   }
   const SparseMatrix At = model.A.transpose();
   std::vector<Index> slot(static_cast<size_t>(m), -1);
-  std::vector<QuadRow> rows;
   for (Index i = 0; i < m; ++i) {
     if (!quad[i]) continue;
     slot[i] = static_cast<Index>(rows.size());
@@ -1141,12 +1127,10 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
   // Convexity: the Hessian of each row (2c on the diagonal, c off it, as 1/2 x' H x) PSD towards a finite upper side,
   // NSD towards a finite lower side; a quadratic row with both sides finite is not convex.
   auto nonconvex = [&](const std::string& msg) {
-    log.log(1, "ERROR: %s\n", msg.c_str());
-    r.status = Status::NonConvex;
-    r.stats.time = timer.elapsed();
-    return r;
+    why = msg;
+    return false;
   };
-  size_t cones = 0;
+  cones = 0;
   for (size_t s = 0; s < rows.size(); ++s) {
     QuadRow& q = rows[s];
     if (is_finite(q.lo) && is_finite(q.hi)) return nonconvex("a quadratic constraint with two finite sides is not convex");
@@ -1160,6 +1144,95 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
     if (cv.convex) continue;
     if (!detect_cone(q, model.col_lb, model.col_ub)) return nonconvex("quadratic constraint not convex: " + cv.message);
     ++cones;
+  }
+  return true;
+}
+
+SolveResult solve_oa_presolved(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
+                               const Timer& timer, const Logger& log, IncumbentTracer* tracer);
+
+// MILP_QUAD_PRESOLVE (default 1; 0: off): mixed-integer models with quadratic rows go through quad_presolve
+// (solver/quad_presolve.hpp) first. Its model has the same columns, so the solution needs only its alias
+// columns recomputed; it is then checked against the model itself, and a point that fails (or a presolved
+// model that is not convex where the model may be) sends the model through the search as it is.
+SolveResult solve_oa(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
+                     const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
+  static const bool on = [] {
+    const char* e = std::getenv("MILP_QUAD_PRESOLVE");
+    return !(e && *e == '0');
+  }();
+  if (on && model.has_quadratic_rows() && model.num_integers() > 0 && !model.has_logical()) {
+    Model pm;
+    const QuadPresolve ps = quad_presolve(model, pm);
+    if (ps.changed()) {
+      log.log(1, "Quadratic presolve: %zu alias members replaced, %d fixed terms folded, %d perspective cones, %d bounds"
+              " tightened\n", ps.aliases.size(), ps.fixed_terms, ps.perspective, ps.bounds);
+      SolveResult r = solve_oa_presolved(pm, params_in, start, timer, log, tracer);
+      bool ok = r.status != Status::NonConvex;
+      if (ok && r.has_solution) {
+        // The model's own rows by the search's measure (QuadRow::violation: a cone by its norm form, absolute
+        // where it has no constants; a rewritten row can be a convex quadratic judged relative to its terms),
+        // and its raw forms no worse than the presolved model's.
+        const double pviol = pm.violation(r.x).max();
+        ps.restore(r.x);
+        double viol = model.violation(r.x).max();
+        ok = viol <= std::max(1e-6, 2.0 * pviol + 1e-9);
+        std::vector<char> oquad;
+        std::vector<QuadRow> orows;
+        size_t ocones = 0;
+        std::string why;
+        if (ok && build_quad_rows(model, oquad, orows, ocones, why)) {
+          for (const QuadRow& q : orows) viol = std::max(viol, q.violation(r.x.data()));
+          for (const QuadRow& q : orows) ok = ok && q.violation(r.x.data()) <= 1e-6;
+        }
+        if (!ok) log.log(1, "Quadratic presolve: its solution violates the model by %.3g; solving without it\n", viol);
+        r.objective = model.objective_value(r.x);
+      }
+      if (ok) return r;
+    }
+  }
+  return solve_oa_presolved(model, params_in, start, timer, log, tracer);
+}
+
+SolveResult solve_oa_presolved(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
+                               const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
+  static const LinearizeOptions opts;
+  if (!model.has_quadratic_rows() && !model.has_quadratic()) {  // every quadratic row became linear in the presolve
+    return solve_plain(model, {}, params_in, start, timer, log, nullptr, tracer, true);
+  }
+  const auto lr = solve_linearized(model, linearize_objective(model, opts), start, log,
+                                   [&](const Model& lm, const std::vector<double>& st) {
+                                     if (lm.has_quadratic_rows()) return solve_oa_core(lm, params_in, st, timer, log, tracer);
+                                     if (lm.has_quadratic()) return solve_quadratic(lm, params_in, st, timer, log, tracer);
+                                     return solve_plain(lm, {}, params_in, st, timer, log, nullptr, tracer, true);
+                                   });
+  if (lr) return *lr;
+  return solve_oa_core(model, params_in, start, timer, log, tracer);
+}
+
+SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
+                          const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
+  SolveResult r;
+  if (model.has_logical()) throw std::runtime_error("quadratic constraints with logical constraints are not supported yet");
+  const double sense = model.sense == ObjSense::Maximize ? -1.0 : 1.0;
+  const Index n = model.num_cols(), m = model.num_rows();
+  std::vector<char> quad;
+  std::vector<QuadRow> rows;
+  size_t cones = 0;
+  auto nonconvex = [&](const std::string& msg) {
+    log.log(1, "ERROR: %s\n", msg.c_str());
+    r.status = Status::NonConvex;
+    r.stats.time = timer.elapsed();
+    return r;
+  };
+  {
+    std::string why;
+    if (!build_quad_rows(model, quad, rows, cones, why)) return nonconvex(why);
+  }
+  const SparseMatrix At = model.A.transpose();
+  std::vector<Index> slot(static_cast<size_t>(m), -1);  // row -> its index in rows
+  for (Index i = 0, k = 0; i < m; ++i) {
+    if (quad[i]) slot[i] = k++;
   }
   Model lin = model;
   lin.q_row.clear(), lin.q_col.clear(), lin.q_val.clear();
@@ -1196,6 +1269,58 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
     }
     rows.push_back(std::move(q));
   }
+  // A rotated cone sum_k c_k x_k^2 <= c u z with a binary z: z = 0 forces every x_k to 0. The tangents say so only
+  // in the limit (at z = 0 the cone has no interior: an integral point with z = 0 and x_k != 0 took 150 rounds of
+  // tangents on CBLIB achtziger_stolpe06-6.2flowc and was still violated), and the columns' ranges give no
+  // big-M there (u and x_k unbounded). The search takes it as an implication instead: x_k is fixed where z is
+  // fixed at 0, and an integral point that violates it is branched on z (MipProblem::implications, as for
+  // indicator constraints without a big-M). Not where a row x_k <= M z with x_k >= 0 says it already.
+  // MILP_OA_CONE_IMPL=0: off.
+  static const bool cone_impl = [] {
+    const char* e = std::getenv("MILP_OA_CONE_IMPL");
+    return !(e && *e == '0');
+  }();
+  if (cone_impl) {
+    auto binary = [&](Index j) {
+      return j < n && (model.col_type[j] == VarType::Binary || model.col_type[j] == VarType::Integer) &&
+             model.col_lb[j] == 0.0 && model.col_ub[j] == 1.0;
+    };
+    auto linked = [&](Index x, Index z) {  // a row a x + b z <= 0 with a > 0 > b (or its mirror image) and x >= 0
+      if (!(model.col_lb[x] >= 0.0)) return false;
+      for (Index k = model.A.begin(x); k < model.A.end(x); ++k) {
+        const Index i = model.A.index[k];
+        if (quad[i] || At.end(i) - At.begin(i) != 2) continue;
+        const Index k0 = At.begin(i), kz = At.index[k0] == x ? k0 + 1 : k0, kx = At.index[k0] == x ? k0 : k0 + 1;
+        if (At.index[kz] != z) continue;
+        if (model.row_ub[i] == 0.0 && At.value[kx] > 0.0 && At.value[kz] < 0.0) return true;
+        if (model.row_lb[i] == 0.0 && At.value[kx] < 0.0 && At.value[kz] > 0.0) return true;
+      }
+      return false;
+    };
+    size_t added = 0;
+    for (const QuadRow& q : rows) {
+      if (!q.cone || q.cone_gamma != 0.0 || !q.idx.empty()) continue;
+      Index u = -1, v = -1;
+      bool ok = true;
+      for (size_t k = 0; k < q.qc.size() && ok; ++k) {
+        if (q.qc[k] == 0.0 || q.qi[k] == q.qj[k]) continue;
+        ok = u < 0;
+        u = q.qi[k], v = q.qj[k];
+      }
+      if (!ok || u < 0) continue;
+      for (const Index z : {u, v}) {
+        if (!binary(z)) continue;
+        for (size_t k = 0; k < q.qc.size(); ++k) {
+          const Index x = q.qi[k];
+          if (q.qc[k] == 0.0 || q.qi[k] != q.qj[k] || x == u || x == v || linked(x, z)) continue;
+          if (model.col_lb[x] > 0.0 || model.col_ub[x] < 0.0) continue;  // 0 outside the column's range: left to the cuts
+          p.implications.push_back({z, 0.0, x});
+          ++added;
+        }
+      }
+    }
+    if (added > 0) log.log(1, "Cones switched by binaries: %zu implications (binary 0: member 0)\n", added);
+  }
   p.quad_rows = std::move(rows);
   // The continuous relaxation by the conic interior-point method (conic/socp.hpp, MILP_CONIC=0: off): it solves a
   // continuous model outright (the outer approximation stays the fallback); with integers, its point gives tangents.
@@ -1220,27 +1345,34 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
       if (cr.status == ConicStatus::Optimal && any_int && start.empty()) {
         // Rounding heuristic: the relaxation's integers rounded and fixed, the continuous rest by the conic method;
         // a feasible point starts the search (MISOCP layouts and flows have no incumbent for a long time without it).
-        MipProblem q = p;
-        for (Index j = 0; j < q.num_cols(); ++j) {
-          if (!q.is_int[j]) continue;
-          const double v = std::clamp(std::round(cr.x[j]), q.col_lb[j], q.col_ub[j]);
-          q.col_lb[j] = q.col_ub[j] = v;
-        }
-        ConicProblem cq;
-        if (conic_relaxation(q, cq)) {
+        // (Rounding upwards as a second attempt was tried for cones switched by binaries, CBLIB achtziger *flowc:
+        // infeasible there as well, so only the nearest integers.)
+        for (const bool up : {false}) {
+          MipProblem q = p;
+          for (Index j = 0; j < q.num_cols(); ++j) {
+            if (!q.is_int[j]) continue;
+            const double v = std::clamp(up ? std::ceil(cr.x[j] - 1e-6) : std::round(cr.x[j]), q.col_lb[j], q.col_ub[j]);
+            q.col_lb[j] = q.col_ub[j] = v;
+          }
+          if (!q.implications.empty() && !q.apply_implications(q.col_lb, q.col_ub)) continue;
+          ConicProblem cq;
+          if (!flatten_fixed_cones(q) || !conic_relaxation(q, cq)) continue;
           ConicOptions co2;
           co2.time_limit = 0.1 * std::max(0.0, params_in.time_limit - timer.elapsed());
           co2.threads = co.threads;
           const ConicResult rr = solve_conic(cq, co2);
-          if (rr.status == ConicStatus::Optimal) {
-            std::vector<double> x(rr.x.begin(), rr.x.begin() + n);
-            for (Index j = 0; j < n; ++j) {
-              if (model.col_type[j] == VarType::Integer || model.col_type[j] == VarType::Binary) x[j] = std::round(x[j]);
-            }
-            if (model.violation(x).max() <= 1e-6) {
-              log.log(1, "Conic rounding: a feasible point, objective %.10g\n", model.objective_value(x));
-              round_start = std::move(x);
-            }
+          log.log(2, "Conic rounding%s: %s, %d iterations\n", up ? " (upwards)" : "", to_string(rr.status), rr.iterations);
+          if (rr.status != ConicStatus::Optimal) continue;
+          std::vector<double> x(rr.x.begin(), rr.x.begin() + n);
+          for (Index j = 0; j < n; ++j) {
+            if (model.col_type[j] == VarType::Integer || model.col_type[j] == VarType::Binary) x[j] = std::round(x[j]);
+            else if (q.col_lb[j] == q.col_ub[j]) x[j] = q.col_lb[j];
+          }
+          log.log(2, "Conic rounding%s: violation %.3g\n", up ? " (upwards)" : "", model.violation(x).max());
+          if (model.violation(x).max() <= 1e-6) {
+            log.log(1, "Conic rounding%s: a feasible point, objective %.10g\n", up ? " (upwards)" : "", model.objective_value(x));
+            round_start = std::move(x);
+            break;
           }
         }
       }

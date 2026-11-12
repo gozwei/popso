@@ -17,6 +17,7 @@ class Prober {
  public:
   Prober(const MipProblem& p, long long work_limit, const ProbingOptions& opt)
       : p_(p), rows_(p.A.transpose()), limit_(work_limit), lb_(p.col_lb), ub_(p.col_ub) {
+    trail_cap_ = 1000000 + 20 * static_cast<size_t>(p.num_cols());
     queued_.assign(p.num_rows(), 0);
     lift_ = opt.lift;
     max_conf_ = opt.max_conflicts;
@@ -379,6 +380,11 @@ class Prober {
   bool propagate() {
     for (;;) {
       for (size_t head = 0; head < queue_.size(); ++head) {
+        // One probe's chain of bound changes is capped: the bounds reached so far are valid, the rest is skipped.
+        if (trail_.size() > trail_cap_) {
+          clear_queue();
+          return true;
+        }
         const Index i = queue_[head];
         queued_[i] = 0;
         if (!process_row(i)) {
@@ -466,6 +472,11 @@ class Prober {
         if (!(use_hi && mininf == 0 && span > gate_hi) && !(use_lo && maxinf == 0 && span > gate_lo)) continue;
       }
       const bool integer = p_.is_int[j];
+      // A continuous column whose domain is down to rounding errors counts as fixed. The rule below accepts any
+      // step that lands within 1e-8 of the opposite bound, so two such columns in two rows trade steps of 1e-18
+      // without end (neos-5104907-jarama, a sub-MIP's probing: columns in [3.5e-13, 9.6e-12], one probe's trail
+      // grew to 13 GB).
+      if (!integer && u - l <= 1e-9 * (1.0 + std::max(std::abs(l), std::abs(u)))) continue;
       const double lo = a > 0 ? l : u, hi = a > 0 ? u : l;
       // Residual activities without j.
       const bool rmin_ok = mininf - (std::isfinite(lo) ? 0 : 1) == 0;
@@ -522,6 +533,7 @@ class Prober {
   const MipProblem& p_;
   SparseMatrix rows_;  // CSR copy of A
   long long limit_, work_ = 0;
+  size_t trail_cap_ = 0;
   std::vector<double> lb_, ub_, lb0_, ub0_;
   std::vector<Index> stamp_, first_;
   std::vector<Change> trail_;

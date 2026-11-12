@@ -173,6 +173,17 @@ double row_violation(const MipProblem& p, const std::vector<double>& act) {
   return viol;
 }
 
+// The largest row violation relative to its row's own side, max(1, |side|): the measure of the MIP search's
+// solution check and of the benchmark harness.
+double row_violation_rel(const MipProblem& p, const std::vector<double>& act) {
+  double viol = 0.0;
+  for (Index i = 0; i < p.num_rows(); ++i) {
+    if (act[i] < p.row_lb[i]) viol = std::max(viol, (p.row_lb[i] - act[i]) / std::max(1.0, std::abs(p.row_lb[i])));
+    if (act[i] > p.row_ub[i]) viol = std::max(viol, (act[i] - p.row_ub[i]) / std::max(1.0, std::abs(p.row_ub[i])));
+  }
+  return viol;
+}
+
 // Feasibility polish of an interior-point result that violates rows (by more than tol): a projection onto the rows
 // that are violated or active (equalities, and rows within 1e-9 relative of a side): dx = A_V' (A_V A_V')^-1 r_V with
 // r_V the distance to the side (0 for an active row that holds), over the columns not clipped at a bound in an earlier
@@ -373,28 +384,34 @@ QpSolution solve_qp(const MipProblem& p, const std::vector<double>& lb, const st
       r = std::move(kept);
       r.approximate = true;
     }
-    // A point that is clearly infeasible in the original problem (the barrier's measures are
-    // scaled) is not accepted; the next attempt runs without scaling.
-    double bmax = 1.0;
-    for (Index i = 0; i < p.num_rows(); ++i) {
-      if (is_finite(p.row_lb[i])) bmax = std::max(bmax, std::abs(p.row_lb[i]));
-      if (is_finite(p.row_ub[i])) bmax = std::max(bmax, std::abs(p.row_ub[i]));
-    }
-    if (r.status == IpmStatus::Optimal && r.primal_infeas > 1e-6 * bmax && !(attempt == 1 && r.approximate && have_kept)) {
+    // A point that violates a row of the original problem (the barrier's measures are scaled) is not accepted;
+    // the next attempt runs without scaling. Judged per row, by more than 1e-6 relative to the row's own side
+    // (until v0.9: relative to the largest side of all rows, which let a row with a small side be violated
+    // by 1e-6 x that largest side; QPLIB_9002 has sides up to 5e9).
+    auto rel_violation = [&](const std::vector<double>& x) {
+      std::vector<double> xc = x;
+      for (Index j = 0; j < n; ++j) xc[j] = std::min(std::max(xc[j], lb[j]), ub[j]);
+      return row_violation_rel(p, activities(p, xc));
+    };
+    const bool keep_first = attempt == 1 && r.approximate && have_kept;  // the first attempt's point, taken back above
+    double rv = r.status == IpmStatus::Optimal && !keep_first ? rel_violation(r.x) : 0.0;
+    if (rv > 1e-6) {
       // The projection onto the active rows often repairs it (then no retry is needed).
       std::vector<double> xp = r.x;
       for (Index j = 0; j < n; ++j) xp[j] = std::min(std::max(xp[j], lb[j]), ub[j]);
       polish_rows(p, lb, ub, xp, 1e-7);
-      const double pv = row_violation(p, activities(p, xp));
-      if (pv <= 1e-6 * bmax) {
-        if (opt.log) opt.log->log(2, "QP: barrier point violated the rows by %.3g, %.3g after the projection\n", r.primal_infeas, pv);
+      const std::vector<double> act = activities(p, xp);
+      const double pv = row_violation_rel(p, act);
+      if (pv <= 1e-6) {
+        if (opt.log) opt.log->log(2, "QP: barrier point violated the rows by %.3g (relative), %.3g after the projection\n", rv, pv);
         r.x = std::move(xp);
-        r.primal_infeas = pv;
+        r.primal_infeas = row_violation(p, act);
+        rv = pv;
       }
     }
-    if (r.status == IpmStatus::Optimal && r.primal_infeas > 1e-6 * bmax && !(attempt == 1 && r.approximate && have_kept)) {
-      if (opt.log) opt.log->log(2, "QP: barrier point violates the rows by %.3g; retrying\n", r.primal_infeas);
-      if (attempt == 0 && r.primal_infeas <= 1e-4 * bmax) kept = r, have_kept = true;
+    if (rv > 1e-6) {
+      if (opt.log) opt.log->log(2, "QP: barrier point violates the rows by %.3g (relative); retrying\n", rv);
+      if (attempt == 0 && rv <= 1e-4) kept = r, have_kept = true;
       continue;
     }
     if (r.status == IpmStatus::Optimal) {
