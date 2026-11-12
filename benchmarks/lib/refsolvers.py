@@ -12,13 +12,15 @@ Each `solve_<name>(path, time_limit, threads, want_solution)` returns a dict:
 from __future__ import annotations
 
 import math
+import os
 import time
 
 from lib.solfile import INF_OR_UNBD, INFEASIBLE, OPTIMAL, TIMELIMIT, UNBOUNDED, UNKNOWN
 
-# Reference solves aim at proven optimality: tight gaps.
-REL_GAP = 1e-9
-ABS_GAP = 1e-9
+# Reference solves aim at proven optimality: tight gaps. POPSO_REF_GAP overrides both (a comparison run under the
+# settings popso is run with, e.g. 1e-6 for spatial branch-and-bound, where 1e-9 is out of reach for any solver).
+REL_GAP = float(os.environ.get("POPSO_REF_GAP", 1e-9))
+ABS_GAP = float(os.environ.get("POPSO_REF_GAP", 1e-9))
 
 
 def _num(v):
@@ -178,7 +180,11 @@ def solve_scip(path, time_limit, threads=1, want_solution=False, mem_mb=None):
         # The quadratic objective becomes a nonlinear constraint on an auxiliary variable: with the
         # default feasibility tolerance 1e-6 SCIP's "optimum" undercuts the true one by ~1e-7. Quadratic
         # constraints likewise, and much more at a cone's apex (x^2 <= t^2 at t = 0 lets x reach 1e-3).
-        m.setParam("numerics/feastol", 1e-9)
+        # POPSO_REF_SCIP_FEASTOL overrides it ("default": SCIP's own 1e-6): on nonconvex models 1e-9 made SCIP
+        # report 4 QPLIB instances infeasible whose published points are feasible to 1e-9.
+        ft = os.environ.get("POPSO_REF_SCIP_FEASTOL", "1e-9")
+        if ft != "default":
+            m.setParam("numerics/feastol", float(ft))
     if mem_mb:
         m.setParam("limits/memory", float(mem_mb) * 0.8)
     t0 = time.perf_counter()

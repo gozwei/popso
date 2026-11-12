@@ -898,7 +898,7 @@ bool fix_propagate_repair(const MipProblem& p, const FprLimits& lim, std::vector
   FprStats local;
   FprStats& out = stats ? *stats : local;
   out = FprStats{};
-  if (p.quadratic() || !p.implications.empty() || !p.quad_rows.empty() || p.num_cols() == 0) return false;
+  if (p.quadratic() || !p.implications.empty() || p.nonlinear() || p.num_cols() == 0) return false;
   if (std::find(p.is_int.begin(), p.is_int.end(), 1) == p.is_int.end()) return false;
   static const bool dbg = std::getenv("MILP_FPR_DEBUG") != nullptr;
   const auto tc = std::chrono::steady_clock::now();

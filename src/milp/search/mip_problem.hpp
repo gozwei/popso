@@ -61,6 +61,15 @@ struct QuadRow {
                  double& rhs) const;
 };
 
+// A product kept exact by spatial branching (v0.10): w = x * y (x == y: a square). The LP holds McCormick rows of
+// the product over the root's bounds as model rows; the search adds those of a node's bounds as rows of that node's
+// LP and branches on x or y (continuous columns too) where an LP point still violates the product.
+struct Bilinear {
+  Index w = -1, x = -1, y = -1;
+  // |w - x y| relative to max(1, |x y|).
+  double violation(const double* v) const;
+};
+
 struct MipProblem {
   SparseMatrix A;  // CSC
   std::vector<double> cost, col_lb, col_ub, row_lb, row_ub;
@@ -80,6 +89,17 @@ struct MipProblem {
   // Convex quadratic rows (outer approximation; usually empty): presolve, symmetry handling and restarts are off
   // otherwise, and max_violation counts them.
   std::vector<QuadRow> quad_rows;
+  std::vector<Bilinear> bilinear;  // products enforced by spatial branching; usually empty
+  // Rows that hold products as columns (a nonconvex quadratic row with each c x_i x_j replaced by c w): max_violation
+  // judges them with the products recomputed from the factors, activity + sum c (x_i x_j - w), so the errors the
+  // single products are allowed cannot add up past the row's tolerance (QPLIB_3816: 1.003e-6 on a row).
+  struct LiftedRow {
+    Index row = -1;
+    std::vector<std::pair<Index, double>> terms;  // (index into bilinear, coefficient)
+  };
+  std::vector<LiftedRow> lifted_rows;
+  // Rows outside the LP or products: presolve, symmetry handling, restarts and conflict analysis are off.
+  bool nonlinear() const { return !quad_rows.empty() || !bilinear.empty(); }
   // Quadratic objective 1/2 x^T Q x (lower triangle, CSC; sign-adjusted for minimization). Empty
   // (no entries) for a MILP; branch_and_bound() and presolve only handle that case (MIQPs are
   // solved by miqp_solve, see qp/miqp.hpp).

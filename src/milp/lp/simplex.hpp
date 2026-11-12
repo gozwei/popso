@@ -117,6 +117,11 @@ class DualSimplex {
   // accessor below reports unscaled data.
   const SparseMatrix& row_matrix() const { return At_orig_; }  // CSR of all rows (incl. added)
   const SparseMatrix& col_matrix() const { return A_orig_; }   // CSC
+  // Strict safe bounds (default off): a dual infeasibility inside the tolerance on a column or row whose range is
+  // infinite on that side makes the safe bound -inf (unless it is at rounding level), instead of being charged at
+  // the variable's current size. That charge is no proof: a product column near 2e8 with a reduced cost of -2e-8
+  // gained 5e-3 by moving 0.1%, and the node's bound was above a feasible point (spatial branch-and-bound).
+  void set_safe_strict(bool on) { safe_strict_ = on; }
   double var_lower(Index j) const { return j < n_ ? lb_[j] : lb_[j] / rscale_[j - n_]; }
   double var_upper(Index j) const { return j < n_ ? ub_[j] : ub_[j] / rscale_[j - n_]; }
   double var_value(Index j) const { return j < n_ ? x_[j] : x_[j] / rscale_[j - n_]; }
@@ -260,6 +265,7 @@ class DualSimplex {
   std::vector<double> ftol_;      // per variable: primal tolerance factor (min(1, rscale) for logicals)
   std::vector<double> dftol_;     // per variable: dual tolerance factor (min(1, 1 / rscale) for logicals)
   mutable std::vector<double> xout_;
+  bool safe_strict_ = false;
   mutable std::vector<double> sb_y_, sb_r_, sb_a_;  // safe_bound scratch
   mutable std::vector<int> sb_cnt_;
   bool has_factor_ = false;

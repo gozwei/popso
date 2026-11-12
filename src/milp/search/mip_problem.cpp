@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace milp {
 
@@ -144,6 +145,14 @@ double MipProblem::objective(const std::vector<double>& x) const {
   return v;
 }
 
+double Bilinear::violation(const double* v) const {
+  const double prod = v[x] * v[y];
+  const double r = std::abs(v[w] - prod) / std::max(1.0, std::abs(prod));
+  // A product that overflows (factors around 1e154 and beyond, from a relaxation without bounds) gives inf / inf:
+  // never a satisfied product (std::max would skip the NaN, and such a point was once reported OPTIMAL at 1.8e308).
+  return std::isfinite(r) ? r : kInf;
+}
+
 double MipProblem::max_violation(const std::vector<double>& x, double* int_viol, double* lin_viol) const {
   double viol = 0.0, iv = 0.0;
   std::vector<double> act(num_rows(), 0.0);
@@ -152,12 +161,26 @@ double MipProblem::max_violation(const std::vector<double>& x, double* int_viol,
     if (is_int[j]) iv = std::max(iv, std::abs(x[j] - std::round(x[j])));
     for (Index p = A.begin(j); p < A.end(j); ++p) act[A.index[p]] += A.value[p] * x[j];
   }
-  for (Index i = 0; i < num_rows(); ++i) viol = std::max({viol, row_lb[i] - act[i], act[i] - row_ub[i]});
+  for (const LiftedRow& lr : lifted_rows) {
+    double e = 0.0;
+    for (const auto& [t, c] : lr.terms) e += c * (x[bilinear[t].x] * x[bilinear[t].y] - x[bilinear[t].w]);
+    act[lr.row] = std::isfinite(e) ? act[lr.row] + e : std::numeric_limits<double>::quiet_NaN();
+  }
+  for (Index i = 0; i < num_rows(); ++i) {
+    const double v = std::max(row_lb[i] - act[i], act[i] - row_ub[i]);
+    viol = v <= viol ? viol : std::isnan(v) ? kInf : v;
+  }
   for (const Implication& im : implications) {
     if (std::abs(x[im.z] - im.zval) < 0.5) viol = std::max(viol, std::abs(x[im.col]));
   }
   if (lin_viol) *lin_viol = std::max(viol, iv);
-  for (const QuadRow& q : quad_rows) viol = std::max(viol, q.violation(x.data()));
+  // (A violation that is not a number counts as infinite: std::max would drop it.)
+  for (const QuadRow& q : quad_rows) {
+    const double v = q.violation(x.data());
+    viol = v <= viol ? viol : std::isnan(v) ? kInf : v;
+  }
+  for (const Bilinear& b : bilinear) viol = std::max(viol, b.violation(x.data()));
+  if (std::isnan(viol)) viol = kInf;
   if (int_viol) *int_viol = iv;
   return std::max(viol, iv);
 }

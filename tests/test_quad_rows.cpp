@@ -80,14 +80,25 @@ TEST(quad_rows_second_order_cones) {
     REQUIRE(c.has_solution);
     CHECK_NEAR(c.x[0], 3.0, 1e-9);  // u (columns in order of appearance: u, v, x)
   }
-  // Not cones: t may be negative; the product's columns may be negative; two negative squares.
-  CHECK(solve_lp_text("min\n t\nst\n c: [ x^2 + y^2 - t^2 ] <= 0\n d: x + y >= 2\nbounds\n -10 <= x <= 10\n"
-                      " -10 <= y <= 10\n -1 <= t <= 100\nend\n").status == Status::NonConvex);
-  CHECK(solve_lp_text("min\n u + v\nst\n c: [ x^2 - u * v ] <= 0\nbounds\n 2.5 <= x <= 10\n -1 <= u <= 100\n"
-                      " 0 <= v <= 100\nend\n").status == Status::NonConvex);
-  CHECK(solve_lp_text("min\n t\nst\n c: [ x^2 - y^2 - t^2 ] <= 0\n" + bounds + "end\n").status == Status::NonConvex);
-  // A positive right side is not a cone (x^2 - t^2 <= 1 has two components even with t >= 0).
-  CHECK(solve_lp_text("min\n t\nst\n c: [ x^2 - t^2 ] <= 1\n" + bounds + "end\n").status == Status::NonConvex);
+  // Not cones (t may be negative; the product's columns may be negative; two negative squares; a positive right
+  // side: x^2 - t^2 <= 1 has two components even with t >= 0): not convex, solved by spatial branch-and-bound
+  // (v0.10) since every column is bounded.
+  {
+    const SolveResult a = solve_lp_text("min\n t\nst\n c: [ x^2 + y^2 - t^2 ] <= 0\n d: x + y >= 2\nbounds\n -10 <= x <= 10\n"
+                                        " -10 <= y <= 10\n -1 <= t <= 100\nend\n");
+    CHECK(a.status == Status::Optimal);
+    CHECK_NEAR(a.objective, std::sqrt(2.0), 1e-5);  // t <= -sqrt(2) is outside t >= -1
+    const SolveResult b = solve_lp_text("min\n u + v\nst\n c: [ x^2 - u * v ] <= 0\nbounds\n 2.5 <= x <= 10\n -1 <= u <= 100\n"
+                                        " 0 <= v <= 100\nend\n");
+    CHECK(b.status == Status::Optimal);
+    CHECK_NEAR(b.objective, 5.0, 1e-5);
+    const SolveResult c = solve_lp_text("min\n t\nst\n c: [ x^2 - y^2 - t^2 ] <= 0\n" + bounds + "end\n");
+    CHECK(c.status == Status::Optimal);
+    CHECK_NEAR(c.objective, 0.0, 1e-5);
+    const SolveResult d = solve_lp_text("min\n t\nst\n c: [ x^2 - t^2 ] <= 1\n" + bounds + "end\n");
+    CHECK(d.status == Status::Optimal);
+    CHECK_NEAR(d.objective, 0.0, 1e-5);
+  }
   // The cone's tolerance is absolute in its norm form, not relative to the head: x^2 <= u v at u = 0 forces x = 0
   // (relative to the head (u + v) / 2 = 5000, x could reach 7 at v = 10000: objective -6).
   for (const bool det : {false, true}) {
@@ -120,9 +131,12 @@ TEST(quad_rows_infeasible_and_nonconvex) {
   CHECK(a.status == Status::Infeasible);
   // x^2 + y^2 >= 1 is not convex (a convex function bounded from below).
   const SolveResult b = solve_lp_text("min\n x\nst\n c: [ x^2 + y^2 ] >= 1\nbounds\n -5 <= x <= 5\n -5 <= y <= 5\nend\n");
-  CHECK(b.status == Status::NonConvex);
+  // Solved by spatial branch-and-bound (v0.10; every column bounded): x = -5 is feasible in both.
+  CHECK(b.status == Status::Optimal);
+  CHECK_NEAR(b.objective, -5.0, 1e-5);
   const SolveResult c = solve_lp_text("min\n x\nst\n c: [ x * y ] <= 1\nbounds\n -5 <= x <= 5\n -5 <= y <= 5\nend\n");
-  CHECK(c.status == Status::NonConvex);
+  CHECK(c.status == Status::Optimal);
+  CHECK_NEAR(c.objective, -5.0, 1e-5);
 }
 
 TEST(quad_rows_binary_products_linearized) {

@@ -96,7 +96,7 @@ bool solve_sub_mip(const MipProblem& p, const std::vector<double>& lb, const std
     return e ? std::atoll(e) : 20000LL;
   }();
   // (Presolve does not know the implications of logical constraints.)
-  const bool presolve = !no_presolve && p.A.nnz() >= presolve_nnz && p.implications.empty() && p.quad_rows.empty();
+  const bool presolve = !no_presolve && p.A.nnz() >= presolve_nnz && p.implications.empty() && !p.nonlinear();
   // Unbounded (or skipped): solve the unreduced problem, which classifies it precisely.
   const PresolveStatus ps = presolve ? pre.run(q, po, log) : PresolveStatus::Unbounded;
   const double t_presolve = timer.elapsed();
@@ -285,7 +285,7 @@ namespace {
 // this when the fixings are at the LP point's own values (puriri: every sub-MIP with the integral
 // LP values fixed was infeasible in presolve, its LP feasible).
 bool presolve_infeasible(const MipProblem& p, const std::vector<double>& lb, const std::vector<double>& ub) {
-  if (!p.implications.empty() || !p.quad_rows.empty()) return false;
+  if (!p.implications.empty() || p.nonlinear()) return false;
   MipProblem q = p;
   q.col_lb = lb;
   q.col_ub = ub;

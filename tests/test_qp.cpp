@@ -357,9 +357,14 @@ TEST(qp_statuses) {
     Model m = b.build();
     m.add_q(0, 0, 2.0);
     m.add_q(1, 1, -2.0);
-    CHECK(solve(m, quiet()).status == Status::NonConvex);
+    // Bounded factors: spatial branch-and-bound (v0.10). min x^2 - y^2 over the box is -1, its max 1.
+    const SolveResult lo = solve(m, quiet());
+    CHECK(lo.status == Status::Optimal);
+    CHECK_NEAR(lo.objective, -1.0, 1e-5);
     m.sense = ObjSense::Maximize;
-    CHECK(solve(m, quiet()).status == Status::NonConvex);
+    const SolveResult hi = solve(m, quiet());
+    CHECK(hi.status == Status::Optimal);
+    CHECK_NEAR(hi.objective, 1.0, 1e-5);
     m.q_val[0] = -2.0;  // concave: -x^2 - y^2, maximized
     const SolveResult r = solve(m, quiet());
     CHECK(r.status == Status::Optimal);
@@ -824,7 +829,10 @@ TEST(qp_presolve_reductions) {
   CHECK(solve(m, quiet()).status == Status::Optimal);
   SolverParams np = quiet();
   np.presolve = false;
-  CHECK(solve(m, np).status == Status::NonConvex);
+  // (v0.10: by spatial branch-and-bound where the factors are bounded, else NonConvex; never a wrong optimum.)
+  const SolveResult rn = solve(m, np);
+  CHECK(rn.status == Status::NonConvex || rn.status == Status::Optimal);
+  if (rn.status == Status::Optimal) CHECK_NEAR(rn.objective, solve(m, quiet()).objective, 1e-5);
   // Infeasible singleton rows: 2 <= x <= 1 through two rows.
   ModelBuilder bi;
   bi.add_col("x", 0.0, 0.0, 5.0);
@@ -878,7 +886,16 @@ TEST(qp_maros_meszaros_samples) {
     CHECK_NEAR(r.objective, c.opt, 1e-6 * std::max(1.0, std::abs(c.opt)));
     CHECK(m.violation(r.x).max() <= 1e-6);
   }
-  CHECK(solve(read_mps(dir + "VALUES.mps"), quiet()).status == Status::NonConvex);
+  // VALUES is not convex: spatial branch-and-bound (v0.10) under a short limit; whatever it reports is consistent.
+  SolverParams vp = quiet();
+  vp.time_limit = 2.0;
+  const Model values = read_mps(dir + "VALUES.mps");
+  const SolveResult rv = solve(values, vp);
+  CHECK(rv.status == Status::Optimal || rv.status == Status::TimeLimit || rv.status == Status::NonConvex);
+  if (rv.has_solution) {
+    CHECK(values.violation(rv.x).max() <= 1e-6);
+    CHECK(rv.bound <= rv.objective + 1e-6 * std::max(1.0, std::abs(rv.objective)));
+  }
 }
 
 namespace {

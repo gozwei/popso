@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.10.0 — 2026-11
+
+- **Nonconvex quadratic models** are solved by spatial branch-and-bound instead of ending with the status
+  `NONCONVEX`. Every product `x_i x_j` of a quadratic row that is not convex, and of the objective if that is
+  not convex, becomes a column with its McCormick rows over the factors' bounds (a square: its secant and
+  tangents); convex rows and a convex objective stay as they are (outer approximation). At a point that
+  satisfies everything else, the search adds the McCormick rows of the node's own bounds to that node's LP and
+  branches on a factor of the most violated product, continuous columns included, until every product holds to
+  1e-6. Product bounds follow the factors' bounds at every node, and factor bounds follow the products'.
+  - Factors without finite bounds get them from the linear rows, from the square terms of the quadratic rows and
+    from the convex part of the model (the column minimized and maximized there) where possible; otherwise a
+    product has only the McCormick rows its finite bounds allow, and the search branches until the domain is
+    bounded. A model that is itself unbounded may then run to the time limit without a verdict.
+  - The solution is checked on the model as given (products recomputed from the factors); a point that violates a
+    row by more than 1.5e-6 relative is not returned.
+  - `NONCONVEX` remains for nonconvex models with logical constraints (indicators, SOS, semi-continuous columns)
+    and with `MILP_SPATIAL=0`.
+  - This is a first version with plain McCormick relaxations: exact, and checked against SCIP on random models
+    (`benchmarks/tools/nc_fuzz.py`), but slow on dense nonconvex QPs. On QPLIB's 261 nonconvex instances with continuous or general integer
+    variables it proves 22 optimal in 120 s (SCIP: 30); see BENCHMARKS.
+- Benchmark harness: `benchmarks/tools/qplib.py --nonconvex` converts QPLIB's 261 nonconvex instances with
+  continuous or general integer variables (`benchmarks/sets/qplib_nonconvex.txt`); the reference wrapper takes
+  the gap and SCIP's feasibility tolerance from `POPSO_REF_GAP` / `POPSO_REF_SCIP_FEASTOL` for comparison runs
+  under popso's own settings.
+
 ## v0.9.0 — 2026-11
 
 - Mixed-integer models with quadratic constraints get a light presolve before the convexity check and the cone

@@ -1098,6 +1098,79 @@ Notes:
 
 </details>
 
+### Nonconvex models with continuous or general integer variables (new in v0.10)
+
+QPLIB's 261 nonconvex instances that are not purely binary
+([`benchmarks/sets/qplib_nonconvex.txt`](benchmarks/sets/qplib_nonconvex.txt), converted with
+`benchmarks/tools/qplib.py --nonconvex`). v0.10 solves them by spatial branch-and-bound with plain
+McCormick relaxations. This is a first version, and SCIP is ahead on this set.
+
+Setup: same machine, twelve 1-thread runs at a time; popso v0.10.0 and SCIP 10.0 with 1 thread,
+120 s, gap 1e-6, each with its default feasibility tolerance. An instance counts as solved when the
+solver proves optimality and the objective agrees with the one QPLIB publishes (to 1e-4 relative).
+
+| | popso | SCIP |
+|---|---|---|
+| proven optimal within 120 s (of 261) | 22 | **30** |
+| objectives that differ from QPLIB's | 0 | 0 |
+| solved by both | 17 | 17 |
+| solved only by this solver | 5 | 13 |
+| shifted geomean (s) | 92.6 | 92.7 |
+
+By QPLIB class (popso / SCIP / instances): LMQ 13 / 19 / 133, LCQ 4 / 4 / 52, QML 5 / 3 / 11,
+LGQ 0 / 2 / 3, QIL 0 / 1 / 2, QMQ 0 / 1 / 1; neither solver proves any of the other 59 (QCQ 30,
+DCQ 7, QCL 6, CMQ 6, CCQ 4, and 6 more).
+
+Notes:
+- popso returns a solution on 110 of the 261; every returned point is verified on the model as
+  given. No run ended with an error or over the memory limit. Of SCIP's runs, 15 ended with an error and
+  4 at the memory limit; they count as unsolved.
+- Where popso stops at the time limit, it is mostly the dual bound that is missing: plain McCormick
+  rows are weak on dense products, and there are no RLT or other strengthened relaxations yet.
+- On QPLIB_5927 popso's point (objective 39.14) is better than the value listed by QPLIB (169.57);
+  SCIP's solution checker accepts the point on the converted model.
+
+<details><summary>Per instance, where either solver finishes (seconds; TL = time limit)</summary>
+
+| instance | class | popso | SCIP |
+|---|---|---|---|
+| QPLIB_0031 | QML | TL | **25.8** |
+| QPLIB_0684 | LMQ | TL | **108.6** |
+| QPLIB_2167 | LMQ | TL | **27.7** |
+| QPLIB_2635 | LCQ | **0.0** | 30.9 |
+| QPLIB_2698 | LCQ | TL | **63.2** |
+| QPLIB_2702 | QML | 65.8 | **40.2** |
+| QPLIB_2714 | LCQ | **0.1** | 0.3 |
+| QPLIB_2881 | LCQ | **0.1** | TL |
+| QPLIB_2882 | LMQ | **92.1** | TL |
+| QPLIB_3060 | QML | 104.5 | **68.9** |
+| QPLIB_3122 | QML | **11.8** | TL |
+| QPLIB_3247 | LCQ | 0.7 | **0.4** |
+| QPLIB_3279 | LMQ | TL | **2.3** |
+| QPLIB_3496 | LGQ | TL | **3.6** |
+| QPLIB_3514 | LMQ | **0.8** | 2.2 |
+| QPLIB_3554 | QML | **31.4** | TL |
+| QPLIB_3620 | LMQ | TL | **50.9** |
+| QPLIB_3622 | LMQ | **4.8** | 6.6 |
+| QPLIB_3624 | LMQ | **4.0** | 11.3 |
+| QPLIB_3643 | LGQ | TL | **15.6** |
+| QPLIB_3645 | LMQ | 55.6 | **8.4** |
+| QPLIB_3646 | LMQ | **0.9** | 2.4 |
+| QPLIB_3676 | LMQ | **16.2** | 38.5 |
+| QPLIB_3677 | LMQ | **2.1** | 11.2 |
+| QPLIB_3690 | LMQ | **5.3** | 18.3 |
+| QPLIB_3725 | LMQ | TL | **87.5** |
+| QPLIB_3727 | LMQ | **0.3** | 1.2 |
+| QPLIB_3790 | QML | **0.8** | TL |
+| QPLIB_3813 | LMQ | **1.6** | 3.6 |
+| QPLIB_3814 | QMQ | TL | **0.4** |
+| QPLIB_3816 | LMQ | TL | **119.3** |
+| QPLIB_4805 | LMQ | TL | **112.6** |
+| QPLIB_8153 | LMQ | 0.5 | **0.3** |
+| QPLIB_8381 | LMQ | 4.0 | **3.6** |
+| QPLIB_9048 | QIL | TL | **30.2** |
+</details>
+
 ## popso over time
 
 The same 63 MIPLIB instances and settings, for every released version (each measured once,

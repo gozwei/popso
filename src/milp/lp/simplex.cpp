@@ -1954,6 +1954,7 @@ double DualSimplex::lagrangian_safe(const std::vector<double>& y, double tau, bo
     const double side = yi > 0.0 ? -var_upper(n_ + i) : -var_lower(n_ + i);  // row lower / upper side
     if (!std::isfinite(side)) {
       if (!(std::abs(yi) <= tau)) continue;  // y_i = 0 (also a NaN)
+      if (safe_strict_ && std::abs(yi) > 1e-13) return -kInf;
       E += std::abs(yi) * std::max(1.0, std::abs(var_value(n_ + i)));
     } else {
       const double t = yi * side;
@@ -1989,6 +1990,7 @@ double DualSimplex::lagrangian_safe(const std::vector<double>& y, double tau, bo
       b = u;
       E += ej * std::abs(u);
     } else if (std::abs(rj) <= tau) {
+      if (safe_strict_ && std::abs(rj) > 1e-13 * (1.0 + std::abs(cj) + sb_a_[j]) + 10.0 * ej) return -kInf;
       double mag = std::max(1.0, std::abs(x_[j]));
       if (lf) mag = std::max(mag, std::abs(l));
       if (uf) mag = std::max(mag, std::abs(u));

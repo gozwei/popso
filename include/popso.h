@@ -26,19 +26,21 @@
  *    handler) while another thread solves. Note that the memory limit is
  *    also checked against the resident size of the whole process.
  *  - Changing the model discards the last result.
- *  - The objective may have a quadratic part 1/2 x^T Q x (popso_set_q). It
- *    must be convex (Q positive semidefinite when minimizing, negative
- *    semidefinite when maximizing; otherwise the status is
- *    POPSO_STATUS_NONCONVEX). Continuous QPs are solved by the barrier
- *    method (no basis); with integer variables by branch-and-bound on QP
- *    relaxations.
- *  - Rows may have quadratic terms (popso_add_qrow_terms). Each quadratic row
- *    must be convex: one finite side, its quadratic part positive
- *    semidefinite when the finite side is an upper bound (negative
- *    semidefinite for a lower bound); otherwise the status is
- *    POPSO_STATUS_NONCONVEX. Such models, continuous or not, are solved by
- *    outer approximation (gradient cuts) inside the branch-and-bound; they
- *    have no duals and no basis.
+ *  - The objective may have a quadratic part 1/2 x^T Q x (popso_set_q).
+ *    Convex (Q positive semidefinite when minimizing, negative semidefinite
+ *    when maximizing): continuous QPs are solved by the barrier method (no
+ *    basis); with integer variables by branch-and-bound on QP relaxations.
+ *  - Rows may have quadratic terms (popso_add_qrow_terms). Convex rows (one
+ *    finite side, the quadratic part positive semidefinite when the finite
+ *    side is an upper bound, negative semidefinite for a lower bound) are
+ *    solved by outer approximation (gradient cuts) inside the
+ *    branch-and-bound; such models have no duals and no basis.
+ *  - A quadratic objective or row that is not convex is solved by spatial
+ *    branch-and-bound since v0.10 (McCormick relaxations of the products,
+ *    branching on their factors). The status POPSO_STATUS_NONCONVEX remains
+ *    for nonconvex models with logical constraints (indicators, SOS,
+ *    semi-continuous variables) and when the environment variable
+ *    MILP_SPATIAL=0 turns spatial branch-and-bound off.
  *  - Besides linear rows, a model may have semi-continuous and semi-integer
  *    variables, SOS1/SOS2 constraints and indicator constraints. They are
  *    reformulated with auxiliary binaries internally; solutions and queries

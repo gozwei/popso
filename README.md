@@ -193,11 +193,12 @@ Subject To
 End
 ```
 
-- The objective must be **convex**: Q positive semidefinite when minimizing, negative
-  semidefinite when maximizing. popso checks this before solving (a sparse factorization of the
-  scaled Q) and reports the status `NONCONVEX` otherwise; Q that is semidefinite only up to a
-  relative 1e-6 (round-off in the input) is accepted with that much added to its diagonal.
-  Exception: a nonconvex objective whose quadratic terms all involve **binaries** (products of two
+- A **convex** objective (Q positive semidefinite when minimizing, negative semidefinite when
+  maximizing) is solved by the methods above. popso checks convexity before solving (a sparse
+  factorization of the scaled Q); Q that is semidefinite only up to a relative 1e-6 (round-off in
+  the input) is accepted with that much added to its diagonal. An objective that is **not convex**
+  goes to spatial branch-and-bound (since v0.10, see below).
+  A nonconvex objective whose quadratic terms all involve **binaries** (products of two
   binaries, a binary's square, a binary times a column with finite bounds, any term with a fixed
   column) is linearized exactly (a product of binaries becomes a new column y with
   y >= x_i + x_j - 1, y <= x_i, y <= x_j; a binary times a bounded column takes the four McCormick
@@ -265,11 +266,22 @@ End
   semidefinite towards a finite upper side (negative semidefinite towards a lower side), or a
   **second-order cone** over the columns' bounds: `x1^2 + ... + xk^2 <= t^2` with `t >= 0`
   (weights, shifts and a constant allowed: one sheet of a hyperboloid) and the rotated
-  `x1^2 + ... + xk^2 <= c u v` with `u, v >= 0`. Ranged rows, equalities and other rows are
-  reported as `NONCONVEX`, except rows whose quadratic terms all involve **binaries** (as for the
-  objective above): convex or not, they are linearized exactly and become linear rows of the MILP
-  (a quadratic knapsack row over 262 binaries, QPLIB_10010: optimal in 10 s, where tangent planes
-  left a 2.3% gap after 60 s).
+  `x1^2 + ... + xk^2 <= c u v` with `u, v >= 0`. Rows whose quadratic terms all involve
+  **binaries** (as for the objective above), convex or not, are linearized exactly and become
+  linear rows of the MILP (a quadratic knapsack row over 262 binaries, QPLIB_10010: optimal in
+  10 s, where tangent planes left a 2.3% gap after 60 s). Ranged rows, equalities and other rows
+  that are **not convex** go to spatial branch-and-bound.
+- **Nonconvex models** (since v0.10): every product `x_i x_j` of a nonconvex row or objective
+  becomes a new column with its McCormick rows (a square: its secant and tangents); convex rows
+  stay as they are. The search keeps each product exact by adding the McCormick rows of a node's
+  bounds and by branching on the factors, continuous ones included, until every product holds to
+  1e-6. This is a first version: it is exact and tested against SCIP on random models, but its
+  relaxations are plain McCormick, so expect it to be slow on dense nonconvex QPs. A factor needs
+  finite bounds to get McCormick rows; popso derives them from the linear and quadratic rows where
+  it can and otherwise branches until the domain is bounded, which may not terminate if the model
+  itself is unbounded. Models with logical constraints (indicators, SOS, semi-continuous columns)
+  and a nonconvex quadratic part are still reported as `NONCONVEX`, as is every nonconvex model
+  with `MILP_SPATIAL=0`.
 - Such models, continuous or mixed-integer, are solved by **outer approximation inside the MILP
   search**: the quadratic rows stay out of the LP and are represented by gradient cuts (tangent
   planes) added at the start, in the root cut loop and at every node whose LP point violates them;
@@ -448,8 +460,8 @@ found in `build/`, or you can point `POPSO_LIBRARY` at it.
 
 - **Problem classes:** LP, MILP, convex QP / MIQP, and (since v0.8) convex QCQP / MIQCQP and
   SOCP / MISOCP (quadratic rows, or the conic benchmark format CBF with linear, quadratic and
-  rotated cones). No semidefinite or exponential cones, no general nonlinear constraints, no
-  nonconvex objectives or constraints except those over binaries (linearized exactly).
+  rotated cones), and (since v0.10) nonconvex QP / QCQP / MIQCQP by spatial branch-and-bound. No
+  semidefinite or exponential cones, no general nonlinear constraints.
 - **Quadratic models:** a basic presolve only, no cutting planes in the MIQP branch-and-bound, which
   is single-threaded (with 2 or more threads it races the outer approximation in the parallel MILP
   search); its node QP solver keeps a dense copy of the Hessian, so MIQPs with more than 3000

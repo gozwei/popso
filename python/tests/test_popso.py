@@ -315,12 +315,14 @@ class TestQuadratic(unittest.TestCase):
         self.assertEqual(r.status, "OPTIMAL")
         self.assertAlmostEqual(r[z], 3.0, places=6)
         self.assertAlmostEqual(r.objective, 0.16, places=6)
-        # Nonconvex: a convex quadratic bounded from below.
+        # Nonconvex (a convex quadratic bounded from below): spatial branch-and-bound (v0.10); a = b = -1.
         n = popso.Model()
         a, b = n.add_var(lb=-1, ub=1), n.add_var(lb=-1, ub=1)
         n.add_constr(a * a + b * b >= 1)
         n.set_objective(a + b)
-        self.assertEqual(n.solve(threads=1).status, "NONCONVEX")
+        rn = n.solve(threads=1)
+        self.assertEqual(rn.status, "OPTIMAL")
+        self.assertAlmostEqual(rn.objective, -2.0, places=5)
         with self.assertRaises(IndexError):
             n.get_qrow_terms(5)
 
@@ -374,7 +376,10 @@ class TestQuadratic(unittest.TestCase):
         m = popso.Model()
         x = m.add_var(lb=-1, ub=1, name="x")
         m.set_objective(-1 * x * x)
-        self.assertEqual(m.solve(threads=1).status, "NONCONVEX")
+        # Not convex: spatial branch-and-bound (v0.10); the minimum of -x^2 on [-1, 1] is -1.
+        r0 = m.solve(threads=1)
+        self.assertEqual(r0.status, "OPTIMAL")
+        self.assertAlmostEqual(r0.objective, -1.0, places=5)
         m.sense = popso.MAXIMIZE
         r = m.solve(threads=1)
         self.assertEqual(r.status, "OPTIMAL")

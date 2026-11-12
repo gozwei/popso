@@ -558,6 +558,8 @@ class Search : public BasisOwner {
     }
     // Implications (logical constraints kept out of the LP) fix bounds outside the propagation trail.
     if (!p.implications.empty()) conflicts_ = false;
+    // Products (spatial branching): a node's LP holds rows that are valid only under the node's bounds.
+    if (!p.bilinear.empty()) conflicts_ = false;
     static const bool trivial = knob("MILP_TRIVIAL_BOUND", 1) > 0;
     if (trivial) {
       double b = 0.0;
@@ -668,6 +670,9 @@ class Search : public BasisOwner {
     // Dynamic cut pool: LP rows m_base.. are pool cuts (local rows, added when violated, removed
     // after aging). pool is this worker's view of the global pool (append-only, by id).
     Index m_base = -1;
+    // Rows this node appended to its own LP after all others (tangents in deterministic mode, McCormick rows of
+    // the node's bounds: valid in its subtree only); process() removes them when the node ends.
+    int local_rows = 0;
     std::vector<int> prow, prow_age;  // per pool row of the LP: pool id, rounds inactive
     std::vector<char> prow_bind;      // per pool row: binding after some node LP since it was added (statistics)
     std::vector<int> pool_pos;        // per pool id: its pool row index, or -1
@@ -874,6 +879,19 @@ class Search : public BasisOwner {
   // Node with an unbounded LP and all implications decided: unbounded if feasible (sub-MIP with zero objective).
   int unbounded_leaf(Worker& w, Node& node);
   int implication_branch(Worker& w, Node& node, Node* children, Index z, double bound);
+  // Products (MipProblem::bilinear, spatial branching). spatial_rows: the McCormick rows of the worker's current
+  // bounds (secant and tangent for a square) that x violates, for the products x violates; their number.
+  // spatial_branch: two children splitting the domain of a column of the product x violates most (any = true: of
+  // the widest column in any product, for a node without an LP point); 0 if no such column can be split.
+  int spatial_rows(const Worker& w, const double* x, std::vector<Cut>& cuts) const;
+  // Bounds of the products from their factors' bounds (interval arithmetic) on the worker's bounds; the changed
+  // columns go to w.changed. False if a product's interval misses its column's bounds: the node is infeasible.
+  bool propagate_products(Worker& w) const;
+  int spatial_branch(Worker& w, Node& node, Node* children, const double* x, double bound, bool any,
+                     double min_viol = kFeasTol);
+  // An incumbent candidate with exact products: the factors fixed at x's values (within the worker's bounds),
+  // every product column at its factors' product, the other columns by an LP. True if it became the incumbent.
+  bool spatial_complete(Worker& w, const double* x);
   bool debug_root_ = true;  // false inside sub-MIPs (debug dumps only from the top-level search)
   std::vector<double> debug_sol_;  // MILP_DEBUG_SOL: known optimal point, one value per line
   void worker_loop(int tid);
@@ -1321,6 +1339,7 @@ class Search : public BasisOwner {
   std::atomic<bool> root_unbounded_{false}, numerical_{false};
   std::atomic<long long> lp_failed_{0}, lp_recovered_{0}, lp_unsolved_{0}, fixed_recovered_{0};
   std::atomic<long long> impl_branches_{0};  // branchings on violated implications
+  std::atomic<long long> spatial_branches_{0}, spatial_rows_{0}, spatial_rounds_{0};  // products
   // verified_point's fixed-integer re-solves: tried, succeeded, total LP iterations (statistics)
   mutable std::atomic<long long> polish_tried_{0}, polish_ok_{0}, polish_iters_{0};
   // Quadratic rows: verified_point's fixed-integer repairs remembered, so a repeated candidate costs nothing:
@@ -1367,6 +1386,7 @@ LpStatus Search::solve_fixed_ints(const std::vector<double>& x_int, const std::v
   if (!p_.implications.empty() && !p_.apply_implications(lb, ub)) return LpStatus::Infeasible;
   DualSimplex lp;
   lp.load(p_.A, p_.cost, lb, ub, p_.row_lb, p_.row_ub);
+  lp.set_safe_strict(!p_.bilinear.empty());
   LpOptions o;
   o.tol = params_.tol;
   o.tol.primal_feas = primal_tol;
@@ -3001,6 +3021,7 @@ double Search::probe(Worker& w, Index j, double lb, double ub, double obj, const
     for (Index i = 0; i < lp.num_rows(); ++i) rlb[i] = -lp.var_upper(lp.num_cols() + i), rub[i] = -lp.var_lower(lp.num_cols() + i);
     DualSimplex fresh;
     fresh.load(R.transpose(), p_.cost, clb, cub, rlb, rub);
+    fresh.set_safe_strict(!p_.bilinear.empty());
     LpOptions o2;
     o2.perturb = false;
     const LpStatus st2 = fresh.solve(o2);
@@ -4080,6 +4101,13 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     count_outcome(1, node.depth);
     return 0;
   }
+  if (!p_.bilinear.empty() && !propagate_products(w)) {
+    for (Index j : w.changed) lp.set_col_bounds(j, w.lb[j], std::max(w.lb[j], w.ub[j]));
+    ++nodes_;
+    ++w.nodes;
+    count_outcome(1, node.depth);
+    return 0;
+  }
   for (Index j : w.changed) lp.set_col_bounds(j, w.lb[j], w.ub[j]);
   apply_global_cuts(w);
   const bool pool_on = use_pool_ && node.id != 0 && w.m_base >= 0;
@@ -4143,6 +4171,7 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     for (Index j = 0; j < p_.num_cols(); ++j) lb[j] = lp.col_lower(j), ub[j] = lp.col_upper(j);
     DualSimplex fresh;
     fresh.load(p_.A, p_.cost, lb, ub, p_.row_lb, p_.row_ub);
+    fresh.set_safe_strict(!p_.bilinear.empty());
     LpOptions o2;
     o2.perturb = false;
     const LpStatus st2 = fresh.solve(o2);
@@ -4180,6 +4209,13 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     const Index z = open_implication(w);
     if (z >= 0) return implication_branch(w, node, children, z, node.bound);
     return unbounded_leaf(w, node);
+  }
+  if (st == LpStatus::Unbounded && !p_.bilinear.empty()) {
+    // The LP has no McCormick rows for a product whose factor has no finite bounds, so its ray says nothing about
+    // the problem: split such a factor's domain (the bounded child gets the rows).
+    const int nc = spatial_branch(w, node, children, nullptr, node.bound, true);
+    if (nc > 0) return nc;
+    // Every factor bounded and the LP still unbounded: the ray is in the linear part.
   }
   if (st == LpStatus::Unbounded && node.id == 0) {
     root_unbounded_ = true;
@@ -4316,7 +4352,7 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
   // Convex quadratic rows (MipProblem::quad_rows, kept out of the LP): while the LP point violates them, gradient cuts
   // (outer approximation) through the cut pool (sub-MIPs: the global cuts) and a re-solve. Deterministic mode applies
   // pool cuts only at its round barriers: there the cuts are rows of the node's own LP meanwhile (det_local below).
-  if (!p_.quad_rows.empty() && st == LpStatus::Optimal) {
+  if (p_.nonlinear() && st == LpStatus::Optimal) {
     // An integral LP point cannot be branched on: there the outer approximation goes on (MILP_OA_INT_ROUNDS) until the
     // point satisfies the rows (its node then closes or branches as usual). A fractional point is branched on after
     // MILP_OA_NODE_ROUNDS rounds, or once its relative violations are below MILP_OA_NODE_TOL (1e-4: CBLIB A/B, 30 s,
@@ -4345,7 +4381,31 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
       // An integral point that violates an implication is branched on its binary (below), not cut.
       if (integral && !p_.implications.empty() && violated_implication(w, lp.x()) >= 0) break;
       std::vector<Cut> cuts;
-      if (quad_oa_cuts(p_, lp.x(), integral || (w.det && !det_local) ? 1e-7 : kOaNodeTol, cuts) == 0) break;
+      // Products: once the point is integral and satisfies the quadratic rows, the McCormick rows of this node's
+      // bounds that it violates become rows of the node's LP (valid in its subtree only). A point they do not
+      // cut off is branched on below (spatial_branch).
+      bool spatial = false;
+      const size_t nq = static_cast<size_t>(
+          quad_oa_cuts(p_, lp.x(), integral || (w.det && !det_local) ? 1e-7 : kOaNodeTol, cuts));
+      if (integral && !p_.bilinear.empty()) {
+        if (round == 0) {
+          // The point with every product recomputed from its factors: feasible where the products only enter
+          // rows with slack (or the objective).
+          std::vector<double> y(lp.x(), lp.x() + p_.num_cols());
+          for (const Bilinear& b : p_.bilinear) y[b.w] = y[b.x] * y[b.y];
+          if (try_incumbent(w, y, "products")) opt.objective_cutoff = std::min(opt.objective_cutoff, cutoff(w));
+        }
+        // With the tangents of the same round: a quadratic row that stays violated must not keep the node's
+        // McCormick rows out (factors fixed by branching, the product forced elsewhere by a linear row: the node
+        // is infeasible, and only these rows say so).
+        const int ns = spatial_rows(w, lp.x(), cuts);
+        if (ns > 0) {
+          spatial = true;
+          ++spatial_rounds_;
+          spatial_rows_ += ns;
+        }
+      }
+      if (cuts.empty()) break;
       // MILP_OA_INT_NLP = k (default 1; 0: off): an integral point that still violates the rows after k rounds
       // has its continuous part solved by the conic method with the integers fixed (at most kOaNlpSolves times
       // per node: the LP may move to another integral point). A feasible point is an incumbent candidate, and
@@ -4353,7 +4413,7 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
       // subproblem's optimum, so the node is cut off or the LP leaves the assignment (the LP / NLP-based
       // branch-and-bound of Quesada and Grossmann, 1992). Tangents at the LP's own points alone converge
       // slowly there: CBLIB achtziger_stolpe06-6.2flowc spent 150 rounds of ~1500 LP iterations on one node.
-      if (integral && kOaIntNlp > 0 && round >= kOaIntNlp && nlp_solves < kOaNlpSolves) {
+      if (nq > 0 && p_.bilinear.empty() && integral && kOaIntNlp > 0 && round >= kOaIntNlp && nlp_solves < kOaNlpSolves) {
         ++nlp_solves;
         std::vector<double> y;
         std::vector<Cut> cert;
@@ -4380,11 +4440,26 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
         }
         ++oa_nlp_solves_;
       }
-      ++oa_rounds_;
-      oa_cuts_ += static_cast<long long>(cuts.size());
-      if (w.det) {
-        for (const Cut& c : cuts) w.new_cuts.push_back(c);
-        if (!det_local) break;
+      if (nq > 0) {
+        ++oa_rounds_;
+        oa_cuts_ += static_cast<long long>(nq);
+      }
+      // (Models with products: always. A tangent the pool takes for a copy of one it has would not reach this LP,
+      // the row would stay violated, and the node would be split without its LP point.)
+      if (w.det || spatial || w.local_rows > 0 || !p_.bilinear.empty()) {
+        // Rows of this node's LP. Tangents (the first nq cuts) are valid everywhere: they also go to the pool
+        // (deterministic mode: at the barrier), and the node keeps its own copy, since its LP takes no pool rows
+        // behind local ones.
+        if (nq > 0) {
+          if (w.det) {
+            for (size_t k = 0; k < nq; ++k) w.new_cuts.push_back(cuts[k]);
+            if (!det_local && !spatial && w.local_rows == 0 && p_.bilinear.empty()) break;
+          } else if (use_pool_ && w.m_base >= 0) {
+            std::vector<Cut> copy(cuts.begin(), cuts.begin() + static_cast<std::ptrdiff_t>(nq));
+            pool_publish(copy, nullptr);
+          }
+        }
+        w.local_rows += static_cast<int>(cuts.size());
         std::vector<Index> start{0}, index;
         std::vector<double> value, rlb, rub;
         for (const Cut& c : cuts) {
@@ -4467,6 +4542,12 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
   bool unsafe = false;
   const double bnd = lp_bound(lp, &unsafe, node.id);
   w.lp_unsafe = unsafe;
+  if (std::getenv("MILP_DEBUG_NODE") && node.id == std::atoll(std::getenv("MILP_DEBUG_NODE"))) {
+    log_.log(0, "DEBUG-NODE %lld: LP objective %.12g, safe bound %.12g (%s), reduced costs:", node.id, obj, bnd, unsafe ? "below" : "same");
+    const std::vector<double> d = lp.reduced_costs();
+    for (Index j = 0; j < lp.num_cols(); ++j) log_.log(0, " d%d=%.6g", j, d[j]);
+    log_.log(0, "\n");
+  }
   if (node.id == 0) {
     root_bound_ = bnd;
     log_.log(1, "Root LP: objective %.10g, %lld iterations, %.2fs\n", p_.display_sense * (obj + p_.offset), lp.iterations(),
@@ -4565,6 +4646,25 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     const Index z = violated_implication(w, x);
     if (z >= 0) return implication_branch(w, node, children, z, std::max(bnd, node.bound));
   }
+  if (w.fracs.empty() && !p_.bilinear.empty()) {
+    // Integral, the node's McCormick rows hold, a product is still violated: split a factor's domain.
+    int nc = spatial_branch(w, node, children, x, std::max(bnd, node.bound), false);
+    if (nc > 0) return nc;
+    // Every product holds within its tolerance. If a row that holds products still fails with the products
+    // recomputed (their small errors add up, and the LP's own row tolerance comes on top; QPLIB_3814 on Linux: no
+    // point was ever accepted), the point with exact products is tried as an incumbent, and the node is split on
+    // any product that is off at all.
+    std::vector<double> pt(x, x + p_.num_cols());
+    if (p_.max_violation(pt) > kFeasTol) {
+      if (spatial_complete(w, x)) opt.objective_cutoff = std::min(opt.objective_cutoff, cutoff(w));
+      if (std::max(bnd, node.bound) >= cutoff(w)) {
+        count_outcome(6, node.depth);
+        return 0;
+      }
+      nc = spatial_branch(w, node, children, x, std::max(bnd, node.bound), false, 1e-10);
+      if (nc > 0) return nc;
+    }
+  }
   if (w.fracs.empty()) {
     w.sol.assign(x, x + p_.num_cols());
     static const bool polish_lp = knob("MILP_POLISH_LP", 1) > 0;
@@ -4576,6 +4676,18 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
       // The LP point is integral within tolerance but violates the model, or is feasible only at a clearly
       // worse objective: we cannot branch on its fractionalities, so branch as for an unsolvable node LP
       // (fresh LP, else a domain split).
+      if (std::getenv("MILP_SPATIAL_DEBUG")) {
+        for (const Bilinear& b : p_.bilinear) {
+          log_.log(0, "    product w%d = x%d * x%d: %.9g vs %.9g * %.9g, viol %.3g; boxes [%g, %g] [%g, %g] [%g, %g]\n", b.w, b.x, b.y,
+                   w.sol[b.w], w.sol[b.x], w.sol[b.y], b.violation(w.sol.data()), w.lb[b.w], w.ub[b.w], w.lb[b.x], w.ub[b.x], w.lb[b.y], w.ub[b.y]);
+        }
+        for (const QuadRow& q : p_.quad_rows) log_.log(0, "    quad row viol %.3g\n", q.violation(w.sol.data()));
+        double lin = 0.0;
+        p_.max_violation(w.sol, nullptr, &lin);
+        log_.log(0, "    linear viol %.3g, x:", lin);
+        for (double v : w.sol) log_.log(0, " %.9g", v);
+        log_.log(0, "\n");
+      }
       log_.log(2, "  node %lld: integral LP point %s (viol %.3g, int %.3g), branching without it\n", node.id,
                feasible ? "worse than the LP bound once exactly feasible" : "violates model", viol, iv);
       return unsolved_branch(w, node, children);
@@ -4903,6 +5015,7 @@ int Search::unsolved_branch(Worker& w, Node& node, Node* children) {
   // A fresh LP over the model rows only (cuts are redundant for validity), cold, no perturbation.
   DualSimplex fresh;
   fresh.load(p_.A, p_.cost, w.lb, w.ub, p_.row_lb, p_.row_ub);
+  fresh.set_safe_strict(!p_.bilinear.empty());
   LpOptions o;
   o.tol = params_.tol;
   o.perturb = false;
@@ -4936,7 +5049,16 @@ int Search::unsolved_branch(Worker& w, Node& node, Node* children) {
         const Index z = violated_implication(w, x.data());
         if (z >= 0) return implication_branch(w, node, children, z, bound);
       }
+      if (!p_.bilinear.empty()) {
+        const int nc = spatial_branch(w, node, children, x.data(), bound, false);
+        if (nc > 0) return nc;
+      }
     }
+  }
+  if (j < 0 && !p_.bilinear.empty()) {
+    // No LP point to go by: split the widest domain among the products' factors.
+    const int nc = spatial_branch(w, node, children, nullptr, bound, true);
+    if (nc > 0) return nc;
   }
   if (j < 0) {
     // Split the largest domain of an unfixed integer column.
@@ -5014,6 +5136,205 @@ Index Search::open_implication(const Worker& w) const {
     if (w.lb[im.z] < w.ub[im.z] && (w.lb[im.col] < 0.0 || w.ub[im.col] > 0.0)) return im.z;
   }
   return -1;
+}
+
+int Search::spatial_rows(const Worker& w, const double* x, std::vector<Cut>& cuts) const {
+  int added = 0;
+  auto add = [&](std::initializer_list<std::pair<Index, double>> terms, double rhs) {
+    // sum terms <= rhs, kept if x violates it clearly (relative to the row's size).
+    double act = 0.0, scale = std::max(1.0, std::abs(rhs));
+    for (const auto& [j, v] : terms) act += v * x[j], scale = std::max(scale, std::abs(v * x[j]));
+    if (act <= rhs + 1e-7 * scale) return;
+    Cut c;
+    c.origin = "mccormick";
+    // Merged per column (a square's row names its column twice).
+    for (const auto& [j, v] : terms) {
+      const auto it = std::find(c.idx.begin(), c.idx.end(), j);
+      if (it == c.idx.end()) c.idx.push_back(j), c.val.push_back(v);
+      else c.val[static_cast<size_t>(it - c.idx.begin())] += v;
+    }
+    c.rhs = rhs;
+    cuts.push_back(std::move(c));
+    ++added;
+  };
+  // The products the point violates; with many of them, the most violated first, at most MILP_SPATIAL_ROWS (1000)
+  // a round (QPLIB_8758: a million products, each round would add millions of rows to the node's LP).
+  static const size_t kCap = static_cast<size_t>(knob("MILP_SPATIAL_ROWS", 1000));
+  std::vector<std::pair<double, const Bilinear*>> viol;
+  for (const Bilinear& b : p_.bilinear) {
+    const double v = b.violation(x);
+    if (v > 0.5 * kFeasTol) viol.emplace_back(v, &b);
+  }
+  if (viol.size() > kCap) {
+    std::nth_element(viol.begin(), viol.begin() + static_cast<std::ptrdiff_t>(kCap), viol.end(),
+                     [](const auto& a, const auto& c) { return a.first > c.first || (a.first == c.first && a.second < c.second); });
+    viol.resize(kCap);
+    std::sort(viol.begin(), viol.end(), [](const auto& a, const auto& c) { return a.second < c.second; });
+  }
+  for (const auto& [vv, bp] : viol) {
+    const Bilinear& b = *bp;
+    const double lx = w.lb[b.x], ux = w.ub[b.x], ly = w.lb[b.y], uy = w.ub[b.y];
+    const bool flx = is_finite(lx), fux = is_finite(ux), fly = is_finite(ly), fuy = is_finite(uy);
+    // Each row where the two bounds it needs are finite.
+    if (b.x == b.y) {
+      // w >= x^2: the tangent at the point; w <= the secant over [lx, ux].
+      const double x0 = std::clamp(x[b.x], lx, ux);
+      add({{b.w, -1.0}, {b.x, 2.0 * x0}}, x0 * x0);
+      if (flx && fux) add({{b.w, 1.0}, {b.x, -(lx + ux)}}, -lx * ux);
+    } else {
+      if (flx && fly) add({{b.w, -1.0}, {b.x, ly}, {b.y, lx}}, lx * ly);
+      if (fux && fuy) add({{b.w, -1.0}, {b.x, uy}, {b.y, ux}}, ux * uy);
+      if (fux && fly) add({{b.w, 1.0}, {b.x, -ly}, {b.y, -ux}}, -ux * ly);
+      if (flx && fuy) add({{b.w, 1.0}, {b.x, -uy}, {b.y, -lx}}, -lx * uy);
+    }
+  }
+  return added;
+}
+
+bool Search::propagate_products(Worker& w) const {
+  auto mul = [](double a, double b) { return a == 0.0 || b == 0.0 ? 0.0 : a * b; };
+  // New bounds [lo, hi] for column j, widened by rounding errors (integers: rounded inward within the tolerance).
+  // False if they miss the column's domain.
+  auto tighten = [&](Index j, double lo, double hi) {
+    if (std::isnan(lo) || std::isnan(hi)) return true;
+    lo -= 1e-9 * std::max(1.0, std::abs(lo));
+    hi += 1e-9 * std::max(1.0, std::abs(hi));
+    if (p_.is_int[j]) {
+      lo = std::ceil(lo - params_.tol.integrality);
+      hi = std::floor(hi + params_.tol.integrality);
+    }
+    double& l = w.lb[j];
+    double& u = w.ub[j];
+    if (lo > u + kFeasTol * std::max(1.0, std::abs(u)) || hi < l - kFeasTol * std::max(1.0, std::abs(l))) return false;
+    bool changed = false;
+    if (lo > l && lo <= u) l = lo, changed = true;
+    if (hi < u && hi >= l) u = hi, changed = true;
+    if (changed) w.changed.push_back(j);
+    return true;
+  };
+  // x in [wl, wu] / [dl, du] where the divisor's interval excludes 0.
+  auto quotient = [&](Index j, double wl, double wu, double dl, double du) {
+    if (!(dl > 0.0) && !(du < 0.0)) return true;
+    auto div = [](double a, double b) { return a == 0.0 ? 0.0 : std::isinf(b) ? 0.0 : a / b; };
+    const double c[4] = {div(wl, dl), div(wl, du), div(wu, dl), div(wu, du)};
+    return tighten(j, *std::min_element(c, c + 4), *std::max_element(c, c + 4));
+  };
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const Bilinear& b : p_.bilinear) {
+      const double lx = w.lb[b.x], ux = w.ub[b.x], ly = w.lb[b.y], uy = w.ub[b.y];
+      // The product from its factors.
+      double lo, hi;
+      if (b.x == b.y) {
+        lo = lx <= 0.0 && ux >= 0.0 ? 0.0 : std::min(mul(lx, lx), mul(ux, ux));
+        hi = std::max(mul(lx, lx), mul(ux, ux));
+      } else {
+        lo = std::min({mul(lx, ly), mul(lx, uy), mul(ux, ly), mul(ux, uy)});
+        hi = std::max({mul(lx, ly), mul(lx, uy), mul(ux, ly), mul(ux, uy)});
+      }
+      if (!tighten(b.w, lo, hi)) return false;
+      // The factors from the product (MILP_SPATIAL_FBBT=0: off).
+      static const bool reverse = knob("MILP_SPATIAL_FBBT", 1) > 0;
+      if (!reverse) continue;
+      const double wl = w.lb[b.w], wu = w.ub[b.w];
+      if (b.x == b.y) {
+        if (wu < 0.0 && wu < -kFeasTol) return false;
+        if (is_finite(wu)) {
+          const double r = std::sqrt(std::max(wu, 0.0));
+          if (!tighten(b.x, -r, r)) return false;
+        }
+        if (wl > 0.0) {
+          const double r = std::sqrt(wl);
+          if (w.lb[b.x] >= 0.0 && !tighten(b.x, r, kInf)) return false;
+          if (w.ub[b.x] <= 0.0 && !tighten(b.x, -kInf, -r)) return false;
+        }
+      } else {
+        if (!quotient(b.x, wl, wu, w.lb[b.y], w.ub[b.y])) return false;
+        if (!quotient(b.y, wl, wu, w.lb[b.x], w.ub[b.x])) return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool Search::spatial_complete(Worker& w, const double* x) {
+  std::vector<double> lb = w.lb, ub = w.ub, pt(x, x + p_.num_cols()), out;
+  for (const Bilinear& b : p_.bilinear) {
+    for (const Index c : {b.x, b.y}) {
+      double v = std::clamp(pt[c], lb[c], ub[c]);
+      if (p_.is_int[c]) v = std::round(v);
+      lb[c] = ub[c] = pt[c] = v;
+    }
+  }
+  for (const Bilinear& b : p_.bilinear) {
+    const double v = lb[b.x] * lb[b.y];
+    if (!std::isfinite(v)) return false;
+    lb[b.w] = ub[b.w] = pt[b.w] = v;
+  }
+  if (solve_fixed_ints(pt, lb, ub, 1e-9, kInf, out) != LpStatus::Optimal) return false;
+  return p_.max_violation(out) <= kFeasTol && try_incumbent(w, out, "products");
+}
+
+int Search::spatial_branch(Worker& w, Node& node, Node* children, const double* x, double bound, bool any,
+                           double min_viol) {
+  // The column: of the most violated product, the factor whose domain is widest relative to its root domain.
+  auto width = [&](Index j) {
+    const double d = w.ub[j] - w.lb[j];
+    if (!is_finite(d)) return 1e30;  // a domain without an end comes first: no McCormick rows until it has both
+    if (p_.is_int[j] ? d < 0.5 : d <= 1e-9 * std::max(1.0, std::max(std::abs(w.lb[j]), std::abs(w.ub[j])))) return 0.0;
+    const double root = p_.col_ub[j] - p_.col_lb[j];
+    return is_finite(root) && root > 0.0 ? d / root : 1.0;
+  };
+  Index j = -1;
+  double best = 0.0, best_w = 0.0;
+  for (const Bilinear& b : p_.bilinear) {
+    const double viol = any ? 1.0 : b.violation(x);
+    if (!any && viol <= min_viol) continue;
+    for (const Index c : {b.x, b.y}) {
+      const double wd = width(c);
+      if (wd <= 0.0) continue;
+      if (viol > best * (1.0 + 1e-9) || (viol >= best * (1.0 - 1e-9) && wd > best_w)) best = viol, best_w = wd, j = c;
+    }
+  }
+  if (j < 0) return 0;
+  // The point: three parts the LP value, one part the middle, kept away from the ends. A domain without an end is
+  // cut beyond the LP value (by max(1, |value|)), so one child is bounded on that side and holds the value, and
+  // the other one excludes it.
+  const double l = w.lb[j], u = w.ub[j], mid = 0.5 * (l + u);
+  double v;
+  if (is_finite(l) && is_finite(u)) {
+    v = x && !any ? 0.75 * std::clamp(x[j], l, u) + 0.25 * mid : mid;
+    v = std::clamp(v, l + 0.1 * (u - l), u - 0.1 * (u - l));
+  } else {
+    const double at = x && !any ? x[j] : is_finite(l) ? l : is_finite(u) ? u : 0.0;
+    const double step = std::max(1.0, std::abs(at));
+    v = !is_finite(u) ? std::max(at, is_finite(l) ? l : at) + step : std::min(at, u) - step;
+  }
+  double down_ub = v, up_lb = v;
+  if (p_.is_int[j]) {
+    down_ub = std::floor(v);
+    if (is_finite(u)) down_ub = std::min(down_ub, u - 1.0);
+    if (is_finite(l)) down_ub = std::max(down_ub, l);
+    up_lb = down_ub + 1.0;
+  }
+  ++spatial_branches_;
+  Node down, up;
+  for (Node* c : {&down, &up}) {
+    c->bound = bound;
+    c->estimate = bound;
+    c->parent_obj = bound;
+    c->depth = node.depth + 1;
+    c->parent = node.id;
+    c->id = next_node_id(w);
+    c->branch_var = -1;  // no pseudocost update
+    c->sym = nullptr;
+  }
+  const PathRef base = branch_segment(w, node, false);
+  set_child_change(down, base, {j, l, down_ub}, nullptr);
+  set_child_change(up, base, {j, up_lb, u}, nullptr);
+  children[0] = std::move(down);
+  children[1] = std::move(up);
+  count_outcome(8, node.depth);
+  return 2;
 }
 
 int Search::unbounded_leaf(Worker& w, Node& node) {
@@ -5473,15 +5794,59 @@ thread_local int Search::last_outcome_ = -1;
 int Search::process(Worker& w, Node& node, Node* children) {
   last_outcome_ = -1;
   const int nc = process_impl(w, node, children);
-  if (w.det && use_pool_ && w.m_base >= 0 && !p_.quad_rows.empty()) {
-    // The node's own tangent rows (deterministic mode, see MILP_OA_DET_LOCAL): the rows after the pool rows.
-    const Index keep = w.m_base + static_cast<Index>(w.prow.size());
-    if (w.lp.num_rows() > keep) {
-      std::vector<Index> rows;
-      for (Index i = keep; i < w.lp.num_rows(); ++i) rows.push_back(i);
-      w.lp.pivot_out_rows(rows);
-      w.lp.remove_rows(rows);
+  if (!debug_sol_.empty() && static_cast<Index>(debug_sol_.size()) == w.lp.num_cols()) {
+    // Debug: a row or a bound of this node's LP (its own rows included) that cuts off the known optimum although
+    // the node's branching bounds contain it.
+    bool contains = true;
+    for (Index j = 0; j < p_.num_cols() && contains; ++j) {
+      const double t = 1e-6 * std::max(1.0, std::abs(debug_sol_[j]));
+      contains = debug_sol_[j] >= w.lp.col_lower(j) - t && debug_sol_[j] <= w.lp.col_upper(j) + t;
     }
+    if (contains && std::getenv("MILP_DEBUG_NODE") && node.id == std::atoll(std::getenv("MILP_DEBUG_NODE"))) {
+      const SparseMatrix& R = w.lp.row_matrix();
+      log_.log(0, "DEBUG-NODE %lld: %d rows (%d its own), LP point:", node.id, w.lp.num_rows(), w.local_rows);
+      for (Index j = 0; j < w.lp.num_cols(); ++j) log_.log(0, " x%d=%.10g [%.8g, %.8g]", j, w.lp.x()[j], w.lp.col_lower(j), w.lp.col_upper(j));
+      log_.log(0, "\n");
+      for (Index i = 0; i < w.lp.num_rows(); ++i) {
+        log_.log(0, "  row %d:", i);
+        double act = 0.0, dact = 0.0;
+        for (Index k = R.begin(i); k < R.end(i); ++k) {
+          log_.log(0, " %+.10g x%d", R.value[k], R.index[k]);
+          act += R.value[k] * w.lp.x()[R.index[k]], dact += R.value[k] * debug_sol_[R.index[k]];
+        }
+        log_.log(0, "  | at the LP point %.10g, at the optimum %.10g, scaled bounds [%.8g, %.8g]\n", act, dact,
+                 -w.lp.col_upper(w.lp.num_cols() + i), -w.lp.col_lower(w.lp.num_cols() + i));
+      }
+    }
+    if (false) {
+      const SparseMatrix& R = w.lp.row_matrix();
+      for (Index i = 0; i < w.lp.num_rows(); ++i) {
+        double act = 0.0, mag = 1.0;
+        for (Index k = R.begin(i); k < R.end(i); ++k) {
+          act += R.value[k] * debug_sol_[R.index[k]];
+          mag = std::max(mag, std::abs(R.value[k] * debug_sol_[R.index[k]]));
+        }
+        // (The row's logical column holds -activity: its bounds are [-row_ub, -row_lb].)
+        const double rl = -w.lp.col_upper(w.lp.num_cols() + i), ru = -w.lp.col_lower(w.lp.num_cols() + i);
+        if (act < rl - 1e-6 * mag || act > ru + 1e-6 * mag) {
+          log_.log(0, "DEBUG-SOL: node %lld: LP row %d of %d (%s) cuts off the optimum: activity %.12g, bounds [%.12g, %.12g]:",
+                   node.id, i, w.lp.num_rows(), i >= w.lp.num_rows() - w.local_rows ? "the node's own" : "model or pool", act,
+                   rl, ru);
+          for (Index k = R.begin(i); k < R.end(i); ++k) log_.log(0, " %+.10g x%d", R.value[k], R.index[k]);
+          log_.log(0, "\n");
+        }
+      }
+    }
+  }
+  if (w.local_rows > 0) {
+    // The node's own rows (tangents in deterministic mode, see MILP_OA_DET_LOCAL; McCormick rows of its bounds):
+    // the last rows of the LP.
+    const Index keep = w.lp.num_rows() - static_cast<Index>(w.local_rows);
+    std::vector<Index> rows;
+    for (Index i = keep; i < w.lp.num_rows(); ++i) rows.push_back(i);
+    w.lp.pivot_out_rows(rows);
+    w.lp.remove_rows(rows);
+    w.local_rows = 0;
   }
   static const bool cut_hist = knob("MILP_CUT_WEIGHT", 0.0) > 0.0;
   if (cut_hist && node.branch_var >= 0 && !stop_) {
@@ -5500,6 +5865,33 @@ int Search::process(Worker& w, Node& node, Node* children) {
     if (w.det) w.leaf_log.emplace_back(node.branch_dir, inf);
   }
   if (debug_sol_.empty()) return nc;
+  // Debug: report when the children of a node whose bounds contain the known optimum do not (a branching that
+  // loses a part of the domain).
+  if (nc > 0) {
+    bool contains = true;
+    for (Index j = 0; j < p_.num_cols() && contains; ++j) {
+      contains = debug_sol_[j] >= w.lb[j] - 1e-6 * std::max(1.0, std::abs(debug_sol_[j])) &&
+                 debug_sol_[j] <= w.ub[j] + 1e-6 * std::max(1.0, std::abs(debug_sol_[j]));
+    }
+    bool kept = false;
+    for (int k = 0; k < nc && contains; ++k) {
+      const BoundChange& c = children[k].change;
+      kept = kept || c.col < 0 || (debug_sol_[c.col] >= c.lb - 1e-9 && debug_sol_[c.col] <= c.ub + 1e-9);
+    }
+    if (contains && !kept) {
+      log_.log(0, "DEBUG-SOL: node %lld (bound %.10g): the optimum is in no child:", node.id, node.bound);
+      for (int k = 0; k < nc; ++k) {
+        const BoundChange& c = children[k].change;
+        log_.log(0, " col %d [%.10g, %.10g] (value %.10g, node [%.10g, %.10g])", c.col, c.lb, c.ub, debug_sol_[c.col], w.lb[c.col], w.ub[c.col]);
+      }
+      log_.log(0, "\n");
+    }
+    if (contains) {
+      log_.log(3, "DEBUG-SOL: node %lld contains the optimum, %d children, bounds %.10g; box:", node.id, nc, children[0].bound);
+      for (Index j = 0; j < p_.num_cols(); ++j) log_.log(3, " x%d [%.8g, %.8g]", j, w.lb[j], w.ub[j]);
+      log_.log(3, "\n");
+    }
+  }
   // Debug: report when a node whose bounds contain the known optimum is closed.
   if (nc == 0) {
     bool contains = true;
@@ -6634,7 +7026,7 @@ void Search::barrier_root(DualSimplex& lp) {
 void Search::detect_symmetry_root() {
   if (std::getenv("MILP_NO_SYMMETRY") != nullptr || !params_.symmetry || !opts_.sub_mip_heuristics) return;
   if (!p_.implications.empty()) return;  // the implications are not part of the symmetry detection
-  if (!p_.quad_rows.empty()) return;     // nor the quadratic rows
+  if (p_.nonlinear()) return;            // nor the quadratic rows and products
   if (std::find(p_.is_int.begin(), p_.is_int.end(), 1) == p_.is_int.end()) return;
   SymmetryOptions so;
   // Deterministic mode: the work limit only (a binding time cap would be timing dependent).
@@ -6906,6 +7298,7 @@ MipResult Search::run() {
     log_.log(2, "  restart: pseudocosts of %d columns carried\n", carried);
   }
   root_lp_.load(p_.A, p_.cost, p_.col_lb, p_.col_ub, p_.row_lb, p_.row_ub);
+  root_lp_.set_safe_strict(!p_.bilinear.empty());  // the workers' LPs are copies
   root_lp_.set_seed(params_.seed);
   cut_data_.build(p_);
   pool_ = std::make_unique<NodePool>(threads_, this, &path_bytes_);
@@ -7453,6 +7846,10 @@ MipResult Search::run() {
     }
     if (impl_branches_.load() > 0) {
       log_.log(1, "Logical implications: %lld branchings\n", impl_branches_.load());
+    }
+    if (!p_.bilinear.empty()) {
+      log_.log(1, "Products: %zu, %lld spatial branchings, %lld McCormick rows in %lld node rounds\n", p_.bilinear.size(),
+               spatial_branches_.load(), spatial_rows_.load(), spatial_rounds_.load());
     }
     if (polish_tried_.load() > 0) {
       log_.log(2, "Fixed-integer re-solves of near-feasible points: %lld, %lld feasible, %lld LP iterations; %lld repeated "

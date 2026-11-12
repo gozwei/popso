@@ -132,7 +132,7 @@ bool symmetry_rows(const MipProblem& q, const SolverParams& params, const Timer&
     return v ? std::atoi(v) : 1;
   }();
   if (mode <= 0 || !params.symmetry || opts.sst_done || !opts.sub_mip_heuristics || !q.implications.empty() ||
-      !q.quad_rows.empty() ||
+      q.nonlinear() ||
       std::getenv("MILP_NO_SYMMETRY") != nullptr) {
     return false;
   }
@@ -1095,12 +1095,23 @@ std::optional<SolveResult> solve_linearized(const Model& model, bool objective, 
 }
 
 SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
-                          const Timer& timer, const Logger& log, IncumbentTracer* tracer);
+                          const Timer& timer, const Logger& log, IncumbentTracer* tracer,
+                          const std::vector<Bilinear>* products = nullptr,
+                          const std::vector<MipProblem::LiftedRow>* lifted = nullptr);
+
+// A model found not convex: an error, unless spatial branch-and-bound takes it from there (solve_model sets the flag
+// for the calling thread; the reason then goes to the debug log only).
+thread_local bool t_spatial_next = false;
+void log_nonconvex(const Logger& log, const std::string& msg) {
+  if (t_spatial_next) log.log(2, "Not convex: %s\n", msg.c_str());
+  else log.log(1, "ERROR: %s\n", msg.c_str());
+}
 
 // The quadratic rows of `model` as the search's QuadRows (their linear parts, terms and sides; `quad` flags the
 // rows), each checked for convexity or recognized as a cone (detect_cone). False, with the reason, if one is neither.
 bool build_quad_rows(const Model& model, std::vector<char>& quad, std::vector<QuadRow>& rows, size_t& cones,
-                     std::string& why) {
+                     std::string& why, std::vector<char>* bad = nullptr) {
+  if (bad) bad->assign(static_cast<size_t>(model.num_rows()), 0);
   const Index n = model.num_cols(), m = model.num_rows();
   quad.assign(static_cast<size_t>(m), 0);
   for (size_t k = 0; k < model.qr_val.size(); ++k) {
@@ -1126,14 +1137,25 @@ bool build_quad_rows(const Model& model, std::vector<char>& quad, std::vector<Qu
   }
   // Convexity: the Hessian of each row (2c on the diagonal, c off it, as 1/2 x' H x) PSD towards a finite upper side,
   // NSD towards a finite lower side; a quadratic row with both sides finite is not convex.
-  auto nonconvex = [&](const std::string& msg) {
-    why = msg;
-    return false;
-  };
+  std::vector<Index> row_of;  // model row of rows[s]
+  for (Index i = 0; i < m; ++i) {
+    if (quad[i]) row_of.push_back(i);
+  }
+  bool all_convex = true;
   cones = 0;
   for (size_t s = 0; s < rows.size(); ++s) {
+    // With `bad`: every row is judged and the rows that are not convex are marked; without: the first one ends it.
+    auto nonconvex = [&](const std::string& msg) {
+      if (all_convex) why = msg;
+      all_convex = false;
+      if (bad) (*bad)[row_of[s]] = 1;
+      return bad != nullptr;
+    };
     QuadRow& q = rows[s];
-    if (is_finite(q.lo) && is_finite(q.hi)) return nonconvex("a quadratic constraint with two finite sides is not convex");
+    if (is_finite(q.lo) && is_finite(q.hi)) {
+      if (nonconvex("a quadratic constraint with two finite sides is not convex")) continue;
+      return false;
+    }
     const double dir = is_finite(q.hi) ? 1.0 : -1.0;
     std::vector<Index> I, J;
     std::vector<double> V;
@@ -1142,10 +1164,13 @@ bool build_quad_rows(const Model& model, std::vector<char>& quad, std::vector<Qu
     }
     const ConvexityResult cv = check_convexity(SparseMatrix::from_triplets(n, n, J, I, V));
     if (cv.convex) continue;
-    if (!detect_cone(q, model.col_lb, model.col_ub)) return nonconvex("quadratic constraint not convex: " + cv.message);
+    if (!detect_cone(q, model.col_lb, model.col_ub)) {
+      if (nonconvex("quadratic constraint not convex: " + cv.message)) continue;
+      return false;
+    }
     ++cones;
   }
-  return true;
+  return all_convex;
 }
 
 SolveResult solve_oa_presolved(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
@@ -1211,7 +1236,8 @@ SolveResult solve_oa_presolved(const Model& model, const SolverParams& params_in
 }
 
 SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, const std::vector<double>& start,
-                          const Timer& timer, const Logger& log, IncumbentTracer* tracer) {
+                          const Timer& timer, const Logger& log, IncumbentTracer* tracer,
+                          const std::vector<Bilinear>* products, const std::vector<MipProblem::LiftedRow>* lifted) {
   SolveResult r;
   if (model.has_logical()) throw std::runtime_error("quadratic constraints with logical constraints are not supported yet");
   const double sense = model.sense == ObjSense::Maximize ? -1.0 : 1.0;
@@ -1220,7 +1246,7 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
   std::vector<QuadRow> rows;
   size_t cones = 0;
   auto nonconvex = [&](const std::string& msg) {
-    log.log(1, "ERROR: %s\n", msg.c_str());
+    log_nonconvex(log, msg);
     r.status = Status::NonConvex;
     r.stats.time = timer.elapsed();
     return r;
@@ -1322,6 +1348,19 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
     if (added > 0) log.log(1, "Cones switched by binaries: %zu implications (binary 0: member 0)\n", added);
   }
   p.quad_rows = std::move(rows);
+  if (products) p.bilinear = *products;  // spatial branching (solve_spatial)
+  if (lifted) {
+    // The model's row indices become the search's: the quadratic rows left the linear part.
+    std::vector<Index> pos(static_cast<size_t>(m), -1);
+    for (Index i = 0, k = 0; i < m; ++i) {
+      if (!quad[i]) pos[i] = k++;
+    }
+    for (const MipProblem::LiftedRow& lr : *lifted) {
+      if (pos[lr.row] < 0) continue;
+      p.lifted_rows.push_back(lr);
+      p.lifted_rows.back().row = pos[lr.row];
+    }
+  }
   // The continuous relaxation by the conic interior-point method (conic/socp.hpp, MILP_CONIC=0: off): it solves a
   // continuous model outright (the outer approximation stays the fallback); with integers, its point gives tangents.
   std::vector<double> relax_x, round_start;
@@ -1332,7 +1371,8 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
     ConicProblem cp;
     std::string why;
     ConicMap cmap;
-    const bool built = !(env && *env == '0') && conic_relaxation(p, cp, &why, &cmap);
+    // (Not with products: the relaxation's point says nothing about them, and its verdicts are for the search.)
+    const bool built = !products && !(env && *env == '0') && conic_relaxation(p, cp, &why, &cmap);
     if (!built && !why.empty()) log.log(1, "Conic relaxation skipped: %s\n", why.c_str());
     if (built) {
       ConicOptions co;
@@ -1560,6 +1600,342 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
   r.stats.lp_iterations = mr.lp_iterations;
   r.stats.root_bound = sense * mr.root_bound;
   r.stats.time = timer.elapsed();
+  return r;
+}
+
+// Bounds from the quadratic rows themselves (any convexity), for the columns with a square term: in a row
+//   lo <= c x^2 + B x + R <= hi,  B = a_k + sum_j c_kj x_j,  R = the terms without x,
+// with B and R in intervals from the other columns' bounds, c > 0 gives c x^2 - beta |x| <= hi - min R (beta =
+// max |B|), so |x| <= (beta + sqrt(beta^2 + 4 c U)) / (2 c) with U = max(hi - min R, 0); c < 0 the same from the
+// lower side. A few passes (a new bound makes other intervals finite). Returns the number of bounds tightened.
+size_t quad_row_bounds(const Model& model, std::vector<double>& lo, std::vector<double>& hi) {
+  const Index n = model.num_cols(), m = model.num_rows();
+  const SparseMatrix At = model.A.transpose();
+  std::vector<std::vector<size_t>> terms(static_cast<size_t>(m));
+  for (size_t k = 0; k < model.qr_val.size(); ++k) {
+    if (model.qr_val[k] != 0.0) terms[model.qr_row[k]].push_back(k);
+  }
+  auto mul = [](double a, double b) { return a == 0.0 || b == 0.0 ? 0.0 : a * b; };
+  struct Iv {
+    double l = 0.0, u = 0.0;
+    void add(double a, double b) { l += a, u += b; }
+  };
+  // c * x_i * x_j over the bounds.
+  auto term_iv = [&](double c, Index i, Index j) {
+    double a, b;
+    if (i == j) {
+      a = lo[i] <= 0.0 && hi[i] >= 0.0 ? 0.0 : std::min(mul(lo[i], lo[i]), mul(hi[i], hi[i]));
+      b = std::max(mul(lo[i], lo[i]), mul(hi[i], hi[i]));
+    } else {
+      const double v[4] = {mul(lo[i], lo[j]), mul(lo[i], hi[j]), mul(hi[i], lo[j]), mul(hi[i], hi[j])};
+      a = *std::min_element(v, v + 4), b = *std::max_element(v, v + 4);
+    }
+    return c >= 0 ? Iv{mul(c, a), mul(c, b)} : Iv{mul(c, b), mul(c, a)};
+  };
+  size_t found = 0;
+  for (int pass = 0; pass < 10; ++pass) {
+    bool any = false;
+    for (Index r = 0; r < m; ++r) {
+      if (terms[r].empty() || terms[r].size() > 5000) continue;
+      for (const size_t kk : terms[r]) {
+        if (model.qr_i[kk] != model.qr_j[kk]) continue;
+        const Index x = model.qr_i[kk];
+        const double c = model.qr_val[kk];
+        Iv B, R;
+        for (Index p = At.begin(r); p < At.end(r); ++p) {
+          const Index j = At.index[p];
+          const double a = At.value[p];
+          if (j == x) B.add(a, a);
+          else R.add(a >= 0 ? mul(a, lo[j]) : mul(a, hi[j]), a >= 0 ? mul(a, hi[j]) : mul(a, lo[j]));
+        }
+        for (const size_t t : terms[r]) {
+          if (t == kk) continue;
+          const Index i = model.qr_i[t], j = model.qr_j[t];
+          const double v = model.qr_val[t];
+          if (i == x || j == x) {
+            const Index o = i == x ? j : i;
+            B.add(v >= 0 ? mul(v, lo[o]) : mul(v, hi[o]), v >= 0 ? mul(v, hi[o]) : mul(v, lo[o]));
+          } else {
+            const Iv iv = term_iv(v, i, j);
+            R.add(iv.l, iv.u);
+          }
+        }
+        if (std::isnan(B.l) || std::isnan(B.u) || !is_finite(B.l) || !is_finite(B.u)) continue;
+        const double beta = std::max(std::abs(B.l), std::abs(B.u));
+        // c x^2 + B x <= U (c > 0), or -c x^2 - B x <= U (c < 0).
+        double U;
+        if (c > 0) {
+          if (!is_finite(model.row_ub[r]) || std::isnan(R.l) || !is_finite(R.l)) continue;
+          U = model.row_ub[r] - R.l;
+        } else {
+          if (!is_finite(model.row_lb[r]) || std::isnan(R.u) || !is_finite(R.u)) continue;
+          U = R.u - model.row_lb[r];
+        }
+        const double ac = std::abs(c);
+        double bnd = (beta + std::sqrt(beta * beta + 4.0 * ac * std::max(U, 0.0))) / (2.0 * ac);
+        bnd += 1e-9 * std::max(1.0, bnd);
+        const bool integer = model.col_type[x] == VarType::Integer || model.col_type[x] == VarType::Binary;
+        if (integer) bnd = std::floor(bnd + 1e-9);
+        // Only clear gains: a bound that was infinite, or 0.1% of the domain.
+        const double gain = is_finite(hi[x] - lo[x]) ? 1e-3 * (hi[x] - lo[x]) : 0.0;
+        if (bnd < hi[x] - gain && bnd >= lo[x]) hi[x] = bnd, ++found, any = true;
+        if (-bnd > lo[x] + gain && -bnd <= hi[x]) lo[x] = -bnd, ++found, any = true;
+      }
+    }
+    if (!any) break;
+  }
+  (void)n;
+  return found;
+}
+
+// Nonconvex quadratic models (v0.10; MILP_SPATIAL=0: off, the model is then reported NONCONVEX as before): spatial
+// branch-and-bound. Every product x_i x_j of a quadratic row that is not convex, and of the objective if that is not
+// convex, becomes a column w with McCormick rows over the factors' bounds (a square: its secant and three tangents);
+// the rows and the objective are then linear in the w. Convex quadratic rows and a convex objective stay as they
+// are (outer approximation). The search keeps w = x_i x_j by McCormick rows of each node's bounds and by branching
+// on the factors, continuous ones included (MipProblem::bilinear). A factor without finite bounds (the linear rows'
+// implied bounds count) has only the McCormick rows its finite bounds give, until branching bounds it. nullopt with
+// the reason if the model has logical constraints or nothing in it is nonconvex.
+std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams& params, const std::vector<double>& start,
+                                         const Timer& timer, const Logger& log, IncumbentTracer* tracer, std::string& why) {
+  if (model.has_logical()) {
+    why = "logical constraints";
+    return std::nullopt;
+  }
+  const Index n = model.num_cols(), m = model.num_rows();
+  const double sense = model.sense == ObjSense::Maximize ? -1.0 : 1.0;
+  std::vector<char> quad, bad;
+  bool obj_bad = false;
+  {
+    std::vector<QuadRow> rows;
+    size_t cones = 0;
+    std::string w;
+    build_quad_rows(model, quad, rows, cones, w, &bad);
+    if (model.has_quadratic()) {
+      SparseMatrix Q = model.q_lower();
+      for (double& v : Q.value) v *= sense;
+      obj_bad = !check_convexity(Q).convex;
+    }
+  }
+  if (!obj_bad && std::find(bad.begin(), bad.end(), 1) == bad.end()) {
+    why = "nothing nonconvex";
+    return std::nullopt;
+  }
+  // Bounds of the factors: the columns' own, tightened by the linear rows.
+  std::vector<double> lo = model.col_lb, hi = model.col_ub;
+  {
+    Model lin = model;
+    lin.q_row.clear(), lin.q_col.clear(), lin.q_val.clear();
+    lin.qr_row.clear(), lin.qr_i.clear(), lin.qr_j.clear(), lin.qr_val.clear();
+    lin.remove_rows(quad);
+    implied_bounds(lin, lo, hi);
+    for (Index j = 0; j < n; ++j) {
+      lo[j] = std::max(lo[j], model.col_lb[j]), hi[j] = std::min(hi[j], model.col_ub[j]);
+      if (lo[j] > hi[j]) lo[j] = hi[j] = model.col_lb[j] > hi[j] ? model.col_lb[j] : hi[j];  // crossed within rounding
+    }
+  }
+  {
+    const size_t found = quad_row_bounds(model, lo, hi);
+    if (found > 0) log.log(1, "  %zu bounds from the quadratic rows' square terms\n", found);
+  }
+  // A factor still without a finite bound: the bound from the convex part of the model (its linear and convex
+  // quadratic rows, integers relaxed), by minimizing and maximizing the column there. A circle x^2 + y^2 <= 4
+  // bounds x and y, and no linear row says so. At most 200 columns and a tenth of the time limit.
+  {
+    std::vector<char> factor(static_cast<size_t>(n), 0);
+    for (size_t k = 0; k < model.qr_val.size(); ++k) {
+      if (model.qr_val[k] != 0.0 && bad[model.qr_row[k]]) factor[model.qr_i[k]] = factor[model.qr_j[k]] = 1;
+    }
+    if (obj_bad) {
+      for (size_t k = 0; k < model.q_val.size(); ++k) {
+        if (model.q_val[k] != 0.0) factor[model.q_row[k]] = factor[model.q_col[k]] = 1;
+      }
+    }
+    std::vector<Index> open;
+    for (Index j = 0; j < n; ++j) {
+      if (factor[j] && (!is_finite(lo[j]) || !is_finite(hi[j]))) open.push_back(j);
+    }
+    if (!open.empty() && open.size() <= 200) {
+      Model R = model;
+      R.q_row.clear(), R.q_col.clear(), R.q_val.clear();
+      R.remove_rows(bad);
+      R.compact_qrows();
+      for (VarType& t : R.col_type) t = VarType::Continuous;
+      R.col_lb = lo, R.col_ub = hi;
+      R.sense = ObjSense::Minimize;
+      R.obj_offset = 0.0;
+      SolverParams rp = params;
+      rp.verbosity = 0;
+      rp.threads = 1;
+      const double budget = timer.elapsed() + 0.1 * std::max(0.0, params.time_limit - timer.elapsed());
+      size_t found = 0;
+      for (const Index j : open) {
+        for (const double dir : {1.0, -1.0}) {
+          if (dir > 0 ? is_finite(lo[j]) : is_finite(hi[j])) continue;
+          if (timer.elapsed() >= budget) break;
+          std::fill(R.obj.begin(), R.obj.end(), 0.0);
+          R.obj[j] = dir;
+          rp.time_limit = budget - timer.elapsed();
+          const SolveResult rr = solve(R, rp);
+          if (rr.status != Status::Optimal || !std::isfinite(rr.bound)) continue;
+          // The dual bound, widened by the solve's tolerance.
+          const double b = rr.bound - 1e-6 * std::max(1.0, std::abs(rr.bound));
+          if (dir > 0) lo[j] = b; else hi[j] = -b;
+          R.col_lb[j] = lo[j], R.col_ub[j] = hi[j];
+          ++found;
+        }
+      }
+      if (found > 0) log.log(1, "  %zu bounds of unbounded factors from the convex part of the model\n", found);
+    }
+  }
+  quad_row_bounds(model, lo, hi);
+  Model L = model;
+  std::vector<Bilinear> terms;
+  std::vector<MipProblem::LiftedRow> lifted;
+  std::map<Index, size_t> lifted_of;  // model row -> its entry in lifted
+  // With very many products their root McCormick rows are left out (the search adds a node's rows where a point
+  // violates them): QPLIB_8758's 1,072,260 products would be 4.3 million rows, 6.9 GB.
+  size_t product_terms = obj_bad ? model.q_val.size() : 0;
+  for (size_t k = 0; k < model.qr_val.size(); ++k) product_terms += model.qr_val[k] != 0.0 && bad[model.qr_row[k]];
+  const bool root_rows = product_terms <= 50000;
+  std::map<std::pair<Index, Index>, Index> wcol;
+  std::vector<Index> ti, tj;  // new matrix entries (row, column)
+  std::vector<double> tv;
+  Index rows_now = m;
+  auto new_row = [&](double rlb, double rub, std::initializer_list<std::pair<Index, double>> coef) {
+    for (const auto& [j, v] : coef) {
+      if (v != 0.0) ti.push_back(rows_now), tj.push_back(j), tv.push_back(v);
+    }
+    L.row_lb.push_back(rlb);
+    L.row_ub.push_back(rub);
+    L.row_names.push_back("mc" + std::to_string(rows_now));
+    ++rows_now;
+  };
+  size_t open_factors = 0;  // products with a factor that has an infinite bound
+  // a * b for bounds: 0 * inf = 0.
+  auto mul = [](double a, double b) { return a == 0.0 || b == 0.0 ? 0.0 : a * b; };
+  auto product = [&](Index i, Index j) -> Index {
+    if (i < j) std::swap(i, j);
+    const auto it = wcol.find({i, j});
+    if (it != wcol.end()) return it->second;
+    const Index w = L.num_cols();
+    const double lx = lo[i], ux = hi[i], ly = lo[j], uy = hi[j];
+    const bool flx = is_finite(lx), fux = is_finite(ux), fly = is_finite(ly), fuy = is_finite(uy);
+    open_factors += !(flx && fux && fly && fuy);
+    double wl, wu;
+    if (i == j) {
+      wl = lx <= 0.0 && ux >= 0.0 ? 0.0 : std::min(mul(lx, lx), mul(ux, ux));
+      wu = std::max(mul(lx, lx), mul(ux, ux));
+    } else {
+      wl = std::min({mul(lx, ly), mul(lx, uy), mul(ux, ly), mul(ux, uy)});
+      wu = std::max({mul(lx, ly), mul(lx, uy), mul(ux, ly), mul(ux, uy)});
+    }
+    if (!is_finite(wl)) wl = -kInf;
+    if (!is_finite(wu)) wu = kInf;
+    L.obj.push_back(0.0);
+    L.col_lb.push_back(wl);
+    L.col_ub.push_back(wu);
+    L.col_type.push_back(VarType::Continuous);
+    L.col_names.push_back("w" + std::to_string(i) + "_" + std::to_string(j));
+    // Each McCormick row needs two of the four bounds: only the rows whose bounds are finite exist (the search
+    // adds the others once branching has made the bounds finite).
+    if (!root_rows) {
+    } else if (i == j) {
+      // w <= secant; w >= the tangents at the ends and the middle (the search adds those at its points).
+      if (flx && fux) new_row(-kInf, -lx * ux, {{w, 1.0}, {i, -(lx + ux)}});
+      const double a = flx ? lx : fux ? ux - 1.0 : -1.0, b = fux ? ux : flx ? lx + 1.0 : 1.0;
+      for (const double x0 : {a, 0.5 * (a + b), b}) new_row(-kInf, x0 * x0, {{w, -1.0}, {i, 2.0 * x0}});
+    } else {
+      if (flx && fly) new_row(-kInf, lx * ly, {{w, -1.0}, {i, ly}, {j, lx}});
+      if (fux && fuy) new_row(-kInf, ux * uy, {{w, -1.0}, {i, uy}, {j, ux}});
+      if (fux && fly) new_row(-kInf, -ux * ly, {{w, 1.0}, {i, -ly}, {j, -ux}});
+      if (flx && fuy) new_row(-kInf, -lx * uy, {{w, 1.0}, {i, -uy}, {j, -lx}});
+    }
+    terms.push_back({w, i, j});
+    wcol[{i, j}] = w;
+    return w;
+  };
+  // The rows that are not convex: their products by columns.
+  {
+    std::vector<Index> qr, qi, qj;
+    std::vector<double> qv;
+    for (size_t k = 0; k < model.qr_val.size(); ++k) {
+      const Index row = model.qr_row[k];
+      if (model.qr_val[k] == 0.0) continue;
+      if (!bad[row]) {
+        qr.push_back(row), qi.push_back(model.qr_i[k]), qj.push_back(model.qr_j[k]), qv.push_back(model.qr_val[k]);
+        continue;
+      }
+      const Index w = product(model.qr_i[k], model.qr_j[k]);
+      ti.push_back(row), tj.push_back(w), tv.push_back(model.qr_val[k]);
+      const auto [it, fresh] = lifted_of.try_emplace(row, lifted.size());
+      if (fresh) lifted.push_back({row, {}});
+      lifted[it->second].terms.push_back({w - n, model.qr_val[k]});
+    }
+    L.qr_row = std::move(qr), L.qr_i = std::move(qi), L.qr_j = std::move(qj), L.qr_val = std::move(qv);
+  }
+  if (obj_bad) {
+    for (size_t k = 0; k < model.q_val.size(); ++k) {
+      if (model.q_val[k] == 0.0) continue;
+      const Index w = product(model.q_row[k], model.q_col[k]);
+      L.obj[w] += (model.q_row[k] == model.q_col[k] ? 0.5 : 1.0) * model.q_val[k];
+    }
+    L.q_row.clear(), L.q_col.clear(), L.q_val.clear();
+  }
+  // The bounds found (valid for every feasible point), as the McCormick rows use them.
+  for (Index j = 0; j < n; ++j) L.col_lb[j] = lo[j], L.col_ub[j] = hi[j];
+  {
+    std::vector<Index> J, I;
+    std::vector<double> V;
+    for (Index j = 0; j < n; ++j) {
+      for (Index k = model.A.begin(j); k < model.A.end(j); ++k) J.push_back(j), I.push_back(model.A.index[k]), V.push_back(model.A.value[k]);
+    }
+    J.insert(J.end(), tj.begin(), tj.end());
+    I.insert(I.end(), ti.begin(), ti.end());
+    V.insert(V.end(), tv.begin(), tv.end());
+    L.A = SparseMatrix::from_triplets(L.num_cols(), rows_now, J, I, V);
+  }
+  size_t squares = 0;
+  for (const Bilinear& b : terms) squares += b.x == b.y;
+  log.log(1, "Nonconvex quadratic model: spatial branch-and-bound on %zu products (%zu squares) of %s%zu rows\n",
+          terms.size(), squares, obj_bad ? "the objective and " : "",
+          static_cast<size_t>(std::count(bad.begin(), bad.end(), 1)));
+  if (open_factors > 0) {
+    log.log(1, "  %zu products have a factor without finite bounds: no McCormick rows there until branching bounds it\n",
+            open_factors);
+  }
+  std::vector<double> st;
+  if (static_cast<Index>(start.size()) == n) {
+    st = start;
+    for (const Bilinear& b : terms) st.push_back(start[b.x] * start[b.y]);
+  }
+  SolveResult r = solve_oa_core(L, params, st, timer, log, tracer, &terms, &lifted);
+  if (r.has_solution) {
+    r.x.resize(static_cast<size_t>(n));
+    r.objective = model.objective_value(r.x);
+    // The model as given, with its products computed from the factors: each row relative to the size of its terms.
+    const std::vector<double> act = model.row_activity(r.x);
+    std::vector<double> scale(static_cast<size_t>(m), 1.0);
+    for (size_t k = 0; k < model.qr_val.size(); ++k) {
+      double& sc = scale[model.qr_row[k]];
+      sc = std::max(sc, std::abs(model.qr_val[k] * r.x[model.qr_i[k]] * r.x[model.qr_j[k]]));
+    }
+    double worst = 0.0;
+    for (Index i = 0; i < m; ++i) {
+      const double v = std::max((model.row_lb[i] - act[i]) / scale[i], (act[i] - model.row_ub[i]) / scale[i]);
+      worst = v <= worst ? worst : std::isnan(v) ? kInf : v;
+    }
+    for (const double v : r.x) {
+      if (!std::isfinite(v)) worst = kInf;
+    }
+    if (!(worst <= 1.5e-6) || !std::isfinite(r.objective)) {
+      // The products' tolerances added up in some row: no answer rather than a wrong one.
+      log.log(1, "ERROR: the solution violates a row of the model by %.2e (relative to the row's terms); discarded\n", worst);
+      r.has_solution = false;
+      r.x.clear();
+      r.status = Status::NumericalError;
+    }
+  }
   return r;
 }
 
@@ -1791,7 +2167,7 @@ SolveResult solve_quadratic(const Model& model, const SolverParams& params, cons
   if (!cv.convex) {
     std::string msg = cv.message;
     if (model.sense == ObjSense::Maximize) msg += " (maximization needs a concave objective)";
-    log.log(1, "ERROR: %s\n", msg.c_str());
+    log_nonconvex(log, msg);
     r.status = Status::NonConvex;
     r.stats.time = timer.elapsed();
     return r;
@@ -1954,7 +2330,21 @@ SolveResult solve_model(const Model& model, const SolverParams& params, const st
                         IncumbentReporter* reporter, IncumbentTracer* tracer) {
   Timer timer;
   Logger log(params.verbosity);
-  // Quadratic constraints: outer approximation in the MILP search (solve_oa).
+  // Quadratic constraints: outer approximation in the MILP search (solve_oa). A model these routes find not convex
+  // goes on to spatial branch-and-bound (solve_spatial).
+  if ((model.has_quadratic_rows() || model.has_quadratic()) && !model.has_logical()) {
+    const char* sp = std::getenv("MILP_SPATIAL");
+    const bool spatial = !(sp && *sp == '0');
+    t_spatial_next = spatial;
+    SolveResult r = model.has_quadratic_rows() ? solve_oa(model, params, start, timer, log, tracer)
+                                               : solve_quadratic(model, params, start, timer, log, tracer);
+    t_spatial_next = false;
+    if (r.status != Status::NonConvex || !spatial) return r;
+    std::string why;
+    if (auto rs = solve_spatial(model, params, start, timer, log, tracer, why)) return *rs;
+    log.log(1, "ERROR: the model is not convex, and spatial branch-and-bound does not apply: %s\n", why.c_str());
+    return r;
+  }
   if (model.has_quadratic_rows()) return solve_oa(model, params, start, timer, log, tracer);
   if (model.has_quadratic()) {
     if (!model.has_logical()) return solve_quadratic(model, params, start, timer, log, tracer);

@@ -523,8 +523,9 @@ static void test_quadratic(void) {
     const int r = 1, c = 1;
     const double v = -5.0;
     CHECK_OK(popso_add_q_entries(m, 1, &r, &c, &v));
+    /* Not convex any more: solved by spatial branch-and-bound since v0.10 (no NONCONVEX status). */
     CHECK_OK(popso_solve(m));
-    CHECK(popso_get_status(m) == POPSO_STATUS_NONCONVEX);
+    CHECK(popso_get_status(m) != POPSO_STATUS_NONCONVEX);
     CHECK(strcmp(popso_status_string(POPSO_STATUS_NONCONVEX), "NONCONVEX") == 0);
     const int bad = 7;
     CHECK(popso_add_q_entries(m, 1, &bad, &c, &v) == POPSO_ERROR_INVALID_ARGUMENT);
@@ -589,10 +590,10 @@ static void test_quadratic_rows(void) {
   CHECK_OK(popso_get_solution(m, x_sol, 2));
   CHECK_NEAR(x_sol[0], 2.0);
   CHECK_NEAR(x_sol[1], 1.0);
-  /* A lower side on a convex row is not convex. */
+  /* A lower side on a convex row is not convex: spatial branch-and-bound since v0.10 (no NONCONVEX status). */
   CHECK_OK(popso_set_row_bounds(m, row, 1.0, POPSO_INFINITY));
   CHECK_OK(popso_solve(m));
-  CHECK(popso_get_status(m) == POPSO_STATUS_NONCONVEX);
+  CHECK(popso_get_status(m) != POPSO_STATUS_NONCONVEX);
   n = popso_num_qrow_terms(NULL, 0);
   CHECK(n == -1);
   popso_free(m);

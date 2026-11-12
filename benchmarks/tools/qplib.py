@@ -121,7 +121,11 @@ def main(argv=None):
     ap.add_argument("--classes", help="comma list of problem classes to keep (e.g. LCD,LMC,LMD,DML); default all convex")
     ap.add_argument("--max-nz", type=int, default=2_000_000, help="skip instances with more nonzeros")
     ap.add_argument("--binary", action="store_true", help="the nonconvex instances over binaries instead of the convex ones")
-    ap.add_argument("--set", help="set file to write ('' = none; default sets/qplib_convex.txt or qplib_binary.txt)")
+    ap.add_argument("--nonconvex", action="store_true",
+                    help="the nonconvex instances with continuous or general integer variables (spatial branch-and-bound, v0.10) "
+                         "into sets/qplib_nonconvex.txt")
+    ap.add_argument("--set", help="set file to write ('' = none; default sets/qplib_convex.txt, qplib_binary.txt or "
+                                  "qplib_nonconvex.txt)")
     ap.add_argument("names", nargs="*", help="only these instances (QPLIB_nnnn)")
     args = ap.parse_args(argv)
 
@@ -131,11 +135,15 @@ def main(argv=None):
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     keep = set(args.classes.split(",")) if args.classes else None
     wanted = (lambda d: not d["cvx"] and d["cls"][1] == "B") if args.binary else (lambda d: d["cvx"])
+    if args.nonconvex:
+        wanted = lambda d: not d["cvx"] and d["cls"][1] != "B"  # noqa: E731
     if args.set is None:
-        args.set = str(BENCH / "sets" / ("qplib_binary.txt" if args.binary else "qplib_convex.txt"))
+        args.set = str(BENCH / "sets" / ("qplib_nonconvex.txt" if args.nonconvex else
+                                         "qplib_binary.txt" if args.binary else "qplib_convex.txt"))
     todo = [d for d in index() if wanted(d) and (keep is None or d["cls"] in keep) and d["nz"] <= args.max_nz
             and (not args.names or d["name"] in args.names)]
-    print(f"{len(todo)} {'nonconvex binary' if args.binary else 'convex'} instances selected", flush=True)
+    print(f"{len(todo)} {'nonconvex' if args.nonconvex else 'nonconvex binary' if args.binary else 'convex'} instances selected",
+          flush=True)
     with tempfile.TemporaryDirectory() as tmp:
         for d in todo:
             name = d["name"]
@@ -153,7 +161,8 @@ def main(argv=None):
                   f" {res.get('sol_error', '')}", flush=True)
     if args.set:
         rel = Path(args.out).resolve()
-        kind = "nonconvex instances over binaries" if args.binary else "convex instances"
+        kind = ("nonconvex instances with continuous or general integer variables" if args.nonconvex else
+                "nonconvex instances over binaries" if args.binary else "convex instances")
         lines = [f"# QPLIB {kind} (benchmarks/tools/qplib.py); class: objective / variables / constraints"]
         for name, r in sorted(meta.items()):
             if r.get("ok") and r.get("check") is not False and wanted(r):
