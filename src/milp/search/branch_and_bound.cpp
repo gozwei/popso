@@ -4392,7 +4392,9 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
           // The point with every product recomputed from its factors: feasible where the products only enter
           // rows with slack (or the objective).
           std::vector<double> y(lp.x(), lp.x() + p_.num_cols());
-          for (const Bilinear& b : p_.bilinear) y[b.w] = y[b.x] * y[b.y];
+          for (const Bilinear& b : p_.bilinear) {
+            y[b.w] = (b.x_int ? std::round(y[b.x]) : y[b.x]) * (b.y_int ? std::round(y[b.y]) : y[b.y]);
+          }
           if (try_incumbent(w, y, "products")) opt.objective_cutoff = std::min(opt.objective_cutoff, cutoff(w));
         }
         // With the tangents of the same round: a quadratic row that stays violated must not keep the node's

@@ -66,6 +66,9 @@ struct QuadRow {
 // LP and branches on x or y (continuous columns too) where an LP point still violates the product.
 struct Bilinear {
   Index w = -1, x = -1, y = -1;
+  // An integer factor counts at its rounded value: a binary at 1e-8 (integral within the tolerance) times a factor
+  // at 5e8 is 0, not 5, and a point that needs the 5 in some row is no solution.
+  bool x_int = false, y_int = false;
   // |w - x y| relative to max(1, |x y|).
   double violation(const double* v) const;
 };

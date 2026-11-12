@@ -87,3 +87,41 @@ TEST(spatial_infeasible_and_unbounded_factors) {
     }
   }
 }
+
+// Products with a general integer factor of small range go through the integer's binary expansion and the exact
+// linearization (solve_spatial); bounds that only the linear rows give count.
+TEST(spatial_integer_expansion) {
+  for (const bool det : {false, true}) {
+    // max x y with x + y <= 7, both integer and nonnegative (upper bounds from the row): 12 at (3, 4) or (4, 3).
+    const SolveResult a = solve_text("max\n obj: [ 2 x * y ] / 2\nst\n c1: x + y <= 7\nbounds\n x >= 0\n y >= 0\ngeneral\n x y\nend\n", det);
+    CHECK(a.status == Status::Optimal);
+    CHECK_NEAR(a.objective, 12.0, 1e-6);
+    // A concave square of an integer with a negative lower bound: min -x^2 + 3 x on [-3, 5]: -18 at x = -3.
+    const SolveResult b = solve_text("min\n obj: 3 x + [ - 2 x ^2 ] / 2\nst\n c1: x + y >= -10\nbounds\n -3 <= x <= 5\n 0 <= y <= 1\ngeneral\n x\nend\n", det);
+    CHECK(b.status == Status::Optimal);
+    CHECK_NEAR(b.objective, -18.0, 1e-6);
+    CHECK_NEAR(b.x[0], -3.0, 1e-9);
+    // A continuous column times an integer in a nonconvex row: z x >= 7, z in [0, 2.5], x integer in [2, 6]:
+    // min z + x = 2.333.. + 3 at x = 3 (x = 2: infeasible, z would be 3.5; x = 4: 1.75 + 4).
+    const SolveResult c = solve_text("min\n obj: z + x\nst\n c1: [ z * x ] >= 7\nbounds\n 0 <= z <= 2.5\n 2 <= x <= 6\ngeneral\n x\nend\n", det);
+    CHECK(c.status == Status::Optimal);
+    CHECK_NEAR(c.objective, 3.0 + 7.0 / 3.0, 1e-5);
+  }
+}
+
+// A binary that is integral only within the tolerance (1e-8) times a free factor at 5e8 gave a product of 6 where
+// the binary's value 0 gives none: the point was returned as a solution (objective 2.9e17, the optimum is 63).
+// Products are judged with their integer factors rounded.
+TEST(spatial_integer_factor_times_huge_value) {
+  SolverParams p;
+  p.verbosity = 0;
+  p.threads = 1;
+  p.mip_rel_gap = 1e-6;
+  p.time_limit = 5.0;
+  const SolveResult r = solve(read_lp_string(
+      "max\n obj: x0 - 4 x1 + 5 x2 + 3 x3 + [ 2 x1 ^2 - 4 x0 * x2 - 4 x3 ^2 + 4 x2 * x3 ] / 2\nst\n"
+      " q0: x2 - 3 x3 + [ 2 x1 * x3 + x0 * x3 + 3 x2 ^2 - 2 x0 ^2 ] = 11\n l0: 4 x0 - 2 x1 - 2 x2 <= 2\n"
+      " l1: - 4 x0 - x1 - x2 + 3 x3 <= 4\n l2: 3 x0 - x1 - 2 x2 + 3 x3 <= 19\nbounds\n 1 <= x0 <= 2\n x1 free\n"
+      "binary\n x2 x3\nend\n"), p);
+  CHECK(!r.has_solution || r.objective <= 63.0 + 1e-3);
+}

@@ -146,7 +146,7 @@ double MipProblem::objective(const std::vector<double>& x) const {
 }
 
 double Bilinear::violation(const double* v) const {
-  const double prod = v[x] * v[y];
+  const double prod = (x_int ? std::round(v[x]) : v[x]) * (y_int ? std::round(v[y]) : v[y]);
   const double r = std::abs(v[w] - prod) / std::max(1.0, std::abs(prod));
   // A product that overflows (factors around 1e154 and beyond, from a relaxation without bounds) gives inf / inf:
   // never a satisfied product (std::max would skip the NaN, and such a point was once reported OPTIMAL at 1.8e308).

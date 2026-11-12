@@ -1348,7 +1348,10 @@ SolveResult solve_oa_core(const Model& model, const SolverParams& params_in, con
     if (added > 0) log.log(1, "Cones switched by binaries: %zu implications (binary 0: member 0)\n", added);
   }
   p.quad_rows = std::move(rows);
-  if (products) p.bilinear = *products;  // spatial branching (solve_spatial)
+  if (products) {  // spatial branching (solve_spatial)
+    p.bilinear = *products;
+    for (Bilinear& b : p.bilinear) b.x_int = p.is_int[b.x] != 0, b.y_int = p.is_int[b.y] != 0;
+  }
   if (lifted) {
     // The model's row indices become the search's: the quadratic rows left the linear part.
     std::vector<Index> pos(static_cast<size_t>(m), -1);
@@ -1721,6 +1724,37 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     why = "nothing nonconvex";
     return std::nullopt;
   }
+  // A solution against the model as given: no answer rather than a wrong one.
+  auto verify = [&](SolveResult& r) {
+    // The model as given, with its products computed from the factors: each row relative to the size of its terms.
+    // Integer columns are set to their rounded values first (integral within the tolerance is not enough when the
+    // other factor of a product is huge).
+    for (Index j = 0; j < n; ++j) {
+      if (model.col_type[j] != VarType::Continuous) r.x[j] = std::round(r.x[j]);
+    }
+    r.objective = model.objective_value(r.x);
+    const std::vector<double> act = model.row_activity(r.x);
+    std::vector<double> scale(static_cast<size_t>(m), 1.0);
+    for (size_t k = 0; k < model.qr_val.size(); ++k) {
+      double& sc = scale[model.qr_row[k]];
+      sc = std::max(sc, std::abs(model.qr_val[k] * r.x[model.qr_i[k]] * r.x[model.qr_j[k]]));
+    }
+    double worst = 0.0;
+    for (Index i = 0; i < m; ++i) {
+      const double v = std::max((model.row_lb[i] - act[i]) / scale[i], (act[i] - model.row_ub[i]) / scale[i]);
+      worst = v <= worst ? worst : std::isnan(v) ? kInf : v;
+    }
+    for (const double v : r.x) {
+      if (!std::isfinite(v)) worst = kInf;
+    }
+    if (!(worst <= 1.5e-6) || !std::isfinite(r.objective)) {
+      // The products' tolerances added up in some row: no answer rather than a wrong one.
+      log.log(1, "ERROR: the solution violates a row of the model by %.2e (relative to the row's terms); discarded\n", worst);
+      r.has_solution = false;
+      r.x.clear();
+      r.status = Status::NumericalError;
+    }
+  };
   // Bounds of the factors: the columns' own, tightened by the linear rows.
   std::vector<double> lo = model.col_lb, hi = model.col_ub;
   {
@@ -1789,6 +1823,136 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
     }
   }
   quad_row_bounds(model, lo, hi);
+  // With the bounds found, every nonconvex product may have a binary factor and a bounded other one: then the
+  // products are linearized exactly and the model is a MILP (or a convex model) for the usual routes, with their
+  // presolve and cuts. A general integer factor with a small range counts after its binary expansion
+  // (x = l + sum c_k b_k, so z x = l z + sum c_k z b_k; QPLIB_3496: continuous columns, bounded only by linear
+  // rows, times integers in [0, 4]). MILP_SPATIAL_LINEARIZE=0: off.
+  {
+    static const bool kOn = [] { const char* e = std::getenv("MILP_SPATIAL_LINEARIZE"); return !(e && e[0] == '0'); }();
+    Model T = model;
+    T.col_lb = lo, T.col_ub = hi;
+    const BinaryProducts bp{T, true};
+    auto bounded = [&](Index j) { return is_finite(lo[j]) && is_finite(hi[j]); };
+    auto int_lo = [&](Index j) { return std::ceil(lo[j] - 1e-9); };
+    auto range = [&](Index j) {  // of an integer column that can be expanded, else -1
+      if (T.col_type[j] == VarType::Continuous || !bounded(j) || bp.binary(j) || bp.fixed(j)) return -1.0;
+      const double r = std::floor(hi[j] + 1e-9) - int_lo(j);
+      return r >= 1.0 && r <= 255.0 ? r : -1.0;
+    };
+    std::vector<char> expand(static_cast<size_t>(n), 0);
+    bool all = kOn;
+    size_t open_terms = 0;
+    auto visit = [&](Index i, Index j) {
+      if (!all || bp.linearizable(i, j)) return;
+      ++open_terms;
+      if (expand[i] || expand[j]) return;
+      const double ri = bounded(j) ? range(i) : -1.0, rj = bounded(i) ? range(j) : -1.0;
+      if (ri < 0.0 && rj < 0.0) all = false;
+      else expand[(rj < 0.0 || (ri >= 0.0 && ri < rj)) ? i : j] = 1;
+    };
+    for (size_t k = 0; k < model.qr_val.size(); ++k) {
+      if (model.qr_val[k] != 0.0 && bad[model.qr_row[k]]) visit(model.qr_i[k], model.qr_j[k]);
+    }
+    if (obj_bad) {
+      for (size_t k = 0; k < model.q_val.size(); ++k) {
+        if (model.q_val[k] != 0.0) visit(model.q_row[k], model.q_col[k]);
+      }
+    }
+    const bool expanding = all && std::find(expand.begin(), expand.end(), 1) != expand.end();
+    if (all && !expanding && lo == model.col_lb && hi == model.col_ub) all = false;  // nothing new: the routes had it
+    if (std::getenv("MILP_SPATIAL_DEBUG")) {
+      std::fprintf(stderr, "spatial linearize: %zu terms without a binary factor, expansion %d, applies %d\n", open_terms,
+                   static_cast<int>(expanding), static_cast<int>(all));
+    }
+    if (all && expanding) {
+      // The expansion columns and their defining rows; the terms of the nonconvex rows (and objective) rewritten.
+      std::vector<Index> J, I;
+      std::vector<double> V;
+      for (Index j = 0; j < n; ++j) {
+        for (Index k = T.A.begin(j); k < T.A.end(j); ++k) J.push_back(j), I.push_back(T.A.index[k]), V.push_back(T.A.value[k]);
+      }
+      std::vector<std::vector<std::pair<Index, double>>> bits(static_cast<size_t>(n));  // (column, coefficient)
+      Index col = n, row = m;
+      for (Index j = 0; j < n; ++j) {
+        if (!expand[j]) continue;
+        const double l = int_lo(j), r = range(j);
+        T.col_lb[j] = l, T.col_ub[j] = l + r;
+        T.row_names.push_back("_bx" + std::to_string(j));
+        T.row_lb.push_back(l), T.row_ub.push_back(l);
+        J.push_back(j), I.push_back(row), V.push_back(1.0);
+        double sum = 0.0;
+        for (double c = 1.0; sum < r; c *= 2.0) {
+          const double ck = std::min(c, r - sum);
+          sum += ck;
+          bits[j].emplace_back(col, ck);
+          T.col_names.push_back("_b" + std::to_string(j) + "_" + std::to_string(bits[j].size()));
+          T.obj.push_back(0.0);
+          T.col_lb.push_back(0.0), T.col_ub.push_back(1.0);
+          T.col_type.push_back(VarType::Integer);
+          J.push_back(col), I.push_back(row), V.push_back(-ck);
+          ++col;
+        }
+        ++row;
+      }
+      std::vector<Index> qr, qi, qj;
+      std::vector<double> qv;
+      for (size_t k = 0; k < T.qr_val.size(); ++k) {
+        const Index r = T.qr_row[k], i = T.qr_i[k], j = T.qr_j[k];
+        const double c = T.qr_val[k];
+        if (c == 0.0) continue;
+        if (!bad[r] || (!expand[i] && !expand[j]) || bp.linearizable(i, j)) {
+          qr.push_back(r), qi.push_back(i), qj.push_back(j), qv.push_back(c);
+          continue;
+        }
+        const Index e = expand[j] ? j : i, o = expand[j] ? i : j;  // c x_o x_e = c l x_o + sum c c_k x_o b_k
+        J.push_back(o), I.push_back(r), V.push_back(c * T.col_lb[e]);
+        for (const auto& [bcol, ck] : bits[e]) qr.push_back(r), qi.push_back(bcol), qj.push_back(o), qv.push_back(c * ck);
+      }
+      T.qr_row.swap(qr), T.qr_i.swap(qi), T.qr_j.swap(qj), T.qr_val.swap(qv);
+      if (obj_bad) {
+        // 1/2 Q_jj x_j^2 and Q_ij x_i x_j (i > j).
+        std::vector<Index> r2, c2;
+        std::vector<double> v2;
+        for (size_t k = 0; k < T.q_val.size(); ++k) {
+          const Index i = T.q_row[k], j = T.q_col[k];
+          if (T.q_val[k] == 0.0) continue;
+          if ((!expand[i] && !expand[j]) || bp.linearizable(i, j)) {
+            r2.push_back(i), c2.push_back(j), v2.push_back(T.q_val[k]);
+            continue;
+          }
+          const double c = i == j ? 0.5 * T.q_val[k] : T.q_val[k];
+          const Index e = expand[j] ? j : i, o = expand[j] ? i : j;
+          T.obj[o] += c * T.col_lb[e];
+          for (const auto& [bcol, ck] : bits[e]) r2.push_back(bcol), c2.push_back(o), v2.push_back(c * ck);
+        }
+        T.q_row.swap(r2), T.q_col.swap(c2), T.q_val.swap(v2);
+      }
+      T.A = SparseMatrix::from_triplets(col, row, J, I, V);
+    }
+    if (all) {
+      log.log(1, "  with the implied bounds every nonconvex product has a binary factor%s: linearized\n",
+              expanding ? " (small integers by their binary expansion)" : "");
+      t_spatial_next = true;  // a row left nonconvex is no error here: the lifting below takes the model
+      const std::vector<double> none;
+      const std::vector<double>& st = expanding ? none : start;
+      SolveResult r = T.has_quadratic_rows() ? solve_oa(T, params, st, timer, log, tracer)
+                                             : solve_quadratic(T, params, st, timer, log, tracer);
+      t_spatial_next = false;
+      if (r.status != Status::NonConvex) {
+        if (r.has_solution) {
+          r.x.resize(static_cast<size_t>(n));
+          r.objective = model.objective_value(r.x);
+          verify(r);
+        }
+        if (r.has_duals) {
+          r.row_dual.resize(static_cast<size_t>(m));
+          r.reduced_cost.resize(static_cast<size_t>(n));
+        }
+        return r;
+      }
+    }
+  }
   Model L = model;
   std::vector<Bilinear> terms;
   std::vector<MipProblem::LiftedRow> lifted;
@@ -1913,28 +2077,7 @@ std::optional<SolveResult> solve_spatial(const Model& model, const SolverParams&
   if (r.has_solution) {
     r.x.resize(static_cast<size_t>(n));
     r.objective = model.objective_value(r.x);
-    // The model as given, with its products computed from the factors: each row relative to the size of its terms.
-    const std::vector<double> act = model.row_activity(r.x);
-    std::vector<double> scale(static_cast<size_t>(m), 1.0);
-    for (size_t k = 0; k < model.qr_val.size(); ++k) {
-      double& sc = scale[model.qr_row[k]];
-      sc = std::max(sc, std::abs(model.qr_val[k] * r.x[model.qr_i[k]] * r.x[model.qr_j[k]]));
-    }
-    double worst = 0.0;
-    for (Index i = 0; i < m; ++i) {
-      const double v = std::max((model.row_lb[i] - act[i]) / scale[i], (act[i] - model.row_ub[i]) / scale[i]);
-      worst = v <= worst ? worst : std::isnan(v) ? kInf : v;
-    }
-    for (const double v : r.x) {
-      if (!std::isfinite(v)) worst = kInf;
-    }
-    if (!(worst <= 1.5e-6) || !std::isfinite(r.objective)) {
-      // The products' tolerances added up in some row: no answer rather than a wrong one.
-      log.log(1, "ERROR: the solution violates a row of the model by %.2e (relative to the row's terms); discarded\n", worst);
-      r.has_solution = false;
-      r.x.clear();
-      r.status = Status::NumericalError;
-    }
+    verify(r);
   }
   return r;
 }

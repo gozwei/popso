@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.1 — 2026-11
+
+- **Fix (wrong answer in v0.10.0):** in spatial branch-and-bound a product with an integer factor was judged at
+  the factor's LP value. A binary at 1e-8 (integral within the tolerance) times an unbounded factor at 5e8 then
+  counted as a product of about 5, and such a point could be returned as a solution although no point with the
+  binary at 0 satisfies the row (found by the fuzz test: an incumbent of 2.9e17 on a model whose optimum is 63).
+  Integer factors now count at their rounded values, in the search and in the final check of the solution.
+- Nonconvex models whose products all have a binary factor once the factors' implied bounds are known (bounds from
+  the linear rows, not only the columns' own) are linearized exactly and solved as MILPs. A general integer factor
+  with a range of at most 255 counts through its binary expansion (`x = l + sum c_k b_k`, so
+  `z x = l z + sum c_k z b_k`). `MILP_SPATIAL_LINEARIZE=0` turns it off.
+
 ## v0.10.0 — 2026-11
 
 - **Nonconvex quadratic models** are solved by spatial branch-and-bound instead of ending with the status

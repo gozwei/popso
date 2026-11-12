@@ -1937,6 +1937,11 @@ double DualSimplex::farkas_bound(const std::vector<double>& y, double tau) const
   return lagrangian_safe(y, tau, false);
 }
 
+void DualSimplex::set_safe_strict(bool on) {
+  static const bool kOff = [] { const char* e = std::getenv("MILP_SAFE_STRICT"); return e && e[0] == '0'; }();
+  safe_strict_ = on && !kOff;
+}
+
 double DualSimplex::lagrangian_safe(const std::vector<double>& y, double tau, bool with_cost) const {
   // Rounding: every product and sum is in round-to-nearest; the error terms use eps = 2u (DBL_EPSILON),
   // twice the unit roundoff, which also covers the rounding of the error terms themselves. Scaling is by

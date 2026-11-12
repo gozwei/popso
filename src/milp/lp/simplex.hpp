@@ -121,7 +121,7 @@ class DualSimplex {
   // infinite on that side makes the safe bound -inf (unless it is at rounding level), instead of being charged at
   // the variable's current size. That charge is no proof: a product column near 2e8 with a reduced cost of -2e-8
   // gained 5e-3 by moving 0.1%, and the node's bound was above a feasible point (spatial branch-and-bound).
-  void set_safe_strict(bool on) { safe_strict_ = on; }
+  void set_safe_strict(bool on);
   double var_lower(Index j) const { return j < n_ ? lb_[j] : lb_[j] / rscale_[j - n_]; }
   double var_upper(Index j) const { return j < n_ ? ub_[j] : ub_[j] / rscale_[j - n_]; }
   double var_value(Index j) const { return j < n_ ? x_[j] : x_[j] / rscale_[j - n_]; }
