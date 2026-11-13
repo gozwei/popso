@@ -35,12 +35,20 @@ void permuted_rows(Index n, const std::vector<Index>& start, const std::vector<I
 // [r0, r1) with r >= (c rounded down to a multiple of 4): the lower part of X X^T (and a few entries
 // above the diagonal, which callers ignore). Blocks of 8 rows x 4 columns are accumulated in
 // registers.
-// Returns false if it stopped part-way (interrupt or deadline, only when interruptible): the
-// factorization is then discarded.
+// Returns false if it stopped part-way (the stop flag; interrupt or deadline, only when interruptible): the
+// factorization is then discarded. Checked about every 2e7 multiply-adds, not every so many columns: one
+// block of 4 columns costs 4 kw (r1 - c0), seconds on the dense supernodes of a large factor
+// (highschool1-aigio ran 8 s past a 40 s limit here, more than 60 s past 300 s on a loaded machine).
 bool syrk_lower(const double* X, size_t ld, Index kw, Index nc, Index r0, Index r1, double* T, size_t ldT,
-                const double* S, bool interruptible) {
+                const double* S, bool interruptible, const std::atomic<bool>* stop) {
+  double since_check = 0.0;
   for (Index c0 = 0; c0 < nc; c0 += 4) {
-    if (interruptible && (c0 & 63) == 0 && interrupted_or_expired()) return false;
+    if (since_check >= 2e7 || c0 == 0) {
+      since_check = 0.0;
+      if (stop && stop->load(std::memory_order_relaxed)) return false;
+      if (interruptible && interrupted_or_expired()) return false;
+    }
+    since_check += 4.0 * static_cast<double>(kw) * static_cast<double>(r1 - std::min(r1, std::max(r0, c0)));
     const Index cw = std::min<Index>(4, nc - c0);
     Index rb = std::max(r0, c0);
     if (cw == 4) {
@@ -103,16 +111,23 @@ SparseCholesky& SparseCholesky::operator=(SparseCholesky&&) noexcept = default;
 bool SparseCholesky::syrk_rows(const double* X, size_t ld, Index kw, Index nc, Index nr, double* T, size_t ldT,
                                const double* S) {
   const double work = static_cast<double>(kw) * nc * nr;
-  if (!pool_ || work < 4e5 || nr < 64) return syrk_lower(X, ld, kw, nc, 0, nr, T, ldT, S, interruptible);
+  if (!pool_ || work < 4e5 || nr < 64) return syrk_lower(X, ld, kw, nc, 0, nr, T, ldT, S, interruptible, stop);
   // Row chunks (multiples of 8 rows); the rows above the first columns cost less, so use more
   // chunks than threads.
   const Index chunks = std::min<Index>(4 * pool_->size(), nr / 32);
   const Index step = ((nr + chunks - 1) / chunks + 7) / 8 * 8;
   const int tasks = static_cast<int>((nr + step - 1) / step);
   std::atomic<bool> complete{true};
+  // The pool's threads see this thread's interrupt flags and deadline for the task (they are thread-local).
+  const detail::InterruptState caller = detail::t_interrupt;
   pool_->run(tasks, [&](int t) {
+    const detail::InterruptState saved = detail::t_interrupt;
+    detail::t_interrupt = caller;
     const Index r0 = static_cast<Index>(t) * step, r1 = std::min(nr, r0 + step);
-    if (!syrk_lower(X, ld, kw, nc, r0, r1, T, ldT, S, interruptible)) complete.store(false);
+    if (complete.load(std::memory_order_relaxed) && !syrk_lower(X, ld, kw, nc, r0, r1, T, ldT, S, interruptible, stop)) {
+      complete.store(false);
+    }
+    detail::t_interrupt = saved;
   });
   return complete.load();
 }

@@ -53,15 +53,16 @@ class Detector {
   void individualize(Index v);
   void undo_to(size_t mark);
   // First non-singleton cell of integer columns, else of continuous ones.
-  Index target() const {
-    Index cont = -1;
-    for (Index q = 0; q < n_; q = cend_[q]) {
-      if (cend_[q] - q <= 1) continue;
-      if (p_.is_int[lab_[q]]) return q;
-      if (cont < 0) cont = q;
-    }
-    return cont;
+  // Called on the first path only, where cells only split: a singleton stays one and a cell keeps its column
+  // type, so both scans resume where the last call stopped (from 0 each time it was a pass over all cells per
+  // level: supportcase12 without presolve, 800k columns, 26 s that no budget counted).
+  Index target() {
+    while (tgt_int_ < n_ && (cend_[tgt_int_] - tgt_int_ <= 1 || !p_.is_int[lab_[tgt_int_]])) tgt_int_ = cend_[tgt_int_];
+    if (tgt_int_ < n_) return tgt_int_;
+    while (tgt_cont_ < n_ && cend_[tgt_cont_] - tgt_cont_ <= 1) tgt_cont_ = cend_[tgt_cont_];
+    return tgt_cont_ < n_ ? tgt_cont_ : -1;
   }
+  Index tgt_int_ = 0, tgt_cont_ = 0;
   void enqueue(Index s) {
     if (!inq_[s]) {
       inq_[s] = 1;
@@ -95,6 +96,7 @@ class Detector {
   std::vector<char> ctouch_, inq_;
   long long work_ = 0, work_limit_ = 0, try_nodes_ = 0;
   bool aborted_ = false;
+  long long next_clock_ = 0;  // work_ at the next look at the clock
   std::vector<Level> levels_;
   std::vector<Index> leaf_, gc_, gr_, uf_, failed_;
   std::vector<double> rowv_;
@@ -263,7 +265,13 @@ uint64_t Detector::refine() {
     for (Index c : tc_) ctouch_[c] = 0;
     tv_.clear();
     tc_.clear();
-    if (work_ > work_limit_ || ((qh & 127) == 0 && (timer_.elapsed() > o_.time_limit || interrupted()))) aborted_ = true;
+    // The clock by work, not by cells: a few huge cells are few queue entries (supportcase12 without presolve,
+    // 800k columns: 27 s at a 1 s cap, past the solve's time limit).
+    if (work_ > work_limit_) aborted_ = true;
+    if (work_ >= next_clock_) {
+      next_clock_ = work_ + 1000000;
+      if (timer_.elapsed() > o_.time_limit || interrupted()) aborted_ = true;
+    }
   }
   queue_.clear();
   return mix64(tr + static_cast<uint64_t>(cells_));

@@ -38,6 +38,7 @@ class Crossover {
             const std::atomic<bool>* stop);
 
  private:
+  const std::atomic<bool>* stop_ = nullptr;  // run()'s flag, for the LU factorizations
   void column(Index k, HVector& v) const {
     v.clear();
     if (k < n_) {
@@ -88,6 +89,7 @@ Index Crossover::factorize() {
   col_.clear();
   std::vector<std::pair<Index, Index>> replaced;
   lu_.interruptible = true;
+  lu_.stop = stop_;
   lu_.factorize(m_, start, index, value, &replaced);
   if (lu_.aborted()) throw CrossoverAborted{};
   for (auto [p, row] : replaced) {
@@ -125,6 +127,7 @@ void Crossover::compute_basic_values() {
 
 Basis Crossover::run(const std::vector<double>& x, const std::vector<double>& y_in, CrossoverStats* st,
                      const std::atomic<bool>* stop) {
+  stop_ = stop;
   const Index N = n_ + m_;
   // No duals given (a primal point only): rank by the costs, no dual push.
   const bool have_y = !y_in.empty();
@@ -504,6 +507,10 @@ LpStatus barrier_solve(DualSimplex& lp, const SparseMatrix& A, const std::vector
       default: return LpStatus::NumericalError;
     }
   }
+  // The time limit as this thread's deadline for the crossover too (the barrier's own scope has ended): its LU
+  // factorizations poll it. highschool1-aigio on the server: at the 300 s limit the crossover was inside one
+  // factorization of the 49800-row basis, which saw neither the limit nor the stop flag (killed at 360 s).
+  DeadlineScope crossover_deadline(opt.time_limit - timer.elapsed());
   const Basis b = crossover(A, cost, col_lb, col_ub, row_lb, row_ub, s.ipm.x, s.ipm.y, &s.crossover, opt.stop);
   if ((opt.stop && opt.stop->load()) || interrupted_or_expired() || b.empty() ||
       (is_finite(opt.time_limit) && timer.elapsed() >= opt.time_limit)) {

@@ -71,6 +71,10 @@ bool DomainPropagator::propagate(std::vector<double>& lb, std::vector<double>& u
     int lv1[2] = {0, 0}, lv2[2] = {0, 0};
     Index lvj[2] = {-1, -1};
     bool uses_cont = false;  // a continuous bound tightened in this call enters the activities
+    // Largest |a_j| (u_j - l_j) over the row's columns (infinite with a one-sided column, whose missing bound
+    // the row may supply): no bound of the row can be tightened from a side whose slack is at least that (see
+    // the skip below).
+    double maxspan = 0.0;
     auto note_level = [&](int side, Index j, int lv) {
       if (lv > lv1[side]) lv2[side] = lv1[side], lv1[side] = lv, lvj[side] = j;
       else if (lv > lv2[side]) lv2[side] = lv;
@@ -78,20 +82,39 @@ bool DomainPropagator::propagate(std::vector<double>& lb, std::vector<double>& u
     for (Index k = rb; k < re; ++k) {
       const Index j = rows_.index[k];
       const double a = rows_.value[k];
-      const double l = lb[j] < -kBigBound ? -kInf : lb[j], u = ub[j] > kBigBound ? kInf : ub[j];
-      if (a > 0) {
-        if (is_finite(l)) minact += a * l; else ++mininf;
-        if (is_finite(u)) maxact += a * u; else ++maxinf;
+      const double lj = lb[j], uj = ub[j];
+      if (std::abs(lj) <= kBigBound && std::abs(uj) <= kBigBound) {
+        // Both bounds finite (nearly every entry): the same sums as below without the tests.
+        const double al = a * lj, au = a * uj;
+        if (a > 0) minact += al, maxact += au;
+        else minact += au, maxact += al;
+        maxspan = std::max(maxspan, std::abs(a) * (uj - lj));
       } else {
-        if (is_finite(u)) minact += a * u; else ++mininf;
-        if (is_finite(l)) maxact += a * l; else ++maxinf;
-      }
-      if (trail) {
-        note_level(0, j, trail->bound_level(j, a < 0));
-        note_level(1, j, trail->bound_level(j, a > 0));
+        const double l = lj < -kBigBound ? -kInf : lj, u = uj > kBigBound ? kInf : uj;
+        if (a > 0) {
+          if (is_finite(l)) minact += a * l; else ++mininf;
+          if (is_finite(u)) maxact += a * u; else ++maxinf;
+        } else {
+          if (is_finite(u)) minact += a * u; else ++mininf;
+          if (is_finite(l)) maxact += a * l; else ++maxinf;
+        }
+        maxspan = is_finite(l) && is_finite(u) ? std::max(maxspan, std::abs(a) * (u - l)) : kInf;
       }
       if (continuous && cont_mark_[j]) uses_cont = true;
     }
+    // The levels are needed only once the row tightens a bound: computed then, before the first push of this
+    // visit (so from the same bounds as the activities above).
+    bool levels_ready = false;
+    auto ensure_levels = [&] {
+      if (levels_ready) return;
+      levels_ready = true;
+      for (Index k = rb; k < re; ++k) {
+        const Index j = rows_.index[k];
+        const double a = rows_.value[k];
+        note_level(0, j, trail->bound_level(j, a < 0));
+        note_level(1, j, trail->bound_level(j, a > 0));
+      }
+    };
     // Level of a bound of column j implied by this row: from the minimal
     // activity (row_ub side) or the maximal one (row_lb side) of the others.
     auto implied_level = [&](Index j, int side) { return lvj[side] == j ? lv2[side] : lv1[side]; };
@@ -104,6 +127,14 @@ bool DomainPropagator::propagate(std::vector<double>& lb, std::vector<double>& u
       feasible = false;
       break;
     }
+    // The row tightens nothing when, on each side, it is infinite, two or more columns are unbounded towards
+    // it (no residual activity is finite), or all are bounded and the side's slack covers the largest span: the
+    // loop below would then find new_ub >= u and new_lb <= l for every column (its tolerances only widen the
+    // implied bounds). Most visits of a dense row end here (mas74: 13 rows of 150 entries, the propagator took
+    // 30% of the tree's time).
+    const bool hi_idle = !is_finite(rhi) || mininf >= 2 || (mininf == 0 && maxspan <= rhi - minact);
+    const bool lo_idle = !is_finite(rlo) || maxinf >= 2 || (maxinf == 0 && maxspan <= maxact - rlo);
+    if (hi_idle && lo_idle) continue;
     // Tighten integer variables only (continuous tightening is left to the LP) unless `continuous`.
     for (Index k = rb; k < re && feasible; ++k) {
       const Index j = rows_.index[k];
@@ -142,6 +173,7 @@ bool DomainPropagator::propagate(std::vector<double>& lb, std::vector<double>& u
       }
       if (new_lb > new_ub + (is_int ? 0.0 : kFeasTol * (1.0 + std::abs(new_lb)))) {
         if (trail) {
+          ensure_levels();
           if (new_lb > lb[j]) trail->push(j, false, new_lb, BoundTrail::kRow, i, nullptr, implied_level(j, a > 0));
           if (new_ub < ub[j]) trail->push(j, true, new_ub, BoundTrail::kRow, i, nullptr, implied_level(j, a < 0));
           trail->fail_crossing(j);
@@ -162,6 +194,7 @@ bool DomainPropagator::propagate(std::vector<double>& lb, std::vector<double>& u
       }
       if (new_lb > lb[j] || new_ub < ub[j]) {
         if (trail) {
+          ensure_levels();
           // With a > 0: x >= from the maximal activity, x <= from the minimal one (the reverse if a < 0).
           if (new_lb > lb[j]) trail->push(j, false, new_lb, BoundTrail::kRow, i, nullptr, implied_level(j, a > 0));
           if (new_ub < ub[j]) trail->push(j, true, new_ub, BoundTrail::kRow, i, nullptr, implied_level(j, a < 0));

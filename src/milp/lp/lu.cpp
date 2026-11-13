@@ -545,7 +545,7 @@ Index LuFactor::factorize(Index m, const std::vector<Index>& start, const std::v
       live_cols += !col_done[i] && K.clen[i] > 0;
     }
     for (Index step = tri_steps; step < m; ++step) {
-      if (interruptible && (step & 63) == 0 && interrupted_or_expired()) {
+      if ((step & 15) == 0 && ((stop && stop->load(std::memory_order_relaxed)) || (interruptible && interrupted_or_expired()))) {
         aborted_ = true;
         return 0;
       }

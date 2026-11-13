@@ -65,6 +65,7 @@ bool solve_sub_mip(const MipProblem& p, const std::vector<double>& lb, const std
   opts.stop_flag = limits.stop;
   opts.progress = limits.progress;
   opts.iteration_limit = limits.iteration_limit;
+  opts.work_limit = limits.work_limit;
   opts.solution_limit = limits.solution_limit;
   opts.check_resident = false;
   // The sub-MIP's root cut loop: MILP_SUB_CUT_ROUNDS = k (default -1: as the main search) at most k rounds
@@ -129,6 +130,7 @@ bool solve_sub_mip(const MipProblem& p, const std::vector<double>& lb, const std
     ++st->solves;
     st->exhausted = r.status == Status::Optimal || r.status == Status::Infeasible;
     st->lp_iterations += r.lp_iterations;
+    st->lp_work += r.lp_work;
     st->dive_iterations += r.dive_iterations;
     st->fp_iterations += r.fp_iterations;
     st->dive_wins += r.dive_wins;
@@ -180,6 +182,7 @@ bool rens(const MipProblem& p, const double* lp_x, double cutoff, const SubMipLi
     st.solves += local.solves;
     st.exhausted = local.exhausted;
     st.lp_iterations += local.lp_iterations;
+    st.lp_work += local.lp_work;
     st.dive_iterations += local.dive_iterations;
     st.fp_iterations += local.fp_iterations;
     st.dive_wins += local.dive_wins;
@@ -316,11 +319,16 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
   SubMipStats ss_total;
   // Shared budget (time; deterministic: LP iterations incl. the dives) of all attempts.
   auto used_iters = [&] { return st.dive_iterations + ss_total.lp_iterations; };
+  long long dive_work = 0;
+  auto used_work = [&] { return dive_work + ss_total.lp_work; };
+  // A work budget reaches the dives' LP solves as iterations at the root LP's work per iteration so far.
+  const long long work_per_iter = std::max<long long>(1, root.work() / std::max<long long>(1, root.iterations()));
   auto finish = [&](bool ok) {
     if (limits.stats) {
       SubMipStats& o = *limits.stats;
       o.solves += ss_total.solves;
       o.lp_iterations += ss_total.lp_iterations + st.dive_iterations;
+      o.lp_work += used_work();
       o.dive_iterations += ss_total.dive_iterations;
       o.fp_iterations += ss_total.fp_iterations;
       o.dive_wins += ss_total.dive_wins;
@@ -349,7 +357,9 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
     const int left = attempts - a;
     if (limits.time_limit - timer.elapsed() <= 0.0 || interrupted() || (limits.stop && limits.stop->load())) break;
     if (limits.iteration_limit >= 0 && used_iters() >= limits.iteration_limit) break;
+    if (limits.work_limit >= 0 && used_work() >= limits.work_limit) break;
     DualSimplex lp = root;
+    const long long work_start = lp.work();
     std::vector<double> lb(n), ub(n);
     for (Index j = 0; j < n; ++j) lb[j] = lp.col_lower(j), ub[j] = lp.col_upper(j);
     struct Saved {
@@ -380,7 +390,8 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
     // The dive may use up to half of this attempt's share of the budget.
     const long long dive_budget =
         limits.iteration_limit >= 0 ? std::max<long long>(1000, (limits.iteration_limit - used_iters()) / (2 * left))
-                                    : -1;
+        : limits.work_limit >= 0 ? std::max<long long>(1000, (limits.work_limit - used_work()) / (2 * left) / work_per_iter)
+                                 : -1;
     const double dive_time = (limits.time_limit - timer.elapsed()) / (2.0 * left);
     const double t_dive = timer.elapsed();
     Index fixed = count_fixed();
@@ -463,6 +474,7 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
       lp_ok = lp.solve(opt) == LpStatus::Optimal;
     }
     st.dive_iterations += lp.iterations() - it_start;
+    dive_work += lp.work() - work_start;
     fixed = count_fixed();
     const double achieved = static_cast<double>(fixed) / static_cast<double>(ints);
     if (fixed == 0 || fixed == ints) {
@@ -477,9 +489,11 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
     if (limits.iteration_limit >= 0) {
       lim.iteration_limit = std::max<long long>(1000, (limits.iteration_limit - used_iters()) / left);
     }
+    if (limits.work_limit >= 0) lim.work_limit = std::max<long long>(1000000, (limits.work_limit - used_work()) / left);
     const bool found = solve_sub_mip(p, lb, ub, cutoff, lim, sol);
     ss_total.solves += ss.solves;
     ss_total.lp_iterations += ss.lp_iterations;
+    ss_total.lp_work += ss.lp_work;
     ss_total.dive_iterations += ss.dive_iterations;
     ss_total.fp_iterations += ss.fp_iterations;
     ss_total.dive_wins += ss.dive_wins;

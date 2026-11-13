@@ -13,6 +13,7 @@
 // on compact row-wise storage with a column-wise index.
 // MILP_LU_STATS=1 prints per-factorization statistics to stderr.
 
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,9 @@ class LuFactor {
   // or the thread's deadline passes (core/interrupt.hpp), checked every 64 pivots: a large basis can take minutes
   // (crossover of a 49800-row root LP ran 3 minutes past the time limit). Only for callers that stop then.
   bool interruptible = false;
+  // factorize() also gives up once this is set (the concurrent root LP's flag: the thread that waits for the
+  // crossover has no other way to end a factorization in progress).
+  const std::atomic<bool>* stop = nullptr;
   bool aborted() const { return aborted_; }
 
   // In-place solves on dense vectors of size m.

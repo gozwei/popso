@@ -16,6 +16,7 @@ struct SubMipStats {
   int solves = 0;              // sub-MIPs actually solved (0: neighbourhood rejected)
   bool exhausted = false;      // last sub-MIP finished (optimal or infeasible): neighbourhood too small
   long long lp_iterations = 0, nodes = 0;
+  long long lp_work = 0;  // LP work of the sub-MIPs and of lp_rens's dives (DualSimplex::work() units, ~1 ns)
   long long dive_iterations = 0, fp_iterations = 0;  // of lp_iterations: the sub-MIPs' dives and pumps
   int dive_wins = 0, fp_runs = 0, fp_wins = 0;       // their new incumbents in the sub-MIPs; pumps run
   Index fixed = 0, ints = 0;  // integer variables fixed / total in the last sub-MIP
@@ -29,6 +30,9 @@ struct SubMipLimits {
   std::atomic<bool>* stop = nullptr;           // optional: abort when set (result: whatever was found)
   std::atomic<long long>* progress = nullptr;  // optional: LP iterations so far are added here
   long long iteration_limit = -1;  // LP iterations per sub-MIP solve (-1: none); deterministic, unlike time
+  // LP work per call (DualSimplex::work() units, ~1 ns each; -1: none): the deterministic counterpart of
+  // time_limit (lp_rens: shared by its dives and sub-MIPs).
+  long long work_limit = -1;
   int mem_limit_mb = 256;          // search memory cap of the sub-MIP
   int solution_limit = 0;          // stop after this many incumbents of the sub-MIP (0: none)
   // Fixing neighbourhoods searched before: the sub-MIP's integer bounds are hashed into *fingerprint, and

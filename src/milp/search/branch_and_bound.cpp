@@ -705,6 +705,7 @@ class Search : public BasisOwner {
     BoundTrail trail;  // bound changes of the current node with reasons (propagation conflict analysis)
     // Conflict propagation may use work proportional to the LP work of the worker.
     long long conf_work = 0, lp_work = 0, conf_calls = 0, conf_prunes = 0;
+    long long units_base = 0;  // lp.work() when the worker took its copy of the root LP
     long long clause_work = 0, clause_calls = 0, clause_hits = 0, prop_work = 0;  // clause propagation budget
     double cont_calls = 0.0, cont_useful = 0.0;  // node propagations with continuous bounds / useful ones (decayed)
     double obj_calls = 0.0, obj_useful = 0.0;    // the same for the objective cutoff row
@@ -745,11 +746,17 @@ class Search : public BasisOwner {
   void run_dives(Worker& w);
   // Root start heuristics (dives, then feasibility pump and RENS) on up to nthreads (0: threads_)
   // threads; results enter in task order (deterministic). t_root: the root's time (< 0: until now).
-  void root_heuristics(Worker& w, int nthreads = 0, double t_root = -1.0);
+  // part: 0 everything; 1 all but the closing LNS rounds; 2 those rounds only (MILP_ROOT_LNS_ASYNC).
+  void root_heuristics(Worker& w, int nthreads = 0, double t_root = -1.0, int part = 0);
+  int async_lns_threads() const;
+  int heur_threads_ = 0, heur_part_ = 0;  // of the heuristics beside the tree (set with heur_w_)
   // MILP_ROOT_HEUR_ASYNC = k (opt-in; 0: off): opportunistic mode with at least k threads runs the root
   // heuristics beside the tree instead of before it, on async_heur_threads() of the threads (the tree starts on
   // the others, which the heuristic threads join when done). heur_w_: the root LP and point they start from.
   std::unique_ptr<Worker> heur_w_;
+  // LP work (DualSimplex::work()) of the root and of the finished tree workers (SearchOptions::work_limit).
+  long long root_units_ = 0;
+  std::atomic<long long> lp_units_{0};
   double heur_t_root_ = 0.0;
   bool prompt_restart_check_ = false;  // restart_check_due_ honoured (set with heur_w_)
   std::atomic<bool> heur_stop_{false};  // the tree has ended: stops the heuristics (LocalStopScope)
@@ -3484,7 +3491,19 @@ int Search::async_heur_threads() const {
   return std::clamp(static_cast<int>(std::lround(share * threads_)), 1, threads_ - 1);
 }
 
-void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
+int Search::async_lns_threads() const {
+  // MILP_ROOT_LNS_ASYNC = k (opt-in; 0: off): opportunistic mode with at least k threads runs the root's dives and
+  // sub-MIPs before the tree as usual (their incumbent decides the root restart at once: irp, beasleyC3 and mc11
+  // lost with everything beside the tree) and only the closing LNS rounds beside it, on MILP_ROOT_HEUR_SHARE of
+  // the threads. The first root only, like MILP_ROOT_HEUR_ASYNC.
+  static const int min_threads = static_cast<int>(knob("MILP_ROOT_LNS_ASYNC", 0));
+  static const double share = knob("MILP_ROOT_HEUR_SHARE", 0.25);
+  if (min_threads <= 0 || params_.deterministic || threads_ < std::max(2, min_threads)) return 0;
+  if (opts_.restarts_done > 0 || opts_.tree_restarts_done > 0) return 0;
+  return std::clamp(static_cast<int>(std::lround(share * threads_)), 1, threads_ - 1);
+}
+
+void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part) {
   // Time this search spent until the end of the root LP with cuts (after a restart: of the
   // restarted root only).
   const double t_root = t_root_in >= 0.0 ? t_root_in : timer_.elapsed() - t_start_;
@@ -3493,8 +3512,9 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
   static const bool sub_debug = std::getenv("MILP_SUBHEUR_DEBUG") != nullptr;
   const int hlog = sub_debug && !opts_.sub_mip_heuristics ? 0 : 3;
   log_.log(hlog, "  root heuristics: root %lld LP iterations (initial LP %lld, barrier root as %lld), %.2fs, %d rows, %d"
-           " cols, cutoff %s, time left %.2fs\n", w.lp.iterations(), root_lp0_iters_, root_lp_equiv_iters_, t_root,
-           p_.num_rows(), p_.num_cols(), is_finite(cutoff(w)) ? "yes" : "no", params_.time_limit - timer_.elapsed());
+           " cols, cutoff %s, time left %.2fs, resident %lld MB\n", w.lp.iterations(), root_lp0_iters_, root_lp_equiv_iters_, t_root,
+           p_.num_rows(), p_.num_cols(), is_finite(cutoff(w)) ? "yes" : "no", params_.time_limit - timer_.elapsed(),
+           resident_bytes() >> 20);
   struct Result {
     std::vector<double> x;
     const char* source = nullptr;
@@ -3523,7 +3543,11 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
     auto loop = [&] {
       for (size_t k; (k = next++) < tasks.size();) {
         if (restart_due()) continue;
+        log_.log(hlog, "  root heuristic task %zu of %zu starts, %.2fs, resident %lld MB\n", k + 1, tasks.size(), timer_.elapsed(),
+                 resident_bytes() >> 20);
         tasks[k](res[k]);
+        log_.log(hlog, "  root heuristic task %zu of %zu done, %.2fs, resident %lld MB\n", k + 1, tasks.size(), timer_.elapsed(),
+                 resident_bytes() >> 20);
         if (early && !res[k].x.empty()) {
           early_wins += try_incumbent(res[k].x, res[k].source);
           res[k].x.clear();
@@ -3531,7 +3555,21 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
       }
     };
     std::vector<std::thread> pool;
-    const int nt = std::min(nthr, static_cast<int>(tasks.size()));
+    int nt = std::min(nthr, static_cast<int>(tasks.size()));
+    // Memory: each task works on its own copy of the root LP or of the problem (a sub-MIP). As many at a time
+    // as fit in what the limit leaves (neos-3402454-bohle, 2.9M rows, 8 GB limit: 5.4 GB at the start of the
+    // root heuristics, past 10 GB five seconds after four tasks started). The estimate, twice 16 bytes per
+    // nonzero and 200 per row and column, is far below what is left on anything of ordinary size.
+    if (!params_.deterministic && opts_.check_resident && nt > 1) {
+      const long long est = 2 * (16LL * p_.A.nnz() + 200LL * (static_cast<long long>(p_.num_rows()) + p_.num_cols()));
+      const long long left = mem_limit_bytes() / 10 * 9 - resident_bytes();
+      const int fit = static_cast<int>(std::clamp<long long>(left / std::max<long long>(est, 1), 1, nt));
+      if (fit < nt) {
+        log_.log(2, "  root heuristics: %d of %d tasks at a time (memory: %lld MB resident, ~%lld MB per task)\n", fit, nt,
+                 resident_bytes() >> 20, est >> 20);
+        nt = fit;
+      }
+    }
     for (int t = 1; t < nt; ++t) pool.emplace_back(inherit_interrupt(loop));
     loop();
     for (auto& th : pool) th.join();
@@ -3547,19 +3585,20 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
   // Wall-clock caps of the heuristics below. None in deterministic mode, where a binding cap would
   // make the result timing dependent (their iteration and node limits bound them there).
   auto capped = [&](double cap) { return params_.deterministic ? remaining() : std::min(cap, remaining()); };
-  // Deterministic mode: LP-work caps of the root sub-MIPs instead, like opportunistic mode's ~3x the
-  // root's time (>= 2 s): 3x the root LP work, at least 2e8 work units (iterations x (rows +
-  // columns), ~2 s on rmatr100-p10 and setpack_large), as LP iterations of this problem.
-  const double dims = static_cast<double>(p_.num_rows() + p_.num_cols());
-  // MILP_DET_SUB_FACTOR (default 3): that multiple of the root LP work. A sub-MIP's LP iterations cost several
-  // times the root's (its presolve, cut loop, propagation), so 3x the work runs far beyond opportunistic mode's
-  // 3x the time (Mac, 4 threads, with MILP_DET_LNS_FACTOR=0.25: factor 1 took n5-3 25.1 -> 21.4 s, seymour1
-  // 23.7 -> 17.8, kasai 34.6 -> 28.3; air05 / app1-1 / h80x6320d within 1.5 s; qap10 unchanged). A/B pending.
+  // Deterministic mode: caps in LP work (DualSimplex::work() units, ~1 ns each on the calibration set, within
+  // a factor ~1.4) where opportunistic mode has seconds: det_secs(t) is the work that stands for t seconds, and
+  // the root's own LP work stands for the root's time (the work clock; the caps used to be LP iterations of
+  // this problem's size, 2-11 s for the same floor: n5-3's RENS 5.6 s against 2.0 s, two LNS rounds of 7 s
+  // against one of 3 s). MILP_DET_SUB_FACTOR (default 3): the sub-MIPs' multiple of the root's work, as
+  // opportunistic mode's 3x the root's time.
   static const double det_sub_factor = knob("MILP_DET_SUB_FACTOR", 3.0);
-  const long long det_sub_iters =
-      params_.deterministic
-          ? static_cast<long long>(std::max(2e8, det_sub_factor * static_cast<double>(w.lp.iterations()) * dims) / std::max(1.0, dims))
-          : -1;
+  auto det_secs = [](double secs) { return static_cast<long long>(1e9 * secs); };
+  const long long root_units = w.lp.work();
+  const long long det_sub_work =
+      !params_.deterministic ? -1
+      : std::min(det_secs(10.0), opts_.start.empty()
+                                     ? std::max(det_secs(2.0), static_cast<long long>(det_sub_factor * static_cast<double>(root_units)))
+                                     : std::max(det_secs(1.0), root_units));
 
   static const bool no_submip = std::getenv("MILP_NO_SUBMIP") != nullptr;
   // Phase 3: improve the incumbent around the root LP point after the cuts (HiGHS finds most
@@ -3600,8 +3639,10 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
     const int max_rounds = lns_adapt > 0.0 ? 200 : 12;
     // MILP_DET_LNS_FACTOR (default 1): factor on that deterministic budget (see MILP_DET_SUB_FACTOR above).
     static const double det_lns_factor = knob("MILP_DET_LNS_FACTOR", 1.0);
-    long long lns_iters = static_cast<long long>(
-        det_lns_factor * static_cast<double>(std::max<long long>(50000, 5 * w.lp.iterations()) * (poor && kPoorLnsSecs > 0.0 ? 4 : 1)));
+    // In LP work (see det_secs above): the root's work, with a poor incumbent at least kPoorLnsSecs' worth, at
+    // most 20 s' worth.
+    long long lns_iters = std::min(det_secs(20.0), static_cast<long long>(det_lns_factor * static_cast<double>(std::max(
+                                                       root_units, poor ? det_secs(kPoorLnsSecs) : 0LL))));
     const long long lns_iters0 = lns_iters;
     long long lns_used = 0;
     double fix = 0.7;
@@ -3620,7 +3661,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
         SubMipLimits lim;
         lim.time_limit = params_.deterministic ? remaining() : std::max(0.1, std::min(5.0, lns_end - timer_.elapsed()));
         lim.node_limit = 500;
-        lim.iteration_limit = params_.deterministic ? std::max<long long>(10000, lns_iters / 2) : -1;
+        lim.work_limit = params_.deterministic ? std::clamp(lns_iters - lns_used, det_secs(0.1), det_secs(5.0)) : -1;
         lim.stats = st;
         return lim;
       };
@@ -3644,7 +3685,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
       const bool improved = incumbent(w) < before;
       log_.log(3, "  root LNS round %d: %s, incumbent %.10g, %.2fs\n", round, improved ? "improved" : "no",
                p_.display_sense * (incumbent(w) + p_.offset), timer_.elapsed());
-      for (const SubMipStats& ss : stats) lns_used += ss.lp_iterations;
+      for (const SubMipStats& ss : stats) lns_used += ss.lp_work;
       bool any_exhausted = false, any_limit = false;
       for (size_t t = with_rins ? 1 : 0; t < lns.size(); ++t) {
         if (stats[t].solves == 0) continue;
@@ -3669,6 +3710,10 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
       }
     }
   };
+  if (part == 2) {
+    lns_phase();
+    return;
+  }
   static const bool lns_first = knob("MILP_ROOT_LNS_FIRST", 0) > 0;
   bool lns_first_ran = false;
   double lns_first_inc = kInf;
@@ -3789,7 +3834,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
         // Stage 3: RENS around the LP point closest to integrality.
         SubMipLimits sl;
         sl.node_limit = 2000;
-        sl.iteration_limit = det_sub_iters;
+        sl.work_limit = params_.deterministic ? det_secs(10.0) : -1;
         sl.time_limit = capped(std::min(10.0, 0.1 * remaining()));
         const double t1 = timer_.elapsed();
         const bool ok3 = rens(p_, closest.data(), kInf, sl, sol);
@@ -3821,7 +3866,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
         lim.time_limit = std::min(lim.time_limit, opts_.start.empty() ? std::max(2.0, 3.0 * t_root) : std::max(1.0, t_root));
       }
       lim.node_limit = 1000;
-      lim.iteration_limit = det_sub_iters;
+      lim.work_limit = det_sub_work;
       SubMipStats ss;
       lim.stats = &ss;
       std::vector<double> sol;
@@ -3845,12 +3890,11 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
       SubMipLimits lim;
       lim.time_limit = capped(std::min(std::max(2.0, t_root), 0.1 * remaining()));
       lim.node_limit = 1000;
-      lim.iteration_limit = det_sub_iters >= 0 ? 2 * det_sub_iters : -1;
+      if (params_.deterministic) lim.work_limit = std::max(det_secs(2.0), root_units);
       if (lp_rens_rel > 0.0) {
         lim.time_limit = std::min(lim.time_limit, capped(std::max(0.5, lp_rens_rel * t_root)));
-        if (lim.iteration_limit >= 0) {
-          const double work = std::max(5e7, 3.0 * lp_rens_rel * static_cast<double>(w.lp.iterations()) * dims);
-          lim.iteration_limit = std::min(lim.iteration_limit, static_cast<long long>(work / std::max(1.0, dims)));
+        if (params_.deterministic) {
+          lim.work_limit = std::min(lim.work_limit, std::max(det_secs(0.5), static_cast<long long>(lp_rens_rel * static_cast<double>(root_units))));
         }
       }
       SubMipStats ss;
@@ -3885,6 +3929,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in) {
   // the rounds ran before the dives and the sub-MIPs above (see lns_first there); they run again here only if
   // those improved the incumbent since.
   if (lns_first_ran && !(incumbent(w) < lns_first_inc)) return;
+  if (part == 1) return;
   lns_phase();
 }
 
@@ -4738,6 +4783,13 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
   auto basis = std::make_shared<const Basis>(lp.get_basis());
   lp.save_state(w.state);
   if (node.id == 0) {
+    // Deterministic point: the FJ / local-MIP helper's points enter before the root heuristics, which then have
+    // an incumbent (guided diving, RINS, the cutoff) or nothing left to do. Before, the next sync after the
+    // initial root LP was the tree's first round (cbs-cta: optimal by the trivial bound at 0.07 s of the helper,
+    // 6 s of root heuristics without it; neos-3004026-krka 5.6 s for the default mode's 0.4 s).
+    static const bool det_heur_sync = knob("MILP_DET_HEUR_SYNC", 0) != 0;
+    if (det_heur_sync && fj_sync_ && !root_heur_done_ && !solved_.load())
+      fj_sync(3 * lp.iterations() * p_.num_rows());
     if (!root_heur_done_ && !solved_.load()) {
       if (async_heur_threads() > 0) {
         // Beside the tree (MILP_ROOT_HEUR_ASYNC), from a copy of this root LP and point.
@@ -4746,6 +4798,19 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
         heur_w_->lp = w.lp;
         heur_w_->xnode = w.xnode;
         heur_t_root_ = timer_.elapsed() - t_start_;
+        heur_threads_ = async_heur_threads(), heur_part_ = 0;
+      } else if (async_lns_threads() > 0) {
+        // The dives and sub-MIPs now; the LNS rounds beside the tree (MILP_ROOT_LNS_ASYNC), from a copy of
+        // this root LP and point, unless a restart or the end of the search skips the tree.
+        const double t_root = timer_.elapsed() - t_start_;
+        root_heuristics(w, 0, t_root, 1);
+        w.lp.restore_state(w.state);
+        heur_w_ = std::make_unique<Worker>();
+        prompt_restart_check_ = true;
+        heur_w_->lp = w.lp;
+        heur_w_->xnode = w.xnode;
+        heur_t_root_ = t_root;
+        heur_threads_ = async_lns_threads(), heur_part_ = 2;
       } else {
         root_heuristics(w);
       }
@@ -5419,7 +5484,14 @@ void Search::run_sub_mips(Worker& w) {
   constexpr long long kMinGap = 10;
   const long long since = nodes - (w.det ? w.lns.last_node : lns_last_node_.load());
   const long long iters_since = static_cast<long long>(searched) - (w.det ? w.lns.last_iters : lns_last_iters_.load());
-  if (since < kGap && (kIterGap <= 0 || since < kMinGap || iters_since < kIterGap)) return;
+  // MILP_DET_LNS_GAP_SCALE (opt-in): deterministic mode counts nodes and iterations per worker, so the spacing is
+  // divided by the number of workers (neos-960392, 8 workers: 5 sub-MIPs in 58 s of tree, the optimal point from
+  // one at 72 s; the default mode has it at 6 s).
+  static const bool det_gap_scale = knob("MILP_DET_LNS_GAP_SCALE", 0) != 0;
+  const long long gap_div = w.det && det_gap_scale ? std::max(1, det_workers_) : 1;
+  if (since < std::max<long long>(kGap / gap_div, 2) &&
+      (kIterGap <= 0 || since < std::max<long long>(kMinGap / gap_div, 2) || iters_since < kIterGap / gap_div))
+    return;
   const double used = static_cast<double>(w.det ? st.iters : sub_iters_.load());
   std::unique_lock<std::mutex> lk(lns_mu_, std::defer_lock);
   if (!w.det) {
@@ -5911,6 +5983,7 @@ int Search::process(Worker& w, Node& node, Node* children) {
 void Search::worker_loop(int tid) {
   Worker w;
   w.lp = root_lp_;
+  w.units_base = w.lp.work();
   w.m_base = root_lp_.num_rows();
   w.lp.set_seed(params_.seed * 131u + static_cast<unsigned>(tid) + 1u);
   w.pc = &pc_;
@@ -5982,6 +6055,11 @@ void Search::worker_loop(int tid) {
       if (stop_reason_ == Status::Unknown) stop_reason_ = Status::IterationLimit;
       stop_ = true;
     }
+    if (opts_.work_limit >= 0 && root_units_ + lp_units_.load() + (w.lp.work() - w.units_base) >= opts_.work_limit) {
+      std::lock_guard<std::mutex> lk(stop_mu_);
+      if (stop_reason_ == Status::Unknown) stop_reason_ = Status::IterationLimit;
+      stop_ = true;
+    }
     memory_control(false);
     if (memory_exceeded(false)) {
       std::lock_guard<std::mutex> lk(stop_mu_);
@@ -6019,6 +6097,7 @@ void Search::worker_loop(int tid) {
   }
   prop_work_total_ += w.prop_work;
   lp_work_total_ += w.lp_work;
+  lp_units_ += w.lp.work() - w.units_base;
 }
 
 void Search::run_deterministic() {
@@ -6576,7 +6655,7 @@ void Search::fj_start() {
   if (disabled || !opts_.feasibility_jump || !opts_.sub_mip_heuristics || is_finite(opts_.cutoff)) return;
   if (std::find(p_.is_int.begin(), p_.is_int.end(), 1) == p_.is_int.end()) return;
   fj_sync_ = params_.deterministic;
-  fj_allowed_ = 1000000;
+  fj_allowed_ = static_cast<long long>(knob("MILP_FJ_FIRST_RELEASE", 1000000));
   fj_thread_ = std::thread(inherit_interrupt([this] {
     FjLimits lim;
     // ~3e8 effort units per second; stops early once it stops making progress.
@@ -6751,6 +6830,60 @@ void Search::fj_start() {
         const bool ok = mutation(p_, inc, fix, seed, incumbent_.load() + p_.offset, sl, sol);
         if (ss.solves == 0) break;
         if (ok && try_incumbent(sol, "mutation")) continue;
+        fix = ss.exhausted ? std::max(0.2, fix - 0.1) : std::min(0.95, fix + 0.05);
+      }
+    }
+    // Deterministic mode (MILP_DET_EARLY_LNS = effort budget, opt-in): the same mutation sub-MIPs from this
+    // helper's own best point, on the helper's effort clock: a sub-MIP's LP work (DualSimplex::work(), about 1 ns
+    // per unit as the effort units) is added when it ends, its solution is stamped with that total and the
+    // helper waits at the allowance before each one. Stops after 8 sub-MIPs in a row without an improvement.
+    static const double det_early_lns = knob("MILP_DET_EARLY_LNS", 0);
+    if (fj_sync_ && det_early_lns > 0 && !best.empty() && lim.checkpoint) {
+      std::vector<double> cur = best;
+      double cur_obj = p_.objective(cur) - p_.offset;
+      double fix = 0.7;
+      long long spent = 0;
+      int fails = 0;
+      for (unsigned seq = 0; !fj_stop_.load() && static_cast<double>(spent) < det_early_lns && fails < 8; ++seq) {
+        {
+          // The allowance: as lim.checkpoint, with the total effort so far.
+          std::unique_lock<std::mutex> lk(fj_mu_);
+          fj_effort_ = base;
+          if (base >= fj_allowed_) {
+            fj_cv_.notify_all();
+            fj_cv_.wait(lk, [&] { return base < fj_allowed_ || fj_stop_.load(); });
+          }
+        }
+        if (fj_stop_.load()) break;
+        SubMipLimits sl;
+        sl.node_limit = 500;
+        sl.time_limit = std::max(0.0, params_.time_limit - timer_.elapsed());
+        sl.work_limit = static_cast<long long>(knob("MILP_DET_EARLY_LNS_WORK", 1e9));
+        sl.stop = &fj_stop_;
+        SubMipStats ss;
+        sl.stats = &ss;
+        const unsigned seed = params_.seed * 7919u + 104729u + seq;
+        std::vector<double> sol;
+        const bool ok = mutation(p_, cur, fix, seed, cur_obj + p_.offset, sl, sol);
+        if (ss.solves == 0) break;
+        const long long used = std::max<long long>(ss.lp_work, 1000000);
+        base += used;
+        spent += used;
+        {
+          std::lock_guard<std::mutex> lk(fj_mu_);
+          fj_post_stamp_ = base;
+        }
+        const double obj = ok ? p_.objective(sol) - p_.offset : kInf;
+        log_.log(3, "  early LNS %u: %s, fix %.2f, work %lld, %.2fs\n", seq, ok ? "found" : "no", fix, ss.lp_work,
+                 timer_.elapsed());
+        if (ok && obj < cur_obj) {
+          cur = sol;
+          cur_obj = obj;
+          publish(sol, "mutation");
+          fails = 0;
+          continue;
+        }
+        ++fails;
         fix = ss.exhausted ? std::max(0.2, fix - 0.1) : std::min(0.95, fix + 0.05);
       }
     }
@@ -7033,7 +7166,7 @@ void Search::detect_symmetry_root() {
   SymmetryOptions so;
   // Deterministic mode: the work limit only (a binding time cap would be timing dependent).
   const double rem = std::max(0.0, params_.time_limit - timer_.elapsed());
-  so.time_limit = params_.deterministic ? rem : std::max(1.0, 0.05 * rem);
+  so.time_limit = params_.deterministic ? rem : std::min(rem, std::max(1.0, 0.05 * rem));
   sym_ = detect_symmetry(p_, so);
   if (!sym_.empty() || sym_.seconds > 0.1) {
     log_.log(1, "Symmetry: %d generators moving %d columns, group order ~1e%.1f, %.2fs%s\n", sym_.num_generators(),
@@ -7323,6 +7456,9 @@ MipResult Search::run() {
   res.root_bound = trivial_lb_ + p_.offset;
   if (!solved_.load()) {
     Worker w;
+    // The work budget of a sub-MIP reaches every LP solve of the search (the copies keep it): the root LP and
+    // the cut loop too, which the check after each node does not see (qap10's sub-MIPs: 4 nodes in 27 s).
+    if (opts_.work_limit >= 0) root_lp_.set_work_limit(opts_.work_limit);
     w.lp = root_lp_;
     w.pc = &pc_;
     Node root;
@@ -7410,8 +7546,23 @@ MipResult Search::run() {
       };
       // Stop the cut rounds once the incumbent closes the gap (deterministic: the incumbent at the start).
       const double inc0 = incumbent_.load();
-      std::function<bool(double)> gap_fn = [this, inc0, det = params_.deterministic](double lb) {
-        return det ? gap_closed_at(lb, inc0) : gap_closed(lb);
+      // MILP_DET_CUT_SYNC (opt-in): deterministic mode syncs the FJ / local-MIP helper at every cut round (points
+      // up to the previous release enter, no wait in the usual case) and releases the LP's work since the last
+      // round (work units and the helper's effort units are both about 1 ns). Before, a root LP under
+      // MILP_DET_ROOT_SYNC iterations left the helper at its first 1e6 units for the whole cut loop
+      // (neos-960392: local MIP has -221 at 1.4 s in the default mode, -2 at 3.7 s here).
+      static const bool det_cut_sync = knob("MILP_DET_CUT_SYNC", 0) != 0;
+      long long fj_work_mark = 0;
+      std::function<bool(double)> gap_fn = [this, inc0, det = params_.deterministic, &w, &fj_work_mark](double lb) {
+        if (!det) return gap_closed(lb);
+        if (!det_cut_sync || !fj_sync_) return gap_closed_at(lb, inc0);
+        const long long work = w.lp.work();
+        const double t0 = timer_.elapsed();  // statistics only
+        fj_sync(work - fj_work_mark, true);
+        root_fj_wait_ += timer_.elapsed() - t0;
+        ++root_fj_syncs_;
+        fj_work_mark = work;
+        return solved_.load() || gap_closed_at(lb, incumbent_.load());
       };
       // Deterministic mode: the FJ / local-MIP helper's points also enter during a long initial root LP, every
       // MILP_DET_ROOT_SYNC iterations (default 5000; 0: at the end of the root cut loop only), each release
@@ -7553,6 +7704,7 @@ MipResult Search::run() {
     report_progress();
     pool_->set_worker_bound(0, kInf);
     root_lp_ = w.lp;  // workers start from the solved root basis
+    root_units_ = w.lp.work();
     static const bool cutprop = std::getenv("MILP_CUTPROP") != nullptr;
     if (cutprop && root_lp_.num_rows() > p_.num_rows()) {
       auto pp = std::make_unique<MipProblem>(p_);
@@ -7627,7 +7779,7 @@ MipResult Search::run() {
     } else {
       // Root heuristics beside the tree (MILP_ROOT_HEUR_ASYNC): H threads run them while the tree starts on
       // the others, then become tree workers too.
-      const int H = heur_w_ ? async_heur_threads() : 0;
+      const int H = heur_w_ ? heur_threads_ : 0;
       std::vector<std::thread> threads;
       for (int t = 0; t < threads_ - H; ++t) threads.emplace_back(inherit_interrupt([this, t] { worker_loop(t); }));
       std::thread heur;
@@ -7636,7 +7788,7 @@ MipResult Search::run() {
         heur = std::thread(inherit_interrupt([this, H] {
           {
             LocalStopScope scope(&heur_stop_);
-            root_heuristics(*heur_w_, H, heur_t_root_);
+            root_heuristics(*heur_w_, H, heur_t_root_, heur_part_);
           }
           log_.log(2, "  root heuristics done at %.2fs, %lld nodes\n", timer_.elapsed(), nodes_.load());
           // Their incumbents fix columns globally (root reduced-cost fixing): the restart the root would have
@@ -7876,6 +8028,7 @@ MipResult Search::run() {
   report_progress();
   res.nodes = nodes_.load();
   res.lp_iterations = lp_iters_.load();
+  res.lp_work = root_units_ + lp_units_.load();
   res.dive_iterations = dive_iters_.load();
   res.fp_iterations = fp_iters_.load();
   res.dive_wins = dive_wins_.load();

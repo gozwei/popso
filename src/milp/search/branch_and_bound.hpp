@@ -70,6 +70,9 @@ struct MipResult {
   std::vector<double> x;
   long long nodes = 0;
   long long lp_iterations = 0;
+  // LP work (DualSimplex::work() units, ~1 ns each) of the root and the tree workers' LPs; opportunistic
+  // searches only (the sub-MIPs' budgets, SearchOptions::work_limit).
+  long long lp_work = 0;
   // Of lp_iterations: the dives (root and tree) and the root feasibility pump, and the new incumbents
   // they found (statistics of the sub-MIPs, SubMipStats).
   long long dive_iterations = 0, fp_iterations = 0;
@@ -151,6 +154,9 @@ struct SearchOptions {
   bool root_lns = true;  // root LNS rounds allowed (restart: only if they improved before it)
   std::atomic<long long>* progress = nullptr;  // LP iterations of this search are added here as it goes
   long long iteration_limit = -1;  // stop (status IterationLimit) after this many LP iterations (-1: none)
+  // Stop (status IterationLimit) once the root's and the tree's LPs have done this much work (DualSimplex::work()
+  // units, ~1 ns each; -1: none). Checked after each node; deterministic in a single-threaded search (the sub-MIPs).
+  long long work_limit = -1;
   int solution_limit = 0;          // stop (status Interrupted) after this many new incumbents (0: none)
   // Enforce the memory limit on the resident size of the whole process too. Off in sub-MIPs:
   // the process includes the main search, so a sub-MIP's small limit was always exceeded and

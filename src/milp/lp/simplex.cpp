@@ -46,6 +46,13 @@ double lp_knob(const char* name, double def) {
 // the first Harris group by (d_j + tol) / |alpha_j| with a wrong-sign d_j instead of tol / |alpha_j|.
 const double kPerturbRows = lp_knob("MILP_LP_PERTURB_ROWS", 0.0);
 const double kBoostRows = lp_knob("MILP_LP_BOOST_ROWS", -1.0);  // -1: as MILP_LP_PERTURB_ROWS
+// Weights of work(): calibrated against wall time (MILP_LP_WORK_TRACE=1 prints, per solve of at least 20 ms,
+// iterations, work and seconds).
+const long long kWorkRows = static_cast<long long>(lp_knob("MILP_LP_WORK_ROWS", 2.0));
+const long long kWorkPivotRow = static_cast<long long>(lp_knob("MILP_LP_WORK_PIVOT", 2.0));
+const long long kWorkSolve = static_cast<long long>(lp_knob("MILP_LP_WORK_SOLVE", 4.0));
+const long long kWorkRefactorBasis = static_cast<long long>(lp_knob("MILP_LP_WORK_REFB", 4.0));
+const long long kWorkRefactorFactor = static_cast<long long>(lp_knob("MILP_LP_WORK_REFF", 8.0));
 const double kColdStall = lp_knob("MILP_LP_COLD_STALL", 0.0);
 const double kStallTol = lp_knob("MILP_LP_STALL_TOL", 1e-9);
 const bool kStallDual = lp_knob("MILP_LP_STALL_DUAL", 0.0) != 0.0;
@@ -438,7 +445,18 @@ bool DualSimplex::refactor(bool renumber) {
     }
   }
   has_factor_ = true;
+  work_ += kWorkRefactorBasis * static_cast<long long>(fac_index_.size()) + kWorkRefactorFactor * lu_.factor_nnz() + m_;
   return replaced.empty();
+}
+
+void DualSimplex::count_iteration_work(Index rho_count, Index col_count) {
+  // A solve that ends with c nonzeros reaches about c average factor columns, at most the whole factor.
+  const long long F = static_cast<long long>(lu_.factor_nnz()) + lu_.eta_nnz();
+  const long long per = F / std::max<Index>(1, m_) + 1;
+  auto solve = [&](Index c) { return std::min(F, kWorkSolve * per * c) + c; };
+  const long long row = static_cast<long long>(rho_count) * (A_.nnz() / std::max<Index>(1, m_) + 1);
+  work_ += kWorkRows * m_ + kWorkPivotRow * (std::min<long long>(row, A_.nnz()) + arow_count_) + solve(rho_count) +
+           2 * solve(col_count);
 }
 
 void DualSimplex::rebuild_infeasible(double ptol) {
@@ -743,6 +761,10 @@ bool DualSimplex::limits_hit(const LpOptions& opt, LpStatus* st) const {
     *st = LpStatus::TimeLimit;
     return true;
   }
+  if (work_limit_ >= 0 && work_ >= work_limit_) {
+    *st = LpStatus::TimeLimit;
+    return true;
+  }
   if (opt.checkpoint && opt.checkpoint_every > 0 && total_iterations_ - iter_start_ >= next_checkpoint_) {
     next_checkpoint_ = total_iterations_ - iter_start_ + opt.checkpoint_every;
     if (!opt.checkpoint(total_iterations_ - iter_start_)) {
@@ -810,6 +832,8 @@ LpStatus DualSimplex::fail(const char* why) {
 }
 
 LpStatus DualSimplex::solve(const LpOptions& opt) {
+  static const bool work_trace = std::getenv("MILP_LP_WORK_TRACE") != nullptr;
+  const long long work0 = work_;
   fail_reason_ = "";
   solve_start_ = t_timer.elapsed();
   iter_start_ = total_iterations_;
@@ -822,6 +846,11 @@ LpStatus DualSimplex::solve(const LpOptions& opt) {
   if (unscaled_from_ >= 0) {
     g_unscaled_solves.fetch_add(1, std::memory_order_relaxed);
     g_unscaled_iterations.fetch_add(total_iterations_ - unscaled_from_, std::memory_order_relaxed);
+  }
+  if (work_trace && t_timer.elapsed() - solve_start_ >= 0.02) {
+    std::printf("LPWORK m %d n %d nnz %lld factor %lld iters %lld work %lld secs %.4f\n", m_, n_,
+                static_cast<long long>(A_.nnz()), static_cast<long long>(lu_.factor_nnz()), total_iterations_ - iter_start_,
+                work_ - work0, t_timer.elapsed() - solve_start_);
   }
   return st;
 }
@@ -1532,6 +1561,7 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
       update_infeasible(r, ptol);
     }
     ++total_iterations_;
+    count_iteration_work(rho_.count, alpha_.count);
     if (opt.verbosity >= 3 && total_iterations_ % 100 == 0) {
       double obj = 0.0, tobj = 0.0;
       for (Index j = 0; j < n_ + m_; ++j) obj += wcost_[j] * x_[j], tobj += cost_[j] * x_[j];
@@ -1601,6 +1631,8 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
       if (status_[q] == VarStatus::AtLower) status_[q] = VarStatus::AtUpper, x_[q] = wub_[q];
       else status_[q] = VarStatus::AtLower, x_[q] = wlb_[q];
       ++total_iterations_;
+      count_iteration_work(0, alpha_.count);
+      work_ += n_;
       continue;
     }
     Index r = -1;
@@ -1667,6 +1699,8 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
     status_[q] = VarStatus::Basic;
     status_[jl] = (leave_lower || wlb_[jl] == wub_[jl]) ? VarStatus::AtLower : VarStatus::AtUpper;
     ++total_iterations_;
+    count_iteration_work(alpha_.count, alpha_.count);
+    work_ += n_;
   }
 }
 

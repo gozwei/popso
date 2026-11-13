@@ -178,6 +178,15 @@ class DualSimplex {
   // Values of all n + m variables (structurals first, logicals unscaled).
   const double* x() const;
   long long iterations() const { return total_iterations_; }
+  // Deterministic work count of all solves so far: elementary operations estimated from the sizes each
+  // iteration touches (rows, pivot row and column nonzeros, the factor's nonzeros reached by the three
+  // solves) and each refactorization. About 1 ns per unit; unlike iterations x (rows + columns) it follows
+  // the cost of dense cut rows and of hypersparse solves. A counter only: nothing in the solver's path
+  // depends on it.
+  long long work() const { return work_; }
+  // Solves return TimeLimit once work() has reached this (-1: no limit): the deterministic stand-in for a
+  // time limit (a sub-MIP's budget, SearchOptions::work_limit). Copies of the LP keep the count and the limit.
+  void set_work_limit(long long limit) { work_limit_ = limit; }
   // Why the last solve returned NumericalError ("" otherwise).
   const char* fail_reason() const { return fail_reason_; }
 
@@ -270,6 +279,9 @@ class DualSimplex {
   mutable std::vector<int> sb_cnt_;
   bool has_factor_ = false;
   long long total_iterations_ = 0;
+  long long work_ = 0;  // work()
+  long long work_limit_ = -1;  // set_work_limit()
+  void count_iteration_work(Index rho_count, Index col_count);
   std::vector<double> farkas_;  // row of B^{-1} proving infeasibility of the last solve
   double farkas_sign_ = 1.0;    // see infeasible()
   bool has_farkas_ = false;

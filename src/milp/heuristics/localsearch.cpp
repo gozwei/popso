@@ -134,6 +134,7 @@ bool proximity(const MipProblem& p, const std::vector<double>& incumbent, double
   pl.node_limit = 1;
   pl.time_limit = limits.time_limit;
   pl.iteration_limit = limits.iteration_limit;
+  pl.work_limit = limits.work_limit;
   pl.stop = limits.stop;
   pl.progress = limits.progress;
   pl.mem_limit_mb = limits.mem_limit_mb;
@@ -141,7 +142,7 @@ bool proximity(const MipProblem& p, const std::vector<double>& incumbent, double
   pl.stats = &ps;
   pl.min_fixed_fraction = 0.0;
   if (solve_sub_mip(p, lb, ub, p.objective(sol) - 1e-9, pl, polished)) sol = std::move(polished);
-  if (limits.stats) limits.stats->lp_iterations += ps.lp_iterations;
+  if (limits.stats) limits.stats->lp_iterations += ps.lp_iterations, limits.stats->lp_work += ps.lp_work;
   return true;
 }
 

@@ -103,7 +103,14 @@ class NormalEquations {
           log->log(2, "Barrier: dense columns: factor %.3g flops with, %.3g + %.3g without them\n",
                    full_ok ? full.flops() : kInf, flops_split, extra);
         }
-        if (!split) chol_ = std::move(full);
+        if (!split) {
+          // `full` takes the stop settings along (its own were only for the analysis): without them the
+          // factorizations ran to their end past a time limit (highschool1-aigio: 7 s past 40 s, more than
+          // 60 s past 300 s on a loaded machine, each factorization taking that long).
+          chol_ = std::move(full);
+          chol_.stop = stop;
+          chol_.interruptible = true;
+        }
       }
       if (split && clique >= 5e7) {
         const double k = static_cast<double>(cand.size());
