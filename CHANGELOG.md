@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.11.1 — 2026-11-15
+
+A correctness fix; nothing else changes.
+
+- **Wrong optimum after two restarts.** When the search restarted, found nothing better than its incumbent, and
+  restarted again, the cutoff of the last search was taken from the incumbent's image under the previous
+  presolve, which a dual reduction can move below the incumbent's objective and below the optimum. The last
+  root was then cut off and the incumbent was reported as optimal. Seen on neos-3083819-nubu (x86,
+  `--deterministic --seed 76`, 4 threads): 6313945 reported, the optimum is 6307996. The incumbent's own
+  objective is now carried through every restart. The one-restart case was fixed in v0.6.3; all versions from
+  v0.7.0 to v0.11.0 have the two-restart case. It was rare: one run in several hundred of that instance, none
+  seen on another instance.
+
 ## v0.11.0 — 2026-11-13
 
 A release of fixes and groundwork for the MILP search; the search itself is unchanged apart from what is listed.

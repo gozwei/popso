@@ -320,7 +320,12 @@ bool solve_presolved(const MipProblem& p, const SolverParams& params, const Logg
       o.start.clear();
     }
     if (!o.start.empty()) {
-      o.start_objective = p.objective(o.start);  // the start's own objective (its crushed point may differ)
+      // The start's own objective (its crushed point may differ). A start that already carries one keeps it:
+      // after a restart whose search found nothing, the start handed on is the crushed point of the level
+      // before, which that level's presolve may have moved below the incumbent's objective
+      // (neos-3083819-nubu, x86, --deterministic --seed 76: the second restart's root was pruned against a
+      // cutoff below the optimum and the incumbent 6313945 came back as optimal; the optimum is 6307996).
+      if (!is_finite(o.start_objective)) o.start_objective = p.objective(o.start);
       o.start = pre.crush(o.start);
     }
     q_start = o.start;
