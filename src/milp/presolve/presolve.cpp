@@ -2,6 +2,7 @@
 
 #include "milp/core/interrupt.hpp"
 #include "milp/presolve/clique_merge.hpp"
+#include "milp/presolve/group_prop.hpp"
 #include "milp/presolve/implied_int.hpp"
 #include "milp/presolve/probing.hpp"
 
@@ -49,6 +50,20 @@ class PresolveWork {
     n_ = in.num_cols();
     rows_.resize(m_);
     cols_.resize(n_);
+    {
+      // Exact sizes first: grown by push_back the lists end up with up to twice the room they need (16 bytes per
+      // nonzero on each side: square47, 27M nonzeros, 0.9 GB exact).
+      std::vector<Index> len(m_, 0);
+      for (Index j = 0; j < n_; ++j) {
+        Index cnt = 0;
+        for (Index p = in.A.begin(j); p < in.A.end(j); ++p) {
+          if (in.A.value[p] == 0.0) continue;
+          ++cnt, ++len[in.A.index[p]];
+        }
+        cols_[j].reserve(static_cast<size_t>(cnt));
+      }
+      for (Index i = 0; i < m_; ++i) rows_[i].reserve(static_cast<size_t>(len[i]));
+    }
     for (Index j = 0; j < n_; ++j) {
       for (Index p = in.A.begin(j); p < in.A.end(j); ++p) {
         if (in.A.value[p] == 0.0) continue;
@@ -90,6 +105,7 @@ class PresolveWork {
     defer_fill_ = probe_pending;
     int clique_runs = 0;
     long long since_clique = 0;
+    long long since_group = 0;
     // Sparsify whenever the other reductions are exhausted and something changed since its last run, at most
     // kSparsifyRuns times; up to 10 more rounds after a run that changed something (also beyond max_rounds).
     constexpr int kSparsifyRuns = 3;
@@ -115,6 +131,8 @@ class PresolveWork {
       step(2, opt_.bound_tightening, [&] { return propagate(); });
       step(0, true, [&] { return column_pass(); });
       step(3, opt_.coef_tightening, [&] { return coef_tightening(); });
+      step(3, opt_.int_divisors, [&] { return int_divisors(); });
+      step(3, opt_.unit_rows, [&] { return unit_rows(); });
       step(4, opt_.dual_fixing, [&] { return dual_fixing(); });
       step(13, opt_.dual_aggregation, [&] { return dual_aggregate(); });
       step(5, opt_.dominated_cols, [&] { return dominated_cols(); });
@@ -126,6 +144,7 @@ class PresolveWork {
       if (halted()) break;
       since_clique += ch;
       since_sparsify += ch;
+      since_group += ch;
       const bool last = round + 1 >= opt_.max_rounds;
       if ((ch == 0 || last) && opt_.sparsify && stats_.sparsify_runs < kSparsifyRuns &&
           (stats_.sparsify_runs == 0 || since_sparsify > 0) && status_ == PresolveStatus::Reduced) {
@@ -141,6 +160,20 @@ class PresolveWork {
           sparsify_until = round + 11;
           continue;
         }
+      }
+      if ((ch == 0 || last) && opt_.group_prop && status_ == PresolveStatus::Reduced && stats_.group_runs < 3 &&
+          (stats_.group_runs == 0 || since_group > 0)) {
+        // One-of group propagation once the cheap reductions are exhausted, before the clique extension and
+        // probing (its fixings shrink both), and again after rounds that changed something.
+        ++stats_.group_runs;
+        since_group = 0;
+        compact();
+        Timer tg;
+        ch = group_prop();
+        step_time_[14] += tg.elapsed();
+        since_sparsify += ch;
+        since_clique += ch;
+        if (ch > 0 && !last) continue;
       }
       if ((ch == 0 || last) && opt_.clique_extension && status_ == PresolveStatus::Reduced && clique_runs < 4 &&
           (clique_runs == 0 || since_clique > 0) && (stats_.probing_passes <= 1 || opt_.probing_cliques)) {
@@ -183,9 +216,9 @@ class PresolveWork {
     if (log_.verbosity() >= 3) {
       static const char* names[] = {"columns", "rows", "propagate", "coef", "dual", "dominated", "parallel_rows",
                                     "parallel_cols", "aggregate", "substitute", "probing", "cliqueext", "sparsify",
-                                    "dualagg"};
+                                    "dualagg", "groups"};
       std::string line = "Presolve step times:";
-      for (int k = 0; k < 14; ++k) line += " " + std::string(names[k]) + " " + std::to_string(step_time_[k]).substr(0, 5);
+      for (int k = 0; k < 15; ++k) line += " " + std::string(names[k]) + " " + std::to_string(step_time_[k]).substr(0, 5);
       log_.log(3, "%s\n", line.c_str());
     }
     if (status_ == PresolveStatus::Reduced) column_pass();
@@ -584,6 +617,168 @@ class PresolveWork {
     return ch;
   }
 
+  // Integer columns whose values are all congruent modulo a divisor. In an equation over integer columns with
+  // integral coefficients, let G be the gcd of the coefficients of the columns other than x_j: if |a_j| divides
+  // G, then x_j is congruent to b / a_j modulo g = G / |a_j|. For g >= 2 the column is replaced by
+  // x_j = g x' + r (x' integer, in the same place): its range shrinks by the factor g, and rows in which it
+  // stands opposite other integers become divisible, which probing and the gcd rule use. Repeated: a rescaled
+  // column changes the gcd of its other equations. traininstance6: the value columns of three 501-member one-of
+  // groups are sums of terms 10 (a - b); as 10 x' the groups lose the 450 members that are no multiple of 10 to
+  // probing (presolved 2804 x 1172 -> 1909 x 272).
+  long long int_divisors() {
+    constexpr double kMaxCoef = 1e9;
+    constexpr long long kMaxDivisor = 1000000;
+    auto gcd = [](long long x, long long y) {
+      while (y != 0) {
+        const long long t = x % y;
+        x = y;
+        y = t;
+      }
+      return x;
+    };
+    long long total = 0, work = 0;
+    long long nnz = 0;
+    for (Index i = 0; i < m_; ++i) nnz += row_alive_[i] ? row_size_[i] : 0;
+    const long long limit = 20 * nnz + 100000;
+    std::vector<long long> coef, pre;
+    std::vector<Index> col;
+    for (int sweep = 0; sweep < 20 && status_ == PresolveStatus::Reduced && work < limit; ++sweep) {
+      long long ch = 0;
+      for (Index i = 0; i < m_ && status_ == PresolveStatus::Reduced && work < limit; ++i) {
+        if (!row_alive_[i] || row_size_[i] < 2 || rlb_[i] != rub_[i]) continue;
+        const double b = rub_[i];
+        if (std::abs(b) > 1e12 || b != std::round(b)) continue;
+        coef.clear();
+        col.clear();
+        bool ok = true, wide = false;
+        for (const Entry& e : rows_[i]) {
+          if (!col_alive_[e.idx]) continue;
+          const double a = std::abs(e.val);
+          if (!is_int_[e.idx] || a > kMaxCoef || a != std::round(a) || a == 0.0) {
+            ok = false;
+            break;
+          }
+          coef.push_back(static_cast<long long>(e.val));
+          col.push_back(e.idx);
+          wide = wide || ub_[e.idx] - lb_[e.idx] > 1.5;
+        }
+        work += static_cast<long long>(coef.size()) + 1;
+        if (!ok || !wide || coef.size() < 2) continue;
+        const size_t len = coef.size();
+        // pre[k]: gcd of the coefficients before k; suf: of those after k.
+        pre.assign(len + 1, 0);
+        for (size_t k = 0; k < len; ++k) pre[k + 1] = gcd(std::abs(coef[k]), pre[k]);
+        long long suf = 0;
+        for (size_t k = len; k-- > 0; suf = gcd(std::abs(coef[k]), suf)) {
+          const Index j = col[k];
+          if (ub_[j] - lb_[j] < 1.5) continue;  // binaries and fixed columns: nothing to gain
+          const long long a = std::abs(coef[k]);
+          const long long G = gcd(pre[k], suf);
+          if (G == 0 || G % a != 0 || G / a < 2 || G / a > kMaxDivisor) continue;
+          const long long g = G / a;
+          const double q = b / static_cast<double>(coef[k]);
+          if (q != std::round(q)) continue;  // no integral solution: left to the gcd rule
+          long long r = static_cast<long long>(q) % g;
+          if (r < 0) r += g;
+          const double gd = static_cast<double>(g), rd = static_cast<double>(r);
+          bool fits = std::abs(cost_[j]) * gd <= 1e12;
+          for (const Entry& e : cols_[j]) {
+            if (row_alive_[e.idx] && std::abs(e.val) * gd > kMaxCoef) fits = false;
+          }
+          if (!fits) continue;
+          const double lo = std::isfinite(lb_[j]) ? std::ceil((lb_[j] - rd) / gd - 1e-9) : -kInf;
+          const double hi = std::isfinite(ub_[j]) ? std::floor((ub_[j] - rd) / gd + 1e-9) : kInf;
+          if (lo > hi) {
+            status_ = PresolveStatus::Infeasible;
+            log_.log(3, "Presolve: column %d has no value congruent to %lld modulo %lld\n", j, r, g);
+            return total;
+          }
+          if (log_.verbosity() >= 4) {
+            log_.log(4, "  col %d [%.12g, %.12g] = %lld x' + %lld (row %d), x' in [%.12g, %.12g]\n", j, lb_[j], ub_[j],
+                     g, r, i, lo, hi);
+          }
+          for (Entry& e : cols_[j]) {
+            const Index i2 = e.idx;
+            if (!row_alive_[i2]) continue;
+            const double d = e.val * rd;
+            if (std::isfinite(rlb_[i2])) rlb_[i2] -= d;
+            if (std::isfinite(rub_[i2])) rub_[i2] -= d;
+            e.val *= gd;
+            for (Entry& f : rows_[i2]) {
+              if (f.idx == j) {
+                f.val = e.val;
+                break;
+              }
+            }
+            work += row_size_[i2];
+          }
+          offset_ += cost_[j] * rd;
+          cost_[j] *= gd;
+          lb_[j] = lo;
+          ub_[j] = hi;
+          out_.stack_.push_back({j, rd, 1.0, {{j, -gd}}});  // x_j = r + g x'
+          ++stats_.int_divisors;
+          ++ch;
+          break;  // the row's coefficients changed: next sweep
+        }
+      }
+      total += ch;
+      if (ch == 0) break;
+    }
+    return total;
+  }
+
+  // Rows whose coefficients all have one absolute value c other than 1 are divided by c: sum of +-x on one side.
+  // The clique steps, the one-of groups and the clique cuts look for coefficients 1 and a side 1; coefficient
+  // tightening and liftings leave rows like 0.25 (x1 + x2 + x3 + x4) <= 0.25 or 238 (x1 + ... + xk) >= 238
+  // (roll3000: 83 packing rows with 0.25, 139 covering rows with 238). Rows of integer columns only, with
+  // integral sides afterwards: a row with a continuous column divided by c > 1 would be held to c times the
+  // feasibility tolerance in its original form (fuzz seed 58, case 205 of the sparsify models: a violation of
+  // 4e-6 through a row divided by 4).
+  long long unit_rows() {
+    long long ch = 0;
+    for (Index i = 0; i < m_ && status_ == PresolveStatus::Reduced; ++i) {
+      if (!row_alive_[i] || row_size_[i] < 2) continue;
+      double c = 0.0;
+      bool ok = true, all_int = true;
+      for (const Entry& e : rows_[i]) {
+        if (!col_alive_[e.idx]) continue;
+        const double a = std::abs(e.val);
+        if (c == 0.0) c = a;
+        if (a != c) {
+          ok = false;
+          break;
+        }
+        all_int = all_int && is_int_[e.idx];
+      }
+      if (!ok || !all_int || c == 0.0 || c == 1.0 || c < 1e-6 || c > 1e6) continue;
+      double lo = std::isfinite(rlb_[i]) ? rlb_[i] / c : rlb_[i], hi = std::isfinite(rub_[i]) ? rub_[i] / c : rub_[i];
+      if (std::isfinite(lo)) lo = std::ceil(lo - opt_.feas_tol);
+      if (std::isfinite(hi)) hi = std::floor(hi + opt_.feas_tol);
+      if (lo > hi) {
+        status_ = PresolveStatus::Infeasible;
+        log_.log(3, "Presolve: row %d has no integral solution (coefficients %g)\n", i, c);
+        return ch;
+      }
+      for (Entry& e : rows_[i]) {
+        if (!col_alive_[e.idx]) continue;
+        const double v = e.val > 0 ? 1.0 : -1.0;
+        e.val = v;
+        for (Entry& f : cols_[e.idx]) {
+          if (f.idx == i) {
+            f.val = v;
+            break;
+          }
+        }
+      }
+      rlb_[i] = lo;
+      rub_[i] = hi;
+      ++stats_.coef_changes;
+      ++ch;
+    }
+    return ch;
+  }
+
   // Coefficient strengthening for integer columns in one-sided rows
   // (normalized to sum a_k x_k <= b with finite max activity M):
   //   a_j > 0, M - a_j < b:  a_j -= d, b -= d u_j  with d = b - (M - a_j)
@@ -597,7 +792,9 @@ class PresolveWork {
       const double s = has_ub ? 1.0 : -1.0;
       double b = has_ub ? rub_[i] : -rlb_[i];
       double maxact = 0.0, mag = std::abs(b);
-      bool ok = true, any_int = false, exact = std::abs(b) < 1e9 && b == std::round(b);
+      // Exact sums: integral data, or (lift_dyadic) multiples of 1/1024 with integral bounds.
+      const double unit = opt_.lift_dyadic ? 1024.0 : 1.0;
+      bool ok = true, any_int = false, exact = std::abs(b) < 1e9 && b * unit == std::round(b * unit);
       for (const Entry& e : rows_[i]) {
         const Index j = e.idx;
         if (!col_alive_[j]) continue;
@@ -610,7 +807,7 @@ class PresolveWork {
         maxact += a * bh;
         mag += std::abs(a * bh);
         any_int = any_int || is_int_[j];
-        exact = exact && a == std::round(a) && bh == std::round(bh) && std::abs(a * bh) < 1e9;
+        exact = exact && a * unit == std::round(a * unit) && bh == std::round(bh) && std::abs(a * bh) < 1e9;
       }
       if (!ok || !any_int) continue;
       // Margin against rounding errors in M (none when all data are moderate integers).
@@ -978,38 +1175,52 @@ class PresolveWork {
   // Parallel rows: rows that are scalar multiples of each other are merged.
   long long parallel_rows() {
     long long ch = 0;
-    std::unordered_map<uint64_t, std::vector<Index>> buckets;
-    std::vector<std::vector<Entry>> norm(m_);  // sorted by column, scaled so the first value is 1
-    std::vector<double> first(m_, 0.0);
+    // The normalized rows (sorted by column, scaled so the first value is 1) lie in one array and the rows with
+    // equal hashes are found by sorting (hash, row) pairs: a hash map of row lists and one vector per row cost
+    // more than the comparisons (neos-3402294-bobin: 2.1 s of a 3.2 s presolve in this step, most of it in the
+    // map). The groups are independent of each other, so the order in which they are visited does not matter.
+    std::vector<Entry>& norm = par_norm_;
+    std::vector<Index>& off = par_off_;
+    std::vector<double>& first = par_first_;
+    std::vector<std::pair<uint64_t, Index>>& keys = par_keys_;
+    norm.clear();
+    keys.clear();
+    off.assign(m_ + 1, 0);
+    first.assign(m_, 0.0);
     for (Index i = 0; i < m_; ++i) {
+      off[i] = static_cast<Index>(norm.size());
       if (!row_alive_[i] || row_size_[i] < 2) continue;
-      auto& v = norm[i];
       for (const Entry& e : rows_[i]) {
-        if (col_alive_[e.idx]) v.push_back(e);
+        if (col_alive_[e.idx]) norm.push_back(e);
       }
-      std::sort(v.begin(), v.end(), [](const Entry& x, const Entry& y) { return x.idx < y.idx; });
-      first[i] = v[0].val;
-      uint64_t h = 1469598103934665603ULL ^ v.size();
-      for (Entry& e : v) {
+      const auto vb = norm.begin() + off[i], ve = norm.end();
+      std::sort(vb, ve, [](const Entry& x, const Entry& y) { return x.idx < y.idx; });
+      first[i] = vb->val;
+      uint64_t h = 1469598103934665603ULL ^ static_cast<size_t>(ve - vb);
+      for (auto it = vb; it != ve; ++it) {
+        Entry& e = *it;
         e.val /= first[i];
         const auto q = static_cast<int64_t>(std::llround(e.val * 1e6));
         h = (h ^ static_cast<uint64_t>(e.idx)) * 1099511628211ULL;
         h = (h ^ static_cast<uint64_t>(q)) * 1099511628211ULL;
       }
-      buckets[h].push_back(i);
+      keys.push_back({h, i});
     }
-    for (auto& kv : buckets) {
-      auto& rs = kv.second;
-      if (rs.size() < 2) continue;
-      for (size_t x = 0; x < rs.size() && status_ == PresolveStatus::Reduced; ++x) {
-        const Index r1 = rs[x];
+    off[m_] = static_cast<Index>(norm.size());
+    std::sort(keys.begin(), keys.end());  // equal hashes together, rows in increasing order within
+    for (size_t g0 = 0, g1; g0 < keys.size(); g0 = g1) {
+      for (g1 = g0 + 1; g1 < keys.size() && keys[g1].first == keys[g0].first; ++g1) {}
+      if (g1 - g0 < 2) continue;
+      for (size_t x = g0; x < g1 && status_ == PresolveStatus::Reduced; ++x) {
+        const Index r1 = keys[x].second;
         if (!row_alive_[r1]) continue;
-        for (size_t y = x + 1; y < rs.size(); ++y) {
-          const Index r2 = rs[y];
-          if (!row_alive_[r2] || norm[r2].size() != norm[r1].size()) continue;
+        const Index len1 = off[r1 + 1] - off[r1];
+        for (size_t y = x + 1; y < g1; ++y) {
+          const Index r2 = keys[y].second;
+          if (!row_alive_[r2] || off[r2 + 1] - off[r2] != len1) continue;
           bool same = true;
-          for (size_t k = 0; k < norm[r1].size() && same; ++k) {
-            const Entry &e1 = norm[r1][k], &e2 = norm[r2][k];
+          for (Index k = 0; k < len1 && same; ++k) {
+            const Entry &e1 = norm[off[r1] + k], &e2 = norm[off[r2] + k];
             same = e1.idx == e2.idx && std::abs(e1.val - e2.val) <= 1e-12 * std::max(1.0, std::abs(e1.val));
           }
           if (!same) continue;
@@ -1105,8 +1316,26 @@ class PresolveWork {
   long long new_entries(Index j, Index i, const std::vector<Entry>& r) {
     if (mark_.size() != static_cast<size_t>(n_)) mark_.assign(n_, -1);
     long long cnt = 0;
+    // A row much longer than the columns of r is not walked: whether it holds a column of r is read from that
+    // column instead (triptim1: the rows of a candidate are over a thousand entries long, its columns about 20).
+    long long col_len = 0;
+    for (const Entry& e : r) col_len += e.idx != j ? static_cast<long long>(cols_[e.idx].size()) : 0;
     for (const Entry& x : cols_[j]) {
       if (!row_alive_[x.idx] || x.idx == i) continue;
+      if (static_cast<long long>(rows_[x.idx].size()) > col_len) {
+        for (const Entry& e : r) {
+          if (e.idx == j) continue;
+          bool found = false;
+          for (const Entry& y : cols_[e.idx]) {
+            if (y.idx == x.idx) {
+              found = true;
+              break;
+            }
+          }
+          cnt += !found;
+        }
+        continue;
+      }
       for (const Entry& e : rows_[x.idx]) mark_[e.idx] = x.idx;
       for (const Entry& e : r) cnt += e.idx != j && mark_[e.idx] != x.idx;
     }
@@ -1117,37 +1346,49 @@ class PresolveWork {
   // y = x_k + s x_j, so x_j is removed and x_k becomes y with the bounds of that sum.
   long long parallel_cols() {
     long long ch = 0;
-    std::unordered_map<uint64_t, std::vector<Index>> buckets;
-    std::vector<std::vector<Entry>> norm(n_);  // sorted by row, scaled so the first value is 1
-    std::vector<double> first(n_, 0.0);
+    // As parallel_rows: the normalized columns (sorted by row, scaled so the first value is 1) in one array,
+    // equal hashes found by sorting. A merge touches only its two columns, so the group order does not matter.
+    std::vector<Entry>& norm = par_norm_;
+    std::vector<Index>& off = par_off_;
+    std::vector<double>& first = par_first_;
+    std::vector<std::pair<uint64_t, Index>>& keys = par_keys_;
+    norm.clear();
+    keys.clear();
+    off.assign(n_ + 1, 0);
+    first.assign(n_, 0.0);
     for (Index j = 0; j < n_; ++j) {
+      off[j] = static_cast<Index>(norm.size());
       if (!col_alive_[j] || col_size_[j] < 1 || lb_[j] == ub_[j]) continue;
-      auto& v = norm[j];
       for (const Entry& e : cols_[j]) {
-        if (row_alive_[e.idx]) v.push_back(e);
+        if (row_alive_[e.idx]) norm.push_back(e);
       }
-      std::sort(v.begin(), v.end(), [](const Entry& x, const Entry& y) { return x.idx < y.idx; });
-      first[j] = v[0].val;
-      uint64_t h = 1469598103934665603ULL ^ (v.size() * 2 + is_int_[j]);
-      for (Entry& e : v) {
+      const auto vb = norm.begin() + off[j], ve = norm.end();
+      std::sort(vb, ve, [](const Entry& x, const Entry& y) { return x.idx < y.idx; });
+      first[j] = vb->val;
+      uint64_t h = 1469598103934665603ULL ^ (static_cast<size_t>(ve - vb) * 2 + is_int_[j]);
+      for (auto it = vb; it != ve; ++it) {
+        Entry& e = *it;
         e.val /= first[j];
         const auto q = static_cast<int64_t>(std::llround(e.val * 1e6));
         h = (h ^ static_cast<uint64_t>(e.idx)) * 1099511628211ULL;
         h = (h ^ static_cast<uint64_t>(q)) * 1099511628211ULL;
       }
-      buckets[h].push_back(j);
+      keys.push_back({h, j});
     }
-    for (auto& kv : buckets) {
-      auto& cs = kv.second;
-      for (size_t x = 0; x < cs.size() && cs.size() > 1; ++x) {
-        const Index k = cs[x];
+    off[n_] = static_cast<Index>(norm.size());
+    std::sort(keys.begin(), keys.end());
+    for (size_t g0 = 0, g1; g0 < keys.size(); g0 = g1) {
+      for (g1 = g0 + 1; g1 < keys.size() && keys[g1].first == keys[g0].first; ++g1) {}
+      for (size_t x = g0; x < g1 && g1 - g0 > 1; ++x) {
+        const Index k = keys[x].second;
         if (!col_alive_[k]) continue;
-        for (size_t y = x + 1; y < cs.size(); ++y) {
-          const Index j = cs[y];
-          if (!col_alive_[j] || is_int_[j] != is_int_[k] || norm[j].size() != norm[k].size()) continue;
+        const Index lenk = off[k + 1] - off[k];
+        for (size_t y = x + 1; y < g1; ++y) {
+          const Index j = keys[y].second;
+          if (!col_alive_[j] || is_int_[j] != is_int_[k] || off[j + 1] - off[j] != lenk) continue;
           bool same = true;
-          for (size_t t = 0; t < norm[k].size() && same; ++t) {
-            const Entry &e1 = norm[k][t], &e2 = norm[j][t];
+          for (Index t = 0; t < lenk && same; ++t) {
+            const Entry &e1 = norm[off[k] + t], &e2 = norm[off[j] + t];
             same = e1.idx == e2.idx && std::abs(e1.val - e2.val) <= 1e-12 * std::max(1.0, std::abs(e1.val));
           }
           if (!same) continue;
@@ -1191,6 +1432,31 @@ class PresolveWork {
     return ch;
   }
 
+  bool binary(Index j) const { return is_int_[j] && lb_[j] == 0.0 && ub_[j] == 1.0; }
+
+  // Whether column j is in a row (other than skip) of three or more binaries with one coefficient a and the side
+  // a on the bounded side of a: sum x <= 1 or sum x = 1 after scaling. Rows of up to 64 columns of j are looked
+  // at, each scanned in full.
+  bool packing_member(Index j, Index skip) const {
+    if (col_size_[j] > 64) return false;
+    for (const Entry& c : cols_[j]) {
+      const Index r = c.idx;
+      if (r == skip || !row_alive_[r] || row_size_[r] < 3) continue;
+      const double a = c.val;
+      if (a > 0 ? rub_[r] != a : rlb_[r] != a) continue;
+      bool ok = true;
+      for (const Entry& e : rows_[r]) {
+        if (!col_alive_[e.idx]) continue;
+        if (e.val != a || !binary(e.idx)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+
   // Doubleton equations a_j x_j + a_k x_k = b: substitute x_j = (b - a_k x_k) / a_j everywhere, move the bounds
   // of x_j onto x_k and drop the row. x_j is continuous, or both are integer with a_k / a_j and b / a_j integral.
   long long aggregate() {
@@ -1219,6 +1485,14 @@ class PresolveWork {
         const bool ok0 = ok(0), ok1 = ok(1);
         if (!ok0 && !ok1) continue;
         el = ok0 && ok1 ? (col_size_[e[0].idx] <= col_size_[e[1].idx] ? 0 : 1) : (ok0 ? 0 : 1);
+        // Complements x + y = 1 of two binaries: the one that is a member of a packing or partitioning row stays,
+        // so that the row keeps its form for the clique steps and the one-of groups (traininstance6: the 501
+        // members of a group were replaced by their complements, sum y = 500, and no step recognized the group).
+        if (opt_.keep_members && ok0 && ok1 && e[0].val == e[1].val && b == e[0].val && binary(e[0].idx) &&
+            binary(e[1].idx)) {
+          const bool m0 = packing_member(e[0].idx, i), m1 = packing_member(e[1].idx, i);
+          if (m0 != m1) el = m0 ? 1 : 0;
+        }
       }
       const Index j = e[el].idx, k = e[1 - el].idx;
       const double aj = e[el].val, ak = e[1 - el].val;
@@ -1256,6 +1530,42 @@ class PresolveWork {
   // |a_rj| >= |a_j| / kMaxImpliedRatio (a_j: x_j's coefficient in row skip): a reduced point violating row r by v
   // puts x_j up to v / |a_rj| beyond its bound, and postsolve's clamp moves that into row skip as |a_j| v / |a_rj|
   // (milo-v12-6-r2-40-1 has ratios up to 100; 10 keeps 232 of the 270 rows removed without a limit).
+  struct RowAct {
+    double minact = 0.0, maxact = 0.0, mag = 0.0;  // over all live columns of the row
+    int nmin = 0, nmax = 0;                        // terms with a bound beyond kBig
+    int stamp = -1;                                // valid if equal to row_act_stamp_
+    bool exact = false;                            // integer terms, totals below 2^52: the sums carry no rounding
+  };
+  // Sums of row r under the current bounds, kept until the row or its columns change (substitute_equations
+  // starts a new stamp at every call and drops the rows of a column it substitutes; nothing else changes them
+  // while implied_by_rows is in use).
+  const RowAct& row_act(Index r) const {
+    RowAct& c = row_act_[r];
+    if (c.stamp == row_act_stamp_) return c;
+    c = RowAct{};
+    c.stamp = row_act_stamp_;
+    c.exact = true;
+    for (const Entry& e : rows_[r]) {
+      const Index k = e.idx;
+      if (!col_alive_[k]) continue;
+      const double bl = e.val > 0 ? lb_[k] : ub_[k], bh = e.val > 0 ? ub_[k] : lb_[k];
+      if (small_bound(bl)) {
+        const double t = e.val * bl;
+        c.minact += t, c.mag += std::abs(t), c.exact = c.exact && t == std::round(t);
+      } else {
+        ++c.nmin;
+      }
+      if (small_bound(bh)) {
+        const double t = e.val * bh;
+        c.maxact += t, c.mag += std::abs(t), c.exact = c.exact && t == std::round(t);
+      } else {
+        ++c.nmax;
+      }
+      c.exact = c.exact && c.mag <= 4503599627370496.0;
+    }
+    return c;
+  }
+
   void implied_by_rows(Index j, Index skip, double aj, bool& lo, bool& hi) const {
     for (const Entry& x : cols_[j]) {
       const Index r = x.idx;
@@ -1269,13 +1579,30 @@ class PresolveWork {
       if (!want_ub && !want_lb) continue;
       double minact = 0.0, maxact = 0.0, mag = 0.0;
       int nmin_inf = 0, nmax_inf = 0;
-      for (const Entry& e : rows_[r]) {
-        const Index k = e.idx;
-        if (k == j || !col_alive_[k]) continue;
-        const double bl = e.val > 0 ? lb_[k] : ub_[k], bh = e.val > 0 ? ub_[k] : lb_[k];
-        if (small_bound(bl)) minact += e.val * bl, mag += std::abs(e.val * bl); else ++nmin_inf;
-        if (small_bound(bh)) maxact += e.val * bh, mag += std::abs(e.val * bh); else ++nmax_inf;
-        if (nmin_inf > 0 && nmax_inf > 0) break;
+      // The sums over the row without x_j. One long row is asked about by many of its columns (triptim1: rows of
+      // over a thousand entries, 43 million entries walked per call of substitute_equations, twelve calls with no
+      // substitution at all), so the sums over the whole row are kept while the row is unchanged (row_act). The
+      // counts of unbounded terms without x_j follow from them; the sums only when every term is an integer and
+      // the totals stay below 2^52: then total minus x_j's term is the same number as the sum that skips x_j.
+      const RowAct& c = row_act(r);
+      const double jl = a > 0 ? lb_[j] : ub_[j], jh = a > 0 ? ub_[j] : lb_[j];
+      const int jmin_inf = small_bound(jl) ? 0 : 1, jmax_inf = small_bound(jh) ? 0 : 1;
+      if (c.nmin - jmin_inf > 0 && c.nmax - jmax_inf > 0) {
+        nmin_inf = nmax_inf = 1;  // neither side gives a bound (the walk below would stop at once)
+      } else if (c.exact) {
+        nmin_inf = c.nmin - jmin_inf, nmax_inf = c.nmax - jmax_inf;
+        minact = c.minact - (jmin_inf ? 0.0 : a * jl);
+        maxact = c.maxact - (jmax_inf ? 0.0 : a * jh);
+        mag = c.mag - (jmin_inf ? 0.0 : std::abs(a * jl)) - (jmax_inf ? 0.0 : std::abs(a * jh));
+      } else {
+        for (const Entry& e : rows_[r]) {
+          const Index k = e.idx;
+          if (k == j || !col_alive_[k]) continue;
+          const double bl = e.val > 0 ? lb_[k] : ub_[k], bh = e.val > 0 ? ub_[k] : lb_[k];
+          if (small_bound(bl)) minact += e.val * bl, mag += std::abs(e.val * bl); else ++nmin_inf;
+          if (small_bound(bh)) maxact += e.val * bh, mag += std::abs(e.val * bh); else ++nmax_inf;
+          if (nmin_inf > 0 && nmax_inf > 0) break;
+        }
       }
       double scale = 1.0;
       if (has_lb) scale = std::max(scale, std::abs(rlb_[r]));
@@ -1334,6 +1661,11 @@ class PresolveWork {
   long long substitute_equations() {
     long long ch = 0;
     std::vector<Entry> r, terms;
+    if (row_act_.size() != static_cast<size_t>(m_)) row_act_.assign(m_, RowAct{});
+    if (++row_act_stamp_ == std::numeric_limits<int>::max()) {
+      row_act_.assign(m_, RowAct{});
+      row_act_stamp_ = 0;
+    }
     for (Index i = 0; i < m_ && status_ == PresolveStatus::Reduced; ++i) {
       if (!row_alive_[i] || rlb_[i] != rub_[i] || row_size_[i] < 2) continue;
       const double b = rlb_[i];
@@ -1433,6 +1765,7 @@ class PresolveWork {
       // The other columns keep the row: their activity is b - a x_j for x_j in [lb_j, ub_j].
       const double side_ub = std::isfinite(ub_[j]) && !best_hi ? b - a * ub_[j] : (a > 0 ? -kInf : kInf);
       const double side_lb = std::isfinite(lb_[j]) && !best_lo ? b - a * lb_[j] : (a > 0 ? kInf : -kInf);
+      for (const Entry& x : cols_[j]) row_act_[x.idx].stamp = -1;  // the rows that change (row i among them)
       substitute(j, b, a, terms, i);
       rlb_[i] = a > 0 ? side_ub : side_lb;
       rub_[i] = a > 0 ? side_lb : side_ub;
@@ -1652,6 +1985,35 @@ class PresolveWork {
     return combos;
   }
 
+  // Propagation over one-of groups with shaving of integer cost columns (group_prop.hpp); applies the bounds.
+  long long group_prop() {
+    MipProblem q;
+    std::vector<Index> cols;
+    assemble(q, cols);
+    const GroupPropResult gr = group_propagate(q);
+    if (gr.groups == 0) {
+      stats_.group_runs = 99;  // no groups: no further run
+      return 0;
+    }
+    if (gr.infeasible) {
+      status_ = PresolveStatus::Infeasible;
+      log_.log(3, "Presolve: one-of group propagation proved infeasibility\n");
+      return 0;
+    }
+    long long ch = 0;
+    for (size_t t = 0; t < cols.size() && status_ == PresolveStatus::Reduced; ++t) {
+      const Index j = cols[t];
+      if (gr.lb[t] <= lb_[j] && gr.ub[t] >= ub_[j]) continue;
+      ch += tighten(j, gr.lb[t], gr.ub[t], 0.0);
+    }
+    stats_.group_fixed += gr.fixed;
+    stats_.group_bounds += gr.tightened;
+    stats_.group_shaved += gr.shaved;
+    log_.log(3, "Presolve one-of groups: %d groups, %d members fixed, %d bounds, %d shaving steps (%d probes), work "
+             "%lld\n", gr.groups, gr.fixed, gr.tightened, gr.shaved, gr.shave_probes, gr.work);
+    return ch;
+  }
+
   // Probing on the binaries of the current problem; applies fixings, bounds, liftings and equivalences.
   // *useful: fixings + equivalences + liftings.
   long long probing(double effort, long long* useful) {
@@ -1662,6 +2024,17 @@ class PresolveWork {
     if (stats_.probing_passes > 1) limit = std::min(limit, last_probe_work_);
     ProbingOptions po;
     po.lift = opt_.probing_lift;
+    po.lift_dyadic = opt_.lift_dyadic;
+    // Default: as many candidates side by side as there are threads, at most 4 (measured at 4 on 4 threads);
+    // one thread probes one candidate at a time (a batch on one thread costs more than it finds).
+    po.batch = opt_.probing_batch >= 0 ? opt_.probing_batch : opt_.threads >= 2 ? std::min(4, opt_.threads) : 0;
+    po.threads = opt_.threads;
+    // MILP_PROBE_STOP=1 (trial, off by default): a pass gives up after a shorter stretch without a useful probe,
+    // 5% of its work limit in the first pass and 2.5% in the later ones instead of 10% (each counted twice: the
+    // order is reversed once). nw04's first pass used 0.66 s for one fixing, and a later pass that finds nothing
+    // costs 20% of the pass before it (neos-957323 0.17 s, k1mushroom 0.14 s).
+    static const bool probe_stop = [] { const char* v = std::getenv("MILP_PROBE_STOP"); return v && v[0] == '1'; }();
+    if (probe_stop) po.idle_frac = stats_.probing_passes > 1 ? 0.025 : 0.05;
     // Implications between binaries (conflicting literal pairs), kept over the passes: at most 8 per nonzero
     // (3e6 pairs, ~50 MB with the prober's adjacency lists; mzzv42z: 1.2e6). The previous passes' ones seed the
     // propagation (live, unmerged columns still binary).
@@ -1729,6 +2102,11 @@ class PresolveWork {
       if (std::min(e.v0, e.v1) < lb_[y] - tol * (1.0 + std::abs(lb_[y])) ||
           std::max(e.v0, e.v1) > ub_[y] + tol * (1.0 + std::abs(ub_[y])))
         continue;
+      // A column that takes (nearly) the same value in both probes is not equivalent to x: the difference is
+      // round-off (a continuous column within [0.4999999999, 0.5000000002]: "y = 0.5 + 3.4e-11 x" left the
+      // coefficient 3.4e-11 in a row, then x in [-29091, 29090] and sides of 2e11; fuzz seed 22, case 1184 of
+      // the sparsify models, wrong since v0.10.0 behind the solver's check of the postsolved point).
+      if (std::abs(e.v1 - e.v0) <= 1e-7 * std::max({1.0, std::abs(e.v0), std::abs(e.v1)})) continue;
       const double d = e.v1 - e.v0, c0 = neg ? e.v0 + d : e.v0, c1 = neg ? -d : d;  // y = c0 + c1 x
       if (log_.verbosity() >= 4) log_.log(4, "  probing: col %d = %.12g + %.12g col %d\n", y, c0, c1, x);
       substitute(y, c0, 1.0, {{x, -c1}}, -1);
@@ -1778,6 +2156,24 @@ class PresolveWork {
         if (!col_alive_[e.idx]) continue;
         if (e.idx == j) a = e.val;
         amax = std::max(amax, std::abs(e.val));
+      }
+      if (opt_.lift_live) {
+        // A row that the fixings of this pass made redundant is not lifted: the lift would keep it alive with
+        // entries of other binaries (traininstance6: 1300 big-M rows of one-of members fixed at 0 by the same
+        // pass stayed as four-entry rows). The next round removes it.
+        double maxact = 0.0;
+        bool finite = true;
+        for (const Entry& e : rows_[i]) {
+          if (!col_alive_[e.idx]) continue;
+          const double v = s * e.val > 0 ? ub_[e.idx] : lb_[e.idx];
+          if (!std::isfinite(v)) {
+            finite = false;
+            break;
+          }
+          maxact += s * e.val * v;
+        }
+        const double side = s * (l.upper ? rub_[i] : rlb_[i]);
+        if (finite && maxact <= side + 1e-9 * std::max(1.0, std::abs(side))) continue;
       }
       // In <= form: c x + ... <= b.
       double c = s * a + (l.one ? l.delta : -l.delta);
@@ -1911,8 +2307,16 @@ class PresolveWork {
   std::vector<double> lb_, ub_, cost_, rlb_, rub_;
   std::vector<char> is_int_;
   std::vector<Index> mark_;  // scratch (new_entries)
+  mutable std::vector<RowAct> row_act_;  // implied_by_rows
+  mutable int row_act_stamp_ = 0;
+  // Scratch of parallel_rows / parallel_cols: normalized vectors in one array (off: start of each), first
+  // values before scaling, (hash, index) pairs.
+  std::vector<Entry> par_norm_;
+  std::vector<Index> par_off_;
+  std::vector<double> par_first_;
+  std::vector<std::pair<uint64_t, Index>> par_keys_;
   double offset_ = 0.0, display_sense_ = 1.0;
-  double step_time_[14] = {};
+  double step_time_[15] = {};
   // Implications between binaries found by probing, as conflicting literal pairs a < b (2 j + v: x_j = v; columns of
   // this problem): seeds of later passes; the pairs of two literals x_j = 1 extend the cliques. Columns that
   // absorbed a parallel column (merged_) no longer stand for themselves.
@@ -1935,6 +2339,13 @@ PresolveOptions PresolveOptions::from_env() {
   PresolveOptions o;
   if (const char* e = std::getenv("MILP_PROBING_EFFORT")) o.probing_effort = std::atof(e);
   if (const char* e = std::getenv("MILP_PROBING_PASSES")) o.probing_passes = std::atoi(e);
+  if (const char* e = std::getenv("MILP_PROBE_PAR")) o.probing_batch = std::atoi(e);
+  if (const char* e = std::getenv("MILP_GROUP_PROP")) o.group_prop = std::atoi(e) != 0;
+  if (const char* e = std::getenv("MILP_INT_DIV")) o.int_divisors = std::atoi(e) != 0;
+  if (const char* e = std::getenv("MILP_KEEP_MEMBERS")) o.keep_members = std::atoi(e) != 0;
+  if (const char* e = std::getenv("MILP_LIFT_LIVE")) o.lift_live = std::atoi(e) != 0;
+  if (const char* e = std::getenv("MILP_LIFT_DYADIC")) o.lift_dyadic = std::atoi(e) != 0;
+  if (const char* e = std::getenv("MILP_UNIT_ROWS")) o.unit_rows = std::atoi(e) != 0;
   if (const char* on = std::getenv("MILP_PRESOLVE_ON")) {
     if ((std::string(",") + on + ",").find(",subst_bounded,") != std::string::npos) o.substitution_bounded = true;
     if ((std::string(",") + on + ",").find(",probing_cliques,") != std::string::npos) o.probing_cliques = true;
@@ -2042,6 +2453,13 @@ PresolveStatus Presolver::run(const MipProblem& in, const PresolveOptions& opt, 
     log.log(2, "Presolve cliques: %lld rows extended, %lld dominated rows, %lld fixed\n", stats_.clique_extended,
             stats_.clique_dominated, stats_.clique_fixed);
   }
+  if (opt.group_prop && stats_.group_runs > 0) {
+    log.log(2, "Presolve one-of groups: %lld members fixed, %lld bounds, %lld shaving steps, %d runs\n", stats_.group_fixed,
+            stats_.group_bounds, stats_.group_shaved, stats_.group_runs == 99 ? 0 : stats_.group_runs);
+  }
+  if (opt.int_divisors && stats_.int_divisors > 0) {
+    log.log(2, "Presolve integer divisors: %lld columns rescaled\n", stats_.int_divisors);
+  }
   if (opt.probing) {
     log.log(2, "Presolve probing: %lld probes, %lld fixed, %lld bounds, %lld equivalences, %lld lifted rows (%lld new "
             "entries), %lld conflicts, %d passes\n", stats_.probes, stats_.probing_fixed, stats_.probing_bounds,
@@ -2086,7 +2504,11 @@ std::vector<double> Presolver::postsolve(const std::vector<double>& x_reduced) c
 std::vector<double> Presolver::crush(const std::vector<double>& x_orig) const {
   std::vector<double> x = x_orig;
   for (const Step& st : stack_) {
-    if (st.other >= 0) x[st.other] += st.coef * x[st.col];  // merged parallel columns: y = x_k + s x_j
+    if (st.other >= 0) {
+      x[st.other] += st.coef * x[st.col];  // merged parallel columns: y = x_k + s x_j
+    } else if (st.terms.size() == 1 && st.terms[0].first == st.col) {
+      x[st.col] = (x[st.col] - st.rhs) / -st.terms[0].second;  // rescaled integer column: x = r + g x'
+    }
   }
   std::vector<double> out(col_map_.size());
   for (size_t k = 0; k < col_map_.size(); ++k) out[k] = x[col_map_[k]];

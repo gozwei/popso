@@ -27,7 +27,7 @@ class CliqueSeparator : public Separator {
 
  private:
   long long work_ = 0;  // literals and graph entries scanned by the last call
-  void build(const MipProblem& p, const SparseMatrix& R, Index m0);
+  void build(const MipProblem& p, const DualSimplex& lp, Index m0);
   bool built_ = false;
   std::vector<std::vector<Index>> cliques_;    // literal lists (2j: x_j, 2j+1: 1 - x_j)
   std::vector<std::vector<Index>> lit_cliques_;  // literal -> clique ids
@@ -35,7 +35,8 @@ class CliqueSeparator : public Separator {
 
 bool binary(const MipProblem& p, Index j) { return p.is_int[j] && p.col_lb[j] == 0.0 && p.col_ub[j] == 1.0; }
 
-void CliqueSeparator::build(const MipProblem& p, const SparseMatrix& R, Index m0) {
+void CliqueSeparator::build(const MipProblem& p, const DualSimplex& lp, Index m0) {
+  const SparseMatrix& R = lp.scaled_row_matrix();  // entry * row_unscale(row): the model's coefficient, exactly
   built_ = true;
   lit_cliques_.assign(2 * static_cast<size_t>(p.num_cols()), {});
   std::vector<std::pair<double, Index>> items;
@@ -46,9 +47,10 @@ void CliqueSeparator::build(const MipProblem& p, const SparseMatrix& R, Index m0
       double b = side;
       items.clear();
       bool ok = true;
+      const double us = lp.row_unscale(i);
       for (Index k = R.begin(i); k < R.end(i) && ok; ++k) {
         const Index j = R.index[k];
-        const double a = sign * R.value[k];
+        const double a = sign * (R.value[k] * us);
         if (binary(p, j)) {
           if (a > 0) {
             items.emplace_back(a, 2 * j);
@@ -80,7 +82,7 @@ void CliqueSeparator::build(const MipProblem& p, const SparseMatrix& R, Index m0
 void CliqueSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   const MipProblem& p = ctx.p;
   work_ = 0;
-  if (!built_) build(p, ctx.lp.row_matrix(), ctx.num_problem_rows);
+  if (!built_) build(p, ctx.lp, ctx.num_problem_rows);
   const std::vector<Index>& cs = ctx.data.conflict_start;
   const std::vector<Index>& cl = ctx.data.conflict_lit;
   const bool probed = !cs.empty() && !cl.empty();

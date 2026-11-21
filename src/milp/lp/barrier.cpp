@@ -177,7 +177,17 @@ class NormalEquations {
     dense_diag_.assign(static_cast<size_t>(m_), 0.0);
     for (Index j : dense_cols_)
       for (Index t = A.begin(j); t < A.end(j); ++t) dense_diag_[A.index[t]] += A.value[t] * A.value[t] * theta[j];
+    // The product is polled as the factorization is (square47, 2294 rows of 3700 entries on average: seconds per
+    // product; a barrier that lost the root race or ran into the time limit was waited for that long).
+    long long since_poll = 0;
     for (Index i = 0; i < m_; ++i) {
+      if (since_poll > 4000000) {
+        since_poll = 0;
+        if ((chol_.stop && chol_.stop->load(std::memory_order_relaxed)) || interrupted_or_expired()) {
+          std::fill(work_.begin(), work_.end(), 0.0);
+          return false;
+        }
+      }
       for (Index k = At.begin(i); k < At.end(i); ++k) {
         const Index j = At.index[k];
         const double aij = At.value[k];
@@ -188,6 +198,7 @@ class NormalEquations {
         const Index* e = A.index.data() + A.end(j);
         const Index* p = std::lower_bound(b, e, i);
         for (const Index* q = p; q < e; ++q) work_[*q] += f * A.value[static_cast<size_t>(q - A.index.data())];
+        since_poll += e - p + 8;
       }
       work_[i] += delta + kDenseDiag * dense_diag_[i];
       for (Index k = start_[i]; k < start_[i + 1]; ++k) {
@@ -526,8 +537,15 @@ class KktSolver {
       augmented_ = false;
       return ne_ok;
     }
-    // The augmented system is larger and indefinite; it needs a clear advantage.
-    augmented_ = !ne_ok || force == 2 || aug_.flops() < 0.5 * ne_.cost();
+    // The augmented system is larger and indefinite; it needs a clear advantage. Work per iteration: the
+    // factorization's flops plus the memory-bound passes over the factor (and A, for the normal equations) of the
+    // half dozen refined solves, which dominate when the factorization is cheap (supportcase19, 10712 x 1429458:
+    // 6.6e8 against 1.4e9 flops, but 0.45 s against 0.35 s per iteration, and the augmented system's
+    // regularization stalls there).
+    constexpr double kSolveWeight = 100.0;
+    const double aug_work = aug_.flops() + kSolveWeight * static_cast<double>(aug_.factor_nnz());
+    const double ne_work = ne_.cost() + kSolveWeight * static_cast<double>(ne_.factor_nnz() + A.nnz());
+    augmented_ = !ne_ok || force == 2 || aug_work < 0.5 * ne_work;
     if (log) log->log(2, "Barrier: using the %s\n", augmented_ ? "augmented system" : "normal equations");
     if (augmented_) ne_ = NormalEquations();
     else aug_ = AugmentedSystem();
@@ -1025,9 +1043,14 @@ IpmResult Ipm::run() {
   int no_progress = 0;
   int iter = 0;
   double pinf0 = 0.0, dinf0 = 0.0, mu0 = 0.0;
+  double prev_pinf = kInf;  // the previous iteration's relative primal infeasibility
   // Best iterate so far (largest of the relative measures): when the method breaks down near the
   // end (round-off), a point within kNearOptimal is still good enough for the crossover.
   constexpr double kNearOptimal = 1e-6;
+  // Iterations without progress that end the method once the best iterate is within kNearOptimal
+  // (MILP_IPM_STALL, default 30, the patience everywhere else: 4 ends a stall at a relative gap of 2.6e-8 after
+  // 31 instead of 75 iterations on one LP, but measured 1.025 [1.007, 1.044] over the screening set).
+  static const int stall_near = [] { const char* v = std::getenv("MILP_IPM_STALL"); return v ? std::max(1, std::atoi(v)) : 30; }();
   struct Snapshot {
     std::vector<double> x, xl, xu, zl, zu, y;
     double merit = kInf;
@@ -1092,7 +1115,11 @@ IpmResult Ipm::run() {
       best_merit = std::min(best_merit, merit);
       best_infeas = std::min(best_infeas, infeas);
       no_progress = 0;
-    } else if (++no_progress >= 30) {
+    } else if (++no_progress >= (best_merit <= kNearOptimal ? stall_near : 30)) {
+      // Near the optimum (the best iterate is good enough for the crossover) a few iterations without a tenth
+      // less are a stall, not a pause: triptim1 on x86 sat at a relative gap of 2.6e-8 with residuals of 1e-13
+      // from iteration 36 to 75 (99 s instead of 39 s; the tolerance is 1e-8) after 80 redundant rows were
+      // removed, and the method went on from the best iterate anyway.
       status = IpmStatus::NumericalError;
       break;
     }
@@ -1171,15 +1198,22 @@ IpmResult Ipm::run() {
       ap = ap2, ad = ad2;
     }
 
-    // QP: once the dual regularization's error in the primal equations (delta dy: the solves
+    // Once the dual regularization's error in the primal equations (delta dy: the solves
     // use the regularized matrix) has dominated a primal residual above the tolerance for five
     // iterations, the solves are refined against the unregularized matrix from then on. With
     // large optimal duals (YAO: |y| ~ 1e5 against costs ~ 1e-3) the primal residual otherwise
     // stalls near delta |dy| while complementarity collapses (iteration limit). Not from the
     // start: the refinement then costs extra solves (MIQP nodes of miqpport: +30% time).
-    if (quadratic_ && !exact_) {
+    // LPs too: supportcase19's root (normal equations) took full steps with dx -> 0 and
+    // delta |dy| = |r_p| from iteration 40 on, the residual and mu frozen ("numerical error"
+    // after 65 iterations); refined it is optimal after 32.
+    if (!exact_) {
       const double rp = inf_norm(rp_);
-      if (reg_d_ * inf_norm(dy) > 0.5 * rp && rp > opt_.tol * (1.0 + bnorm)) ++reg_dominated_;
+      // An LP only while the primal residual does not fall either (rail01, rail02 with the augmented system: the
+      // regularization dominates early while the residual still falls; refining there cost 25% more time).
+      const bool stuck = quadratic_ || pinf > 0.9 * prev_pinf;
+      prev_pinf = pinf;
+      if (stuck && reg_d_ * inf_norm(dy) > 0.5 * rp && rp > opt_.tol * (1.0 + bnorm)) ++reg_dominated_;
       else reg_dominated_ = 0;
       if (reg_dominated_ >= 5) {
         exact_ = true;

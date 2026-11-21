@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <limits>
 
+#include "milp/core/interrupt.hpp"
 #include "milp/core/worker_pool.hpp"
 #include "milp/cuts/cut.hpp"
 #include "milp/cuts/mcf.hpp"
@@ -81,12 +82,14 @@ class MirSeparator : public Separator {
 
  private:
   // Variables 0..n-1 are structurals, n + i is the logical of LP row i.
-  double lower(Index j) const { return j < n_ ? ctx_->p.col_lb[j] : ctx_->lp.var_lower(j); }
-  double upper(Index j) const { return j < n_ ? ctx_->p.col_ub[j] : ctx_->lp.var_upper(j); }
+  // (Read from the call's copies lo_ / up_ / cls_, set up in separate(): the transformation of every
+  // aggregation asks for each of its columns, and the logicals' bounds were calls into the LP.)
+  double lower(Index j) const { return own_->lo_[j]; }
+  double upper(Index j) const { return own_->up_[j]; }
   // Integer columns, and implied integers (MipProblem::implied_int) with integral bounds: some optimal
   // solution has them integral, so the c-MIR rounding may treat them as integers.
-  bool is_int(Index j) const {
-    if (j >= n_) return false;
+  bool is_int(Index j) const { return own_->cls_[j] == kClsInt; }
+  bool is_int_column(Index j) const {
     const MipProblem& p = ctx_->p;
     if (p.is_int[j]) return true;
     return p.is_implied_int(j) && integral_bound(p.col_lb[j]) && integral_bound(p.col_ub[j]);
@@ -106,7 +109,11 @@ class MirSeparator : public Separator {
   bool try_flowcover(Cut* cut);
   // Distance of continuous x_j from its closest bound (incl. variable bounds) and that bound.
   // sign > 0 (< 0): only simple bounds and VUBs (VLBs), sign 0: all.
-  double bound_distance(Index j, ContTerm* t, int sign = 0) const;
+  // Columns with several variable bounds keep the result per call (bd_slot_ / bd_cache_): it depends on
+  // the LP point and the bounds only, and every aggregation of a path transforms the column again (swath3:
+  // the variable bound lists were 6% of the tree time).
+  double bound_distance(Index j, ContTerm* t, int sign = 0);
+  double bound_distance_raw(Index j, ContTerm* t, int sign) const;
   // Builds cont_/ints_ for the base sum agg_j x_j <= b; returns beta's b part (nan on failure).
   // Mode 0: closest bound; mode 1: variable bounds only where the x' term is kept (c < 0).
   double transform(double b, int mode, bool* vb_skipped);
@@ -172,7 +179,31 @@ class MirSeparator : public Separator {
   // Per column (built on first use in a call): positions k in its column of the problem rows whose
   // logical is within kTightDist of a bound, the only candidates for path elimination (app1-1 has
   // continuous columns in 1225 rows, scanned at every aggregation step otherwise).
-  std::vector<Index> tight_beg_, tight_end_, tight_k_;
+  // A candidate carries what the row choice reads (its row, the model's coefficient, the row's distance, dual
+  // score and integer flag), so the choice walks one array; rows it would always skip (longer than the limit,
+  // variable bound rows) are left out when the list is built.
+  struct TightRow {
+    Index r;
+    double val, dist, ds;
+    char has_int;
+  };
+  std::vector<Index> tight_beg_, tight_end_;
+  std::vector<TightRow> tight_;
+  struct BdEntry {
+    ContTerm t[3];
+    double d[3];
+    const VarBound* kvb[2];
+    double kbest[2];
+    unsigned char have = 0;  // bits 0-2: t / d by sign + 1; bits 3-4: the knapsack's choice by side
+  };
+  // Per variable of the call: integer (see is_int_column), continuous with at least kBdCacheMin variable
+  // bounds (bound distances kept in bd_cache_), other continuous (logicals too).
+  enum : char { kClsCont = 0, kClsInt = 1, kClsVb = 2 };
+  std::vector<char> cls_;
+  std::vector<double> lo_, up_;
+  std::vector<Index> bd_slot_;  // per column: its entry of bd_cache_ in this call, or -1
+  std::vector<BdEntry> bd_cache_;
+  static constexpr size_t kBdCacheMin = 1;  // variable bounds of a column from which the result is kept
   std::vector<ContTerm> cont_;
   std::vector<IntTerm> ints_;
   std::vector<double> deltas_;
@@ -222,7 +253,21 @@ class MirSeparator : public Separator {
   std::vector<long long> chunk_work_;
 };
 
-double MirSeparator::bound_distance(Index j, ContTerm* t, int sign) const {
+double MirSeparator::bound_distance(Index j, ContTerm* t, int sign) {
+  if (own_->cls_[j] != kClsVb) return bound_distance_raw(j, t, sign);
+  if (bd_slot_[j] < 0) bd_slot_[j] = static_cast<Index>(bd_cache_.size()), bd_cache_.emplace_back();
+  BdEntry& e = bd_cache_[bd_slot_[j]];
+  const int s = sign < 0 ? 0 : sign > 0 ? 2 : 1;
+  if (!(e.have >> s & 1)) {
+    e.d[s] = bound_distance_raw(j, &e.t[s], sign);
+    if (!is_finite(e.d[s])) e.t[s] = ContTerm{j, BoundKind::Lower, 0.0, -1, 0.0, 0.0, 0.0};  // never read
+    e.have = static_cast<unsigned char>(e.have | 1 << s);
+  }
+  *t = e.t[s];
+  return e.d[s];
+}
+
+double MirSeparator::bound_distance_raw(Index j, ContTerm* t, int sign) const {
   const double* xv = ctx_->x;
   const double x = xv[j];
   double best = kInf, best_key = kInf;
@@ -253,12 +298,13 @@ double MirSeparator::bound_distance(Index j, ContTerm* t, int sign) const {
 }
 
 void MirSeparator::add_row(Index i, double mult) {
-  const SparseMatrix& R = ctx_->lp.row_matrix();
+  const SparseMatrix& R = ctx_->lp.scaled_row_matrix();  // entry * us: the model's coefficient, exactly
+  const double us = ctx_->lp.row_unscale(i);
   auto add = [&](Index j, double v) {
     if (!mark_[j]) mark_[j] = 1, nz_.push_back(j);
     agg_[j] += v;
   };
-  for (Index k = R.begin(i); k < R.end(i); ++k) add(R.index[k], mult * R.value[k]);
+  for (Index k = R.begin(i); k < R.end(i); ++k) add(R.index[k], mult * (R.value[k] * us));
   add(n_ + i, mult);
   work_count_ += R.end(i) - R.begin(i);
 }
@@ -273,9 +319,10 @@ void MirSeparator::emit(Index j, double v, Cut* cut) const {
     cut->idx.push_back(j), cut->val.push_back(v);
     return;
   }
-  const SparseMatrix& R = ctx_->lp.row_matrix();
+  const SparseMatrix& R = ctx_->lp.scaled_row_matrix();
   const Index i = j - n_;
-  for (Index k = R.begin(i); k < R.end(i); ++k) cut->idx.push_back(R.index[k]), cut->val.push_back(-v * R.value[k]);
+  const double us = ctx_->lp.row_unscale(i);
+  for (Index k = R.begin(i); k < R.end(i); ++k) cut->idx.push_back(R.index[k]), cut->val.push_back(-v * (R.value[k] * us));
 }
 
 // MIR cut for divisor delta over the current cont_/ints_ transformation, written
@@ -604,22 +651,34 @@ bool MirSeparator::try_knapsack(Cut* cut, double b0) {
     const double x = xv[j];
     double best = kInf;
     const VarBound* vb_best = nullptr;
-    if (a > 0) {
-      if (is_finite(l)) best = x - l;
-      if (j < n_) {
-        for (const VarBound& vb : ctx_->data.vlb[j]) {
-          const double d = x - (vb.constant + vb.coef * xv[vb.y]) - 1e-6;
-          if (d < best) best = d, vb_best = &vb;
-        }
-      }
+    // Kept per call for columns with several variable bounds, as bound_distance does.
+    BdEntry* e = nullptr;
+    const int side = a > 0 ? 0 : 1;
+    if (own_->cls_[j] == kClsVb) {
+      if (bd_slot_[j] < 0) bd_slot_[j] = static_cast<Index>(bd_cache_.size()), bd_cache_.emplace_back();
+      e = &bd_cache_[bd_slot_[j]];
+    }
+    if (e && (e->have >> (3 + side) & 1)) {
+      best = e->kbest[side], vb_best = e->kvb[side];
     } else {
-      if (is_finite(u)) best = u - x;
-      if (j < n_) {
-        for (const VarBound& vb : ctx_->data.vub[j]) {
-          const double d = vb.constant + vb.coef * xv[vb.y] - x - 1e-6;
-          if (d < best) best = d, vb_best = &vb;
+      if (a > 0) {
+        if (is_finite(l)) best = x - l;
+        if (j < n_) {
+          for (const VarBound& vb : ctx_->data.vlb[j]) {
+            const double d = x - (vb.constant + vb.coef * xv[vb.y]) - 1e-6;
+            if (d < best) best = d, vb_best = &vb;
+          }
+        }
+      } else {
+        if (is_finite(u)) best = u - x;
+        if (j < n_) {
+          for (const VarBound& vb : ctx_->data.vub[j]) {
+            const double d = vb.constant + vb.coef * xv[vb.y] - x - 1e-6;
+            if (d < best) best = d, vb_best = &vb;
+          }
         }
       }
+      if (e) e->kbest[side] = best, e->kvb[side] = vb_best, e->have = static_cast<unsigned char>(e->have | 1 << (3 + side));
     }
     if (!is_finite(best)) return false;
     if (vb_best) {
@@ -986,22 +1045,29 @@ bool MirSeparator::try_flowcover(Cut* cut) {
 
 void MirSeparator::build_tight(Index j) {
   const Index m0 = ctx_->num_problem_rows;
-  const SparseMatrix& C = ctx_->lp.col_matrix();
-  tight_beg_[j] = static_cast<Index>(tight_k_.size());
+  const SparseMatrix& C = ctx_->lp.scaled_col_matrix();  // pattern as the model's; values scaled by row
+  const SparseMatrix& R = ctx_->lp.scaled_row_matrix();  // the pattern only
+  const MipProblem& p = ctx_->p;
+  const Index max_len = 500;
+  // The dual score is used for continuous columns without a variable bound from a two-variable row only
+  // (see aggregate_path).
+  const bool by_dual = dual_choice_ && !is_int(j) && !ctx_->data.row_vb[j];
+  tight_beg_[j] = static_cast<Index>(tight_.size());
   for (Index k = C.begin(j); k < C.end(j); ++k) {
     const Index r = C.index[k];
-    if (r < m0 && row_dist_[r] <= kTightDist) tight_k_.push_back(k);
+    if (r >= m0 || row_dist_[r] > kTightDist) continue;
+    const Index rlen = R.end(r) - R.begin(r);
+    if (rlen > max_len) continue;
+    if (rlen == 2 && (p.is_int[R.index[R.begin(r)]] || p.is_int[R.index[R.begin(r) + 1]])) continue;  // VB row
+    tight_.push_back({r, C.value[k] / ctx_->lp.row_scale(r), row_dist_[r],
+                      by_dual ? row_dual_[r] + 1e-3 / (1.0 + static_cast<double>(rlen)) : 0.0, row_int_[r]});
   }
-  tight_end_[j] = static_cast<Index>(tight_k_.size());
+  tight_end_[j] = static_cast<Index>(tight_.size());
   work_count_ += C.end(j) - C.begin(j);
 }
 
 void MirSeparator::aggregate_path(Index i0, double sign, std::vector<Cut>& out) {
-  const SparseMatrix& R = ctx_->lp.row_matrix();
-  const SparseMatrix& C = ctx_->lp.col_matrix();
-  const MipProblem& p = ctx_->p;
   const MirSeparator& o = *own_;
-  const Index max_len = 500;
   clear_agg();
   for (Index r : used_) row_used_[r] = 0;
   used_.assign(1, i0);
@@ -1066,29 +1132,24 @@ void MirSeparator::aggregate_path(Index i0, double sign, std::vector<Cut>& out) 
     double sbest = kInf, mbest = 0.0, dbest_row = -1.0;
     const bool prefer_int = ctx_->data.vub[jbest].empty() && ctx_->data.vlb[jbest].empty();
     if (o.tight_beg_[jbest] < 0) build_tight(jbest);  // own_ == this here (separate_chunked builds them first)
-    for (Index t = o.tight_beg_[jbest]; t < o.tight_end_[jbest]; ++t) {
-      const Index k = o.tight_k_[t];
-      const Index r = C.index[k];
+    // Among equally tight rows: the one with the largest LP dual (as SCIP's aggregation row score: the
+    // rows that prove the LP bound; neos17 pairs an observation row with a contradicting one), then
+    // the sparser one; otherwise the first tight row in column order. Not for integer eliminations
+    // (mzzv42z root 100 -> 98%) nor columns with a variable bound from a two-variable row (x <= u y:
+    // the balance rows of lot sizing / fixed charge paths are taken in order; by dual, mc11 went from
+    // 15-23 s to 24-120 s over 3 seeds, exp-1-500-5-5 1 -> 3 s). (TightRow::ds, set in build_tight.)
+    const double aj = agg_[jbest];
+    const TightRow* tend = o.tight_.data() + o.tight_end_[jbest];
+    for (const TightRow* t = o.tight_.data() + o.tight_beg_[jbest]; t != tend; ++t) {
+      const Index r = t->r;
       if (row_used_[r]) continue;
-      // Cheapest test first: the row must be tight (its logical at a bound).
-      const double mult = -agg_[jbest] / C.value[k];
-      double slack = o.row_dist_[r] * std::abs(mult);
+      // The row must be tight (its logical at a bound).
+      const double mult = -aj / t->val;
+      double slack = t->dist * std::abs(mult);
       if (slack > 1e-6) continue;
-      const Index rlen = R.end(r) - R.begin(r);
-      if (rlen > max_len) continue;
-      if (rlen == 2 && (p.is_int[R.index[R.begin(r)]] || p.is_int[R.index[R.begin(r) + 1]])) continue;  // VB row
-      if (prefer_int && !o.row_int_[r]) slack += 1.0;
-      // Among equally tight rows: the one with the largest LP dual (as SCIP's aggregation row score: the
-      // rows that prove the LP bound; neos17 pairs an observation row with a contradicting one), then
-      // the sparser one; otherwise the first tight row in column order. Not for integer eliminations
-      // (mzzv42z root 100 -> 98%) nor columns with a variable bound from a two-variable row (x <= u y:
-      // the balance rows of lot sizing / fixed charge paths are taken in order; by dual, mc11 went from
-      // 15-23 s to 24-120 s over 3 seeds, exp-1-500-5-5 1 -> 3 s).
-      const double ds = dual_choice_ && !is_int(jbest) && !ctx_->data.row_vb[jbest]
-                            ? o.row_dual_[r] + 1e-3 / (1.0 + static_cast<double>(rlen))
-                            : 0.0;
-      if (slack < sbest - 1e-12 || (slack <= sbest + 1e-12 && ds > dbest_row)) {
-        sbest = slack, rbest = r, mbest = mult, dbest_row = ds;
+      if (prefer_int && !t->has_int) slack += 1.0;
+      if (slack < sbest - 1e-12 || (slack <= sbest + 1e-12 && t->ds > dbest_row)) {
+        sbest = slack, rbest = r, mbest = mult, dbest_row = t->ds;
       }
     }
     if (rbest < 0) return;
@@ -1319,7 +1380,7 @@ void MirSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
     fc_win_ = w ? std::atof(w) : 1e30;
   }
   const Index m = lp.num_rows(), m0 = ctx.num_problem_rows;
-  const SparseMatrix& R = lp.row_matrix();
+  const SparseMatrix& R = lp.scaled_row_matrix();  // entry * row_unscale(row): the model's coefficient, exactly
   agg_.assign(n_ + m, 0.0);
   mark_.assign(n_ + m, 0);
   icoef_.assign(n_, 0.0);
@@ -1336,7 +1397,16 @@ void MirSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   row_dist_.resize(m0);
   tight_beg_.assign(n_, -1);
   tight_end_.assign(n_, -1);
-  tight_k_.clear();
+  tight_.clear();
+  bd_slot_.assign(n_, -1);
+  bd_cache_.clear();
+  own_ = this;
+  lo_.resize(n_ + m), up_.resize(n_ + m), cls_.resize(n_ + m);
+  for (Index j = 0; j < n_; ++j) {
+    lo_[j] = p.col_lb[j], up_[j] = p.col_ub[j];
+    cls_[j] = is_int_column(j) ? kClsInt : ctx.data.vlb[j].size() + ctx.data.vub[j].size() >= kBdCacheMin ? kClsVb : kClsCont;
+  }
+  for (Index j = n_; j < n_ + m; ++j) lo_[j] = lp.var_lower(j), up_[j] = lp.var_upper(j), cls_[j] = kClsCont;
   for (Index i = 0; i < m0; ++i) {
     ContTerm t;
     row_dist_[i] = bound_distance(n_ + i, &t);
@@ -1353,9 +1423,10 @@ void MirSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
     row_maxact_.assign(m0, 0.0);
     for (Index i = 0; i < m0; ++i) {
       double lo = 0.0, hi = 0.0;
+      const double us = lp.row_unscale(i);
       for (Index k = R.begin(i); k < R.end(i); ++k) {
         const Index j = R.index[k];
-        const double v = R.value[k];
+        const double v = R.value[k] * us;
         lo += v * (v > 0 ? p.col_lb[j] : p.col_ub[j]);
         hi += v * (v > 0 ? p.col_ub[j] : p.col_lb[j]);
       }
@@ -1425,7 +1496,9 @@ void MirSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
     clear_agg();
     return;
   }
-  for (size_t s = 0; s < starts_.size() && tried < max_starts && work_count_ < budget; ++s) {
+  // The stop flag and the deadline are polled per start (neos-5104907-jarama: a node's separation ran 0.6 s past
+  // the time limit).
+  for (size_t s = 0; s < starts_.size() && tried < max_starts && work_count_ < budget && !interrupted_or_expired(); ++s) {
     const Index i0 = starts_[s].second;
     ++tried;
     if (is_finite(p.row_ub[i0])) aggregate_path(i0, 1.0, out);
@@ -1460,6 +1533,8 @@ void MirSeparator::separate_chunked(long long budget, Index max_starts, std::vec
     h.icoef_.assign(n_, 0.0);
     h.dense_.assign(n_, 0.0);
     h.imark_.assign(n_, 0);
+    h.bd_slot_.assign(n_, -1);
+    h.bd_cache_.clear();
     h.nz_.clear();
     h.inz_.clear();
     h.row_used_.assign(row_used_.size(), 0);
@@ -1474,7 +1549,7 @@ void MirSeparator::separate_chunked(long long budget, Index max_starts, std::vec
   chunk_work_.resize(chunk);
   size_t s = 0;
   Index tried = 0;
-  while (s < starts_.size() && tried < max_starts && work_count_ < budget) {
+  while (s < starts_.size() && tried < max_starts && work_count_ < budget && !interrupted_or_expired()) {
     const size_t len = std::min({chunk, starts_.size() - s, static_cast<size_t>(max_starts - tried)});
     const long long w0 = work_count_;
     std::atomic<size_t> next{0};

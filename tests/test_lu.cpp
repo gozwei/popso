@@ -231,6 +231,165 @@ TEST(lu_hyper_sparse_solves_match_dense) {
   if (!CHECK(worst <= 1e-11)) std::fprintf(stderr, "  worst relative discrepancy %.3g\n", worst);
 }
 
+TEST(lu_ft_update_in_dense_block) {
+  // Forrest-Tomlin updates of positions whose step lies in the dense kernel block (ft_dense): after every
+  // update the solves of the updated factor (dense loops and hyper-sparse) agree with a fresh factorization of
+  // the current basis, and the factor never falls back to product-form etas.
+  std::mt19937 rng(23);
+  int in_block = 0, with_block = 0;
+  double worst = 0.0;
+  for (int trial = 0; trial < 60; ++trial) {
+    const Index m = 130 + static_cast<Index>(rng() % 300);
+    // Nonsingular by construction (the block of a random_basis is often rank deficient and then not kept
+    // as a dense block): a diagonal with a few off-diagonal entries, and k columns that are 70% dense in k rows.
+    std::vector<Col> cols(m);
+    for (Index c = 0; c < m; ++c) {
+      cols[c].push_back({c, 2.0 + static_cast<double>(rng() % 5)});
+      for (int k = static_cast<int>(rng() % 3); k > 0; --k) {
+        const Index r = static_cast<Index>(rng() % m);
+        if (r != c) cols[c].push_back({r, static_cast<double>(static_cast<int>(rng() % 5) - 2) + 0.25});
+      }
+    }
+    {
+      const Index k = 60 + static_cast<Index>(rng() % 40), r0 = static_cast<Index>(rng() % (m - k));
+      for (Index c = 0; c < k; ++c) {
+        Col col;
+        for (Index i = 0; i < k; ++i) {
+          if (i == c) col.push_back({r0 + i, 9.0 + static_cast<double>(rng() % 7)});
+          else if (rng() % 10 < 7) col.push_back({r0 + i, 0.5 + static_cast<double>(rng() % 100) / 37.0});
+        }
+        cols[r0 + c] = col;
+      }
+    }
+    LuFactor lu;
+    lu.ft_dense = true;
+    factorize(lu, cols);
+    if (trial % 2 == 0) {
+      std::vector<Index> old_pos;
+      lu.renumber_positions(old_pos);
+      std::vector<Col> perm(m);
+      for (Index p = 0; p < m; ++p) perm[p] = cols[old_pos[p]];
+      cols.swap(perm);
+    }
+    if (lu.dense_dim() == 0) continue;
+    ++with_block;
+    // Positions of the block's columns: those with at least 30 entries.
+    std::vector<Index> block;
+    for (Index p = 0; p < m; ++p)
+      if (cols[p].size() >= 30) block.push_back(p);
+    if (!CHECK(!block.empty())) continue;
+    LuFactor dense = lu, hyper = lu;
+    dense.hyper_mode = 1;
+    hyper.hyper_mode = 2;
+    const int updates = 10 + static_cast<int>(rng() % 50);
+    for (int u = 0; u < updates; ++u) {
+      // Entering column: a few entries, half of the time inside the block's rows (denser spike in the block).
+      Col a;
+      const Index base = cols[block[0]][0].first;
+      for (int k = 0; k < 1 + static_cast<int>(rng() % 5); ++k) {
+        const Index r = (rng() % 2) ? std::min<Index>(m - 1, base + static_cast<Index>(rng() % 50))
+                                    : static_cast<Index>(rng() % m);
+        a.push_back({r, static_cast<double>(static_cast<int>(rng() % 7) - 3) + 0.5});
+      }
+      HVector h1, h2;
+      h1.resize(m);
+      for (auto [r, v] : a) {
+        if (h1.dense[r] == 0.0) h1.nz[h1.count++] = r;
+        h1.dense[r] += v;
+      }
+      h2 = h1;
+      dense.ftran(h1);
+      hyper.ftran(h2);
+      // Two of three updates replace a block column (a block position replaced earlier is an ordinary
+      // Forrest-Tomlin step by then, also covered).
+      const Index p = (rng() % 3) ? block[rng() % block.size()] : static_cast<Index>(rng() % m);
+      double amax = 0.0;
+      for (Index i = 0; i < m; ++i) amax = std::max(amax, std::abs(h1.dense[i]));
+      if (std::abs(h1.dense[p]) < std::max(0.1 * amax, 1e-3)) continue;
+      dense.update(p, h1);
+      hyper.update(p, h2);
+      in_block += cols[p].size() >= 30;
+      CHECK(!dense.product_form());
+      CHECK(!hyper.product_form());
+      Col ac;
+      for (Index r = 0; r < m; ++r) {
+        double v = 0.0;
+        for (auto [rr, vv] : a)
+          if (rr == r) v += vv;
+        if (v != 0.0) ac.push_back({r, v});
+      }
+      cols[p] = ac;
+      LuFactor fresh;
+      {
+        std::vector<Col> copy = cols;
+        factorize(fresh, copy);
+      }
+      if (dense.wants_refactor() || hyper.wants_refactor()) {
+        CHECK(dense.wants_refactor() == hyper.wants_refactor());
+        dense = fresh;
+        hyper = fresh;
+        dense.ft_dense = hyper.ft_dense = true;
+        dense.hyper_mode = 1;
+        hyper.hyper_mode = 2;
+        block.clear();
+        if (fresh.dense_dim() > 0)
+          for (Index q = 0; q < m; ++q)
+            if (cols[q].size() >= 30) block.push_back(q);
+        if (block.empty()) break;
+        continue;
+      }
+      fresh.hyper_mode = 1;
+      for (int s = 0; s < 3; ++s) {
+        const int nnz = s == 2 ? static_cast<int>(m / 3) : 1 + static_cast<int>(rng() % 4);
+        HVector f0 = sparse_rhs(rng, m, nnz), f1 = f0, f2 = f0, b0 = sparse_rhs(rng, m, nnz), b1 = b0, b2 = b0;
+        const HVector rf = f0, rb = b0;
+        fresh.ftran(f0);
+        dense.ftran(f1, -1.0, false);
+        hyper.ftran(f2, -1.0, false);
+        fresh.btran(b0);
+        dense.btran(b1);
+        hyper.btran(b2);
+        // Residuals against the basis itself (B x = f, B^T z = b), relative to the size of the terms: on an
+        // ill-conditioned basis the solutions of two factorizations differ by more than rounding, their
+        // residuals do not. The fresh factorization gives the scale of what is attainable.
+        auto residuals = [&](const HVector& x, const HVector& z, const HVector& rf, const HVector& rb, double& ef,
+                             double& eb) {
+          std::vector<double> bx(m, 0.0), ax(m, 0.0);
+          eb = 0.0;
+          for (Index c = 0; c < m; ++c) {
+            double dotv = 0.0, mag = 0.0;
+            for (auto [r, v] : cols[c]) {
+              bx[r] += v * x.dense[c];
+              ax[r] += std::abs(v * x.dense[c]);
+              dotv += v * z.dense[r];
+              mag += std::abs(v * z.dense[r]);
+            }
+            eb = std::max(eb, std::abs(dotv - rb.dense[c]) / (1.0 + mag));
+          }
+          ef = 0.0;
+          for (Index i = 0; i < m; ++i) ef = std::max(ef, std::abs(bx[i] - rf.dense[i]) / (1.0 + ax[i]));
+        };
+        double ef, eb, ef2, eb2, ef0, eb0;
+        residuals(f1, b1, rf, rb, ef, eb);
+        residuals(f2, b2, rf, rb, ef2, eb2);
+        residuals(f0, b0, rf, rb, ef0, eb0);
+        ef = std::max(ef, ef2);
+        eb = std::max(eb, eb2);
+        worst = std::max({worst, ef, eb});
+        if (!CHECK(ef <= 1e-9 + 1e3 * ef0 && eb <= 1e-9 + 1e3 * eb0))
+          std::fprintf(stderr, "  (trial %d, m %d, update %d: ftran %.3g (fresh %.3g), btran %.3g (fresh %.3g))\n", trial,
+                       static_cast<int>(m), u, ef, ef0, eb, eb0);
+        double e;
+        CHECK(same(f1, f2, &e));
+        CHECK(same(b1, b2, &e));
+      }
+    }
+  }
+  CHECK(with_block >= 20);
+  CHECK(in_block >= 200);
+  if (!CHECK(worst <= 1e-9)) std::fprintf(stderr, "  worst relative residual %.3g\n", worst);
+}
+
 TEST(lu_multi_ftran_mixed_modes) {
   // ftran(a, b, c) with some right-hand sides solved hyper-sparsely and the others in one dense pass.
   std::mt19937 rng(5);

@@ -248,11 +248,35 @@ Index count_ints(const MipProblem& q) {
 
 // Solves the problem with presolve; returns false if the caller should solve
 // the original problem instead (presolve gave up or postsolve failed).
+// A problem's matrix on loan from the model it was built from (MipProblem::from_model copies it: square47, 27M
+// nonzeros, 330 MB). While the presolved problem is searched nothing reads the outer problem's matrix (the
+// presolver keeps its own data; incumbents are reported through the model), so it is dropped after presolve and
+// copied back before the postsolved point is checked, and whenever solve_presolved returns.
+struct MatrixLoan {
+  MipProblem* p = nullptr;
+  const SparseMatrix* source = nullptr;  // equal to p->A
+  bool out = false;
+  void drop() {
+    if (!p || out || source->nnz() < kMinNnz) return;
+    p->A = SparseMatrix();  // move assignment: the old arrays are freed
+    out = true;
+  }
+  void give_back() {
+    if (!out) return;
+    p->A = *source;
+    out = false;
+  }
+  ~MatrixLoan() { give_back(); }
+  static constexpr Index kMinNnz = 1000000;
+};
+
 bool solve_presolved(const MipProblem& p, const SolverParams& params, const Logger& log, const Timer& timer,
-                     MipResult* out, const SearchOptions& opts = {}) {
+                     MipResult* out, const SearchOptions& opts = {}, MatrixLoan loan = {}) {
   const RestartRule rule = RestartRule::from_env();
   Presolver pre;
-  const PresolveStatus ps = pre.run(p, PresolveOptions::from_env(), log);
+  PresolveOptions popt = PresolveOptions::from_env();
+  popt.threads = params.threads > 0 ? params.threads : static_cast<int>(std::thread::hardware_concurrency());
+  const PresolveStatus ps = pre.run(p, popt, log);
   const PresolveStats& st = pre.stats();
   log.log(1, "Presolve: %d rows, %d cols, %d nnz -> %d rows, %d cols, %d nnz (%.2fs)\n", st.rows_before,
           st.cols_before, st.nnz_before, st.rows_after, st.cols_after, st.nnz_after, st.time);
@@ -277,6 +301,7 @@ bool solve_presolved(const MipProblem& p, const SolverParams& params, const Logg
     return false;
   }
   const MipProblem& q = pre.reduced();
+  loan.drop();  // p.A is not read again before give_back()
   if (opts.sub_mip_heuristics && opts.restarts_done == 0 && opts.tree_restarts_done == 0 && !opts.sst_done &&
       local_search_bench(q)) {
     out->status = Status::Unknown;  // MILP_LS_BENCH: heuristic evaluation only
@@ -460,6 +485,7 @@ bool solve_presolved(const MipProblem& p, const SolverParams& params, const Logg
     mr2.bound = std::min(mr2.bound, mr2.objective);
     mr = std::move(mr2);
   }
+  loan.give_back();
   if (!postsolve_result(p, pre, params, timer, log, &mr)) {
     out->bound = mr.bound;  // still a valid bound for the caller's re-solve
     out->presolve = summary;
@@ -716,7 +742,9 @@ SolveResult solve_plain(const Model& model, const std::vector<Implication>& impl
     start_x = std::move(so.x);
     opts.start = start_x;
   }
-  if (!params.presolve || !solve_presolved(p, params, log, timer, &mr, opts)) {
+  MatrixLoan loan;
+  loan.p = &p, loan.source = &model.A;
+  if (!params.presolve || !solve_presolved(p, params, log, timer, &mr, opts, loan)) {
     // A failed presolved solve may still leave a valid bound (postsolve failure).
     const double presolved_bound = params.presolve && is_finite(mr.bound) ? mr.bound : -kInf;
     const PresolveSummary presolved = mr.presolve;  // a presolve that gave up still ran

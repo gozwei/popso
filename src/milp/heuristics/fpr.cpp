@@ -12,6 +12,7 @@
 #include "milp/core/interrupt.hpp"
 #include "milp/core/log.hpp"
 #include "milp/core/timer.hpp"
+#include "milp/heuristics/cdsearch.hpp"
 #include "milp/heuristics/fj.hpp"
 #include "milp/heuristics/lmip.hpp"
 #include "milp/heuristics/localsearch.hpp"
@@ -1075,6 +1076,25 @@ void heuristic_bench(const MipProblem& p, long long effort, unsigned seed, const
     } else {
       log.log(0, "HEURBENCH lp time=%.4f status=%s\n", t_lp, to_string(ls));
     }
+  }
+  if (const char* cv = std::getenv("MILP_FPR_BENCH_CDS")) {
+    // Conflict search (heuristics/cdsearch.hpp); 2: started from FJ's closest point.
+    Timer t;
+    CdsLimits cl;
+    cl.effort = effort;
+    cl.seed = seed;
+    if (std::atoi(cv) == 2 && !fj_closest.empty()) cl.hint = &fj_closest;
+    CdsStats cs;
+    std::vector<double> x;
+    const bool ok = conflict_search(p, cl, x, &cs);
+    log.log(0,
+            "HEURBENCH cds found=%d applicable=%d infeasible=%d obj=%.10g effort=%lld time=%.4f decisions=%lld "
+            "conflicts=%lld restarts=%lld learned=%lld lits=%.1f units=%lld decision_clauses=%lld not_asserting=%lld "
+            "max_level=%d dropped=%lld long=%lld\n",
+            ok, cs.applicable, cs.infeasible, ok ? user_obj(p.objective(x) - p.offset) : kInf, cs.effort, t.elapsed(),
+            cs.decisions, cs.conflicts, cs.restarts, cs.learned,
+            cs.learned ? static_cast<double>(cs.lits) / static_cast<double>(cs.learned) : 0.0, cs.units,
+            cs.decision_clauses, cs.not_asserting, cs.max_level, cs.dropped, cs.long_clauses);
   }
   if (std::getenv("MILP_FPR_BENCH_EACH")) {
     // Every strategy of the LP-free portfolio alone (one run each, the paper's per-run budget).

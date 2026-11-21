@@ -1,0 +1,21 @@
+# Tree-bound core instances for tools/node_cost.py: "<path> <node limit>" (one thread, --deterministic; limits
+# from a 12 s calibration on the Mac, 2026-11-15, raised to at least 300 nodes; root-bound instances left out).
+benchmarks/miplib/pg5_34.mps.gz 1500
+benchmarks/miplib/swath3.mps.gz 600
+benchmarks/miplib/rocI-4-11.mps.gz 425
+benchmarks/miplib/ns1830653.mps.gz 300
+benchmarks/miplib/CMS750_4.mps.gz 400
+benchmarks/miplib/rococoC10-001000.mps.gz 400
+benchmarks/miplib/eil33-2.mps.gz 340
+benchmarks/miplib/neos-4738912-atrato.mps.gz 430
+benchmarks/miplib/neos5.mps.gz 50000
+benchmarks/miplib/roll3000.mps.gz 400
+benchmarks/miplib/beasleyC3.mps.gz 300
+benchmarks/miplib/neos-3627168-kasai.mps.gz 300
+benchmarks/miplib/seymour1.mps.gz 300
+benchmarks/miplib/neos-2978193-inde.mps.gz 900
+benchmarks/miplib/mas76.mps.gz 150000
+benchmarks/miplib/timtab1.mps.gz 11000
+benchmarks/miplib/n5-3.mps.gz 300
+benchmarks/miplib/ns1208400.mps.gz 330
+benchmarks/miplib/pk1.mps.gz 150000

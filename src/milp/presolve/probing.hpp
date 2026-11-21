@@ -52,8 +52,21 @@ struct ProbingResult {
 
 struct ProbingOptions {
   bool lift = false;         // find liftings (the rows of p are not changed; the caller applies them)
+  // Rows whose coefficients and side are multiples of 1/1024 (0.25, 0.5, ...) with integral bounds count as
+  // exact like integral ones: no rounding margin in their liftings (0.25 + 0.75 gives 1, not 0.9999999996).
+  bool lift_dyadic = false;
   size_t max_conflicts = 0;  // keep and propagate up to this many conflicting literal pairs (incl. seeds)
   const std::vector<std::pair<Index, Index>>* seeds = nullptr;  // known conflicts (binaries of p)
+  // Batched probing (0 or 1: off, one candidate at a time): `batch` candidates are probed side by side from the
+  // same global bounds, on up to `threads` threads; the result depends on `batch` only, not on `threads`.
+  int batch = 0;
+  int threads = 1;
+  // Batches whose probes took less work than this each (in the previous batch) run on the calling thread
+  // (-1: MILP_PROBE_PAR_MIN, default 3000; tests set 0 so that every batch goes to the helper threads).
+  long long par_min = -1;
+  // Share of the work limit that may pass without a useful probe before the order is reversed, and again before
+  // the pass stops (negative: MILP_PROBE_IDLE, default 0.1). Smaller under MILP_PROBE_STOP=1 (presolve.cpp).
+  double idle_frac = -1.0;
 };
 
 // work_limit: roughly the number of matrix entries visited.

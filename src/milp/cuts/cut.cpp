@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <numeric>
 
 #include "milp/core/interrupt.hpp"
@@ -356,8 +359,100 @@ double norm2(const Cut& c) {
 
 }  // namespace
 
+int CutPoolOptions::dense_mode() {
+  static const int mode = [] { const char* v = std::getenv("MILP_CUT_DENSE_MODE"); return v ? std::atoi(v) : 6; }();
+  return mode;
+}
+
+void CutPoolOptions::set_dense(const MipProblem& p, bool root) {
+  static const double x = [] { const char* v = std::getenv("MILP_CUT_DENSE"); return v ? std::atof(v) : 8.0; }();
+  if (!(x > 0.0) || p.num_rows() == 0) return;
+  static const double floor_len = [] { const char* v = std::getenv("MILP_CUT_DENSE_FLOOR"); return v ? std::atof(v) : 10.0; }();
+  static const double share = [] { const char* v = std::getenv("MILP_CUT_DENSE_SHARE"); return v ? std::atof(v) : 0.5; }();
+  const int mode = dense_mode();
+  dense_root = root;
+  if ((mode == 1 && root) || (mode == 2 && !root)) return;
+  const double avg = static_cast<double>(p.A.index.size()) / static_cast<double>(p.num_rows());
+  double len = std::max(floor_len, x * avg);
+  if (mode == 5) len = std::max(len, std::sqrt(static_cast<double>(p.num_cols())));
+  dense_len = static_cast<Index>(len);
+  dense_share = share;
+  dense_gomory_only = mode == 3;
+}
+
+namespace {
+
+// MILP_CUT_DENSE_DIAG=1: per separator, the long cuts the density rule saw and dropped, root loops and node rounds
+// apart; printed at exit.
+struct DenseDiag {
+  struct Row {
+    const char* origin;
+    long long seen[2] = {0, 0}, lng[2] = {0, 0}, dropped[2] = {0, 0}, dropped_len[2] = {0, 0};
+    double dropped_eff[2] = {0.0, 0.0};  // sum of efficacy / the round's best
+  };
+  std::mutex mu;
+  std::vector<Row> rows;
+  Row& row(const char* origin) {
+    for (Row& r : rows) {
+      if (std::strcmp(r.origin, origin) == 0) return r;
+    }
+    rows.push_back(Row{origin});
+    return rows.back();
+  }
+  ~DenseDiag() {
+    for (const Row& r : rows) {
+      for (int k = 0; k < 2; ++k) {
+        if (r.seen[k] == 0) continue;
+        std::fprintf(stderr, "CUTDENSE %s %-9s seen %lld long %lld dropped %lld avg len %.0f avg rel eff %.2f\n",
+                     k ? "root" : "node", r.origin, r.seen[k], r.lng[k], r.dropped[k],
+                     r.dropped[k] ? static_cast<double>(r.dropped_len[k]) / static_cast<double>(r.dropped[k]) : 0.0,
+                     r.dropped[k] ? r.dropped_eff[k] / static_cast<double>(r.dropped[k]) : 0.0);
+      }
+    }
+  }
+};
+DenseDiag* dense_diag() {
+  static const bool on = std::getenv("MILP_CUT_DENSE_DIAG") != nullptr;
+  static DenseDiag d;
+  return on ? &d : nullptr;
+}
+
+bool tableau_cut(const Cut& c) {
+  return std::strcmp(c.origin, "gomory") == 0 || std::strcmp(c.origin, "tmir") == 0 || std::strcmp(c.origin, "zerohalf") == 0;
+}
+
+}  // namespace
+
 std::vector<Cut> CutPool::select() {
   double good = -kInf;
+  if (opt_.dense_len > 0 && !cuts_.empty()) {
+    double max_eff = 0.0;
+    for (const Cut& c : cuts_) max_eff = std::max(max_eff, c.efficacy);
+    DenseDiag* diag = dense_diag();
+    std::unique_lock<std::mutex> lk;
+    if (diag) lk = std::unique_lock<std::mutex>(diag->mu);
+    const int dk = opt_.dense_root ? 1 : 0;
+    size_t w = 0;
+    for (size_t k = 0; k < cuts_.size(); ++k) {
+      Cut& c = cuts_[k];
+      const Index len = static_cast<Index>(c.idx.size());
+      DenseDiag::Row* dr = diag ? &diag->row(c.origin) : nullptr;
+      if (dr) ++dr->seen[dk];
+      if (len > opt_.dense_len && (!opt_.dense_gomory_only || tableau_cut(c))) {
+        const double f = std::sqrt(static_cast<double>(opt_.dense_len) / static_cast<double>(len));
+        if (dr) ++dr->lng[dk];
+        if (c.efficacy * f < opt_.dense_share * max_eff) {
+          if (dr) ++dr->dropped[dk], dr->dropped_len[dk] += len, dr->dropped_eff[dk] += c.efficacy / max_eff;
+          continue;
+        }
+        c.score *= f;
+        c.efficacy *= f;  // the hybrid score below is built from it
+      }
+      if (w != k) cuts_[w] = std::move(cuts_[k]);
+      ++w;
+    }
+    cuts_.resize(w);
+  }
   if (opt_.hybrid && !cuts_.empty()) {
     double max_eff = 0.0;
     for (const Cut& c : cuts_) max_eff = std::max(max_eff, c.efficacy);

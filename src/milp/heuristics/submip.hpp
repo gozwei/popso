@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "milp/lp/simplex.hpp"
@@ -34,6 +35,9 @@ struct SubMipLimits {
   // time_limit (lp_rens: shared by its dives and sub-MIPs).
   long long work_limit = -1;
   int mem_limit_mb = 256;          // search memory cap of the sub-MIP
+  // lp_rens only: DomainPropagator::shared_rows of its problem, if the caller holds them (a row copy of its own
+  // otherwise: 12 bytes per nonzero).
+  std::shared_ptr<const SparseMatrix> prop_rows;
   int solution_limit = 0;          // stop after this many incumbents of the sub-MIP (0: none)
   // Fixing neighbourhoods searched before: the sub-MIP's integer bounds are hashed into *fingerprint, and
   // one whose hash is in *skip is not solved (no solve counted). Only for neighbourhoods of p itself with

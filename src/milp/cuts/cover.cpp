@@ -38,7 +38,7 @@ bool is_binary(const MipProblem& p, Index j) { return p.is_int[j] && p.col_lb[j]
 
 void CoverSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   const MipProblem& p = ctx.p;
-  const SparseMatrix& R = ctx.lp.row_matrix();
+  const SparseMatrix& R = ctx.lp.scaled_row_matrix();  // the pattern only
   for (Index i = 0; i < ctx.num_problem_rows; ++i) {
     // Need at least two binaries, one of them fractional.
     Index nbin = 0;
@@ -57,12 +57,13 @@ void CoverSeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
 
 void CoverSeparator::separate_side(const SepaContext& ctx, Index row, double sign, std::vector<Cut>& out) {
   const MipProblem& p = ctx.p;
-  const SparseMatrix& R = ctx.lp.row_matrix();
+  const SparseMatrix& R = ctx.lp.scaled_row_matrix();  // entry * us: the model's coefficient, exactly
+  const double us = ctx.lp.row_unscale(row);
   double b = sign > 0 ? p.row_ub[row] : -p.row_lb[row];
   items_.clear();
   for (Index k = R.begin(row); k < R.end(row); ++k) {
     const Index j = R.index[k];
-    const double a = sign * R.value[k];
+    const double a = sign * (R.value[k] * us);
     if (is_binary(p, j)) {
       if (a > 0) {
         items_.push_back({j, a, false, ctx.x[j]});

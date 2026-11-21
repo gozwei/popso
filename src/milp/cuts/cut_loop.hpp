@@ -23,6 +23,8 @@ struct CutLoopStats {
   // The rounds' LP re-solves: dual simplex iterations and wall-clock seconds.
   long long resolve_iterations = 0;
   double resolve_time = 0.0;
+  double initial_lp_time = 0.0;  // the loop's first LP solve
+  double sep_time = 0.0;         // all separators, wall-clock seconds
   long long global_fixed = 0;  // columns fixed by CutLoopOptions::fix_fn
 };
 

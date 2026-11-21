@@ -54,7 +54,7 @@ struct BoundTrail {
       return;
     }
     int& l = last[2 * static_cast<size_t>(col) + (up ? 1 : 0)];
-    if (lvl < 0) lvl = level;
+    if (lvl < 0 || chrono) lvl = level;
     if (l >= 0 && e[l].level > lvl) lvl = e[l].level;
     e.push_back({col, static_cast<uint8_t>(up ? 1 : 0), static_cast<uint8_t>(kind), row, val, c, l, lvl});
     l = static_cast<int>(e.size()) - 1;
@@ -78,6 +78,9 @@ struct BoundTrail {
   size_t cap = 0;
   bool overflow = false;
   int level = 0;  // level of new decisions (and the highest level in use)
+  // Every entry gets the level current when it is pushed (a search that backtracks on this trail: the entries of
+  // a level are then a contiguous block). Default: an implied bound gets the highest level among its reasons.
+  bool chrono = false;
   // Why propagation failed: a row side (fail_upper: row_ub side violated),
   // a conflict, or a column whose propagated bounds crossed.
   Fail fail = kNone;

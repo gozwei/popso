@@ -199,12 +199,13 @@ CliqueExtension find_clique_extensions(const MipProblem& p, long long work_limit
     }
     return false;
   };
-  // Neighbourhood size of j (entries visited when enumerating its neighbours).
-  auto nbsize = [&](Index j) {
-    long long s = 0;
-    for (Index k = qstart[j]; k < qstart[j + 1]; ++k) s += cstart[qidx[k] + 1] - cstart[qidx[k]];
-    return s;
-  };
+  // Neighbourhood size of j (entries visited when enumerating its neighbours), once per column: summed per
+  // row it was sum_j deg(j)^2 uncounted steps (square47, 2294 rows of ~3700 binaries in ~240 rows each: 2e9).
+  std::vector<long long> nb(n, 0);
+  for (Index q = 0; q < nq; ++q) {
+    const long long len = cstart[q + 1] - cstart[q];
+    for (Index k = cstart[q]; k < cstart[q + 1]; ++k) nb[cidx[k]] += len;
+  }
 
   std::vector<Index> stamp(n, -1), last(n, -1), cnt(n, 0);
   std::vector<std::vector<Index>> ext(m);  // extension of packing row i
@@ -219,12 +220,12 @@ CliqueExtension find_clique_extensions(const MipProblem& p, long long work_limit
     Index k0 = members[0];
     long long best = -1;
     for (Index j : members) {
-      const long long s = nbsize(j);
+      const long long s = nb[j];
       cost += s;
       if (best < 0 || s < best) best = s, k0 = j;
     }
     if (work + cost > work_limit) continue;
-    work += cost;
+    work += cost;  // the full count's cost, also when the row ends early below: the budget binds as it always did
     // Candidates: neighbours of k0 outside the row; count how many members each one is adjacent to.
     for (Index j : members) stamp[j] = -2 - i;  // members are excluded
     cand.clear();
@@ -240,17 +241,33 @@ CliqueExtension find_clique_extensions(const MipProblem& p, long long work_limit
       }
     }
     if (cand.empty()) continue;
+    // A candidate must be adjacent to every member: cheapest members first, and the row is done as soon as no
+    // candidate is adjacent to all the members seen (the count over all members cost the sum of their
+    // neighbourhoods per row whatever the outcome: square47 used its whole budget on the first rows and found
+    // nothing). The surviving set does not depend on the order, and the work charged is the full count's, so
+    // results are the same as without the early end.
+    std::sort(members.begin(), members.end(), [&](Index a, Index b) { return nb[a] < nb[b] || (nb[a] == nb[b] && a < b); });
+    Index seen = 0;
+    bool alive = true;
     for (Index j : members) {
+      Index hits = 0;
       for (Index k = qstart[j]; k < qstart[j + 1]; ++k) {
         const Index q = qidx[k];
         for (Index t = cstart[q]; t < cstart[q + 1]; ++t) {
           const Index w = cidx[t];
           if (stamp[w] != i || last[w] == j) continue;
           last[w] = j;
+          hits += cnt[w] == seen;
           ++cnt[w];
         }
       }
+      ++seen;
+      if (hits == 0) {
+        alive = false;
+        break;
+      }
     }
+    if (!alive) continue;
     const Index need = static_cast<Index>(members.size());
     cand.erase(std::remove_if(cand.begin(), cand.end(), [&](Index w) { return cnt[w] != need; }), cand.end());
     if (cand.empty()) continue;

@@ -293,7 +293,9 @@ Model random_mcnd(std::mt19937& rng) {
 // capacity rows sum_k x <= c y (y binary or a small integer module count), commodity balances
 // (outflow - inflow = supply, sometimes as inequalities), optionally per-commodity linking x_k <= d_k y.
 // `big`: more nodes and commodities (for the solver, not for enumeration).
-Model random_netdesign(std::mt19937& rng, bool undirected, bool big = false) {
+// totals: every arc also has its total flow T_a = sum of its flow columns (an equation with unit coefficients,
+// which looks like a flow row) and a second capacity row on T_a, as in n5-3.
+Model random_netdesign(std::mt19937& rng, bool undirected, bool big = false, bool totals = false) {
   ModelBuilder b;
   const int nn = big ? 5 + rng() % 4 : 3 + rng() % 2;
   std::vector<std::pair<int, int>> arcs;
@@ -333,6 +335,16 @@ Model random_netdesign(std::mt19937& rng, bool undirected, bool big = false) {
           b.add_coef(lk, j, 1.0), b.add_coef(lk, y, -dem[k]);
         }
       }
+    }
+    if (totals) {
+      const Index tot = b.add_col("T" + std::to_string(a), 0.0, 0.0, kInf);
+      const Index def = b.add_row("def" + std::to_string(a), 0.0, 0.0);
+      b.add_coef(def, tot, -1.0);
+      for (int k = 0; k < nk; ++k) {
+        for (Index j : x[a][k]) b.add_coef(def, j, 1.0);
+      }
+      const Index cap2 = b.add_row("capT" + std::to_string(a), -kInf, 0.0);
+      b.add_coef(cap2, tot, 1.0), b.add_coef(cap2, y, -c);
     }
   }
   for (int k = 0; k < nk; ++k) {
@@ -914,6 +926,83 @@ TEST(cuts_mcf_network_detection) {
     MipProblem p = make_problem(b.build());
     CHECK(detect_mcf_network(p).empty());
   }
+}
+
+TEST(cuts_mcf_detection_with_total_rows) {
+  // Directed: 3 nodes, 4 commodities, arcs 0->1, 1->2, 0->2 with capacity rows sum_k x_ak <= 9 y_a, and for
+  // every arc its total flow T_a = sum_k x_ak with T_a <= 9 y_a (n5-3). Every flow column is then in three
+  // equations with unit coefficients: without MILP_MCF_LONG no flow row is left, with it the totals' rows
+  // (the longest) are dropped and the network is found.
+  ModelBuilder b;
+  const std::vector<std::pair<int, int>> arcs{{0, 1}, {1, 2}, {0, 2}};
+  const int nk = 4;
+  std::vector<std::vector<Index>> x(3);
+  for (size_t a = 0; a < arcs.size(); ++a) {
+    const Index y = b.add_col("y", 1.0, 0, 1, VarType::Binary);
+    const Index cap = b.add_row("cap", -kInf, 0.0);
+    b.add_coef(cap, y, -9.0);
+    const Index tot = b.add_col("T", 0.0, 0, kInf);
+    const Index def = b.add_row("def", 0.0, 0.0);
+    b.add_coef(def, tot, -1.0);
+    for (int k = 0; k < nk; ++k) {
+      x[a].push_back(b.add_col("x", 0.0, 0, kInf));
+      b.add_coef(cap, x[a][k], 1.0);
+      b.add_coef(def, x[a][k], 1.0);
+    }
+    const Index cap2 = b.add_row("capT", -kInf, 0.0);
+    b.add_coef(cap2, tot, 1.0), b.add_coef(cap2, y, -9.0);
+  }
+  for (int k = 0; k < nk; ++k) {
+    for (int v = 0; v < 3; ++v) {
+      const double d = v == 2 ? 2.0 : v == 0 ? -2.0 : 0.0;
+      const Index r = b.add_row("bal", d, d);
+      for (size_t a = 0; a < arcs.size(); ++a) {
+        if (arcs[a].second == v) b.add_coef(r, x[a][k], 1.0);
+        if (arcs[a].first == v) b.add_coef(r, x[a][k], -1.0);
+      }
+    }
+  }
+  MipProblem p = make_problem(b.build());
+  g_mcf_drop_long = 0;
+  CHECK(detect_mcf_network(p).empty());
+  g_mcf_drop_long = 1;
+  const McfNetwork net = detect_mcf_network(p);
+  g_mcf_drop_long = -1;
+  CHECK_EQ(net.num_nodes, 3);
+  CHECK_EQ(net.num_comms, nk);
+  Index capacitated = 0;
+  for (const auto& a : net.arcs) capacitated += a.cap_row >= 0 && a.tail >= 0 && a.head >= 0 && a.tail != a.head;
+  CHECK_EQ(static_cast<int>(capacitated), 3);
+  CHECK_EQ(static_cast<int>(net.flow_rows.size()), 3 * nk);
+}
+
+TEST(cuts_mcf_total_rows_random_validity) {
+  // As cuts_mcf_random_validity on network design models that carry total-flow equations, with the detection
+  // rule of MILP_MCF_LONG on: every cut holds at every feasible point (enumeration of the design columns, an
+  // LP over the flows), and the rule does find networks there (mcf cuts appear).
+  std::mt19937 rng(211);
+  int ncuts = 0, ninvalid = 0, feasible = 0, found = 0, found_off = 0;
+  for (int t = 0; t < iters(200); ++t) {
+    Model m = random_netdesign(rng, t % 2 == 1, false, true);
+    MipProblem p = make_problem(m);
+    g_mcf_drop_long = 0;
+    found_off += !detect_mcf_network(p).empty();
+    g_mcf_drop_long = 1;
+    found += !detect_mcf_network(p).empty();
+    if (enumerate_optimum(p) != kInf) {
+      ++feasible;
+      check_cuts_valid(p, only(false, false, false, false, true), &ncuts, &ninvalid);
+      check_cuts_valid(p, only(true, true, true, true, true), &ncuts, &ninvalid);
+    }
+    g_mcf_drop_long = -1;
+  }
+  const int nmcf = g_origin_count["mcf"];
+  std::printf("  network cut-sets with total rows: %d feasible, networks found %d (rule off: %d), %d cuts checked (%d mcf), %d invalid\n",
+              feasible, found, found_off, ncuts, nmcf, ninvalid);
+  g_origin_count.clear();
+  CHECK(found > found_off);
+  CHECK(nmcf > 20);
+  CHECK_EQ(ninvalid, 0);
 }
 
 TEST(cuts_mcf_random_validity) {

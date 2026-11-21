@@ -91,7 +91,23 @@ TEST(packed_basis_round_trip) {
       id += 1 + static_cast<int>(rng() % 300);
       nb.emplace_back(id, static_cast<VarStatus>(1 + rng() % 3));
     }
-    PackedBasis* p = PackedBasis::make(b, size, use_ref ? &refv : nullptr, trial % 5 ? &nb : nullptr);
+    // Every third trial with steepest-edge weights behind the pool stream.
+    std::vector<float> wts;
+    if (trial % 3 == 1) {
+      wts.resize(1 + rng() % 50);
+      for (float& x : wts) x = 1.0f + static_cast<float>(rng() % 1000) / 7.0f;
+    }
+    PackedBasis* p = PackedBasis::make(b, size, use_ref ? &refv : nullptr, trial % 5 ? &nb : nullptr,
+                                       wts.empty() ? nullptr : &wts);
+    {
+      std::vector<float> back_w{-1.0f};
+      CHECK_EQ(p->has_weights(), !wts.empty());
+      CHECK_EQ(p->weights(back_w), !wts.empty());
+      if (!wts.empty()) {
+        CHECK(back_w == wts);
+        CHECK(p->bytes() >= static_cast<long long>(16 + 4 + 4 * wts.size()));
+      }
+    }
     const Index want = size >= 0 ? size : static_cast<Index>(b.status.size());
     CHECK_EQ(p->size(), want);
     if (!use_ref) CHECK(!p->sparse());

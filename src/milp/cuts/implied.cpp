@@ -94,15 +94,16 @@ void ImpliedBoundSeparator::separate(const SepaContext& ctx, std::vector<Cut>& o
   const double* xv = ctx.x;
   auto check = [&](const auto& im) {
     const double bound = im.v0 + (im.v1 - im.v0) * xv[im.y];
+    // The test first: nearly every implication holds at the LP point, and building the cut before the test
+    // allocated its index array for each of them (neos-3046615-murg: 5% of the thread time in malloc / free).
+    if (im.upper ? xv[im.x] <= bound + 1e-6 : xv[im.x] >= bound - 1e-6) return;
     Cut c;
     c.origin = "implbd";
     c.idx = {im.x, im.y};
     if (im.upper) {
-      if (xv[im.x] <= bound + 1e-6) return;
       c.val = {1.0, -(im.v1 - im.v0)};  // x - (v1 - v0) y <= v0
       c.rhs = im.v0;
     } else {
-      if (xv[im.x] >= bound - 1e-6) return;
       c.val = {-1.0, im.v1 - im.v0};  // -x + (v1 - v0) y <= -v0
       c.rhs = -im.v0;
     }

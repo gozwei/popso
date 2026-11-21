@@ -60,7 +60,8 @@ bool infeasibility_conflict(const DualSimplex& lp, const std::vector<double>& y,
 // if given) and returns false if the conflict is infeasible.
 bool propagate_conflict(const Conflict& c, const std::vector<char>& is_int, std::vector<double>& lb,
                         std::vector<double>& ub, std::vector<Index>* tightened, bool* changed,
-                        BoundTrail* trail = nullptr);
+                        BoundTrail* trail = nullptr,
+                        double idle_room = kInf);
 
 // Conflict analysis of a node proved infeasible by domain propagation (the
 // failure recorded in `trail`): walks the implication graph (reasons: rows of
@@ -69,18 +70,23 @@ bool propagate_conflict(const Conflict& c, const std::vector<char>& is_int, std:
 // cut of the deepest decision level, then those of the next lower levels.
 // Bounds are relaxed towards the global bounds [glb, gub] as far as the
 // reasons allow. Clauses with a literal on a continuous column or more than
-// max_lits literals are skipped. Returns the number of clauses appended.
+// max_lits literals are skipped (first_only: the analysis then ends instead of going on to the lower levels).
+// minimize: the first clause is minimized (literals implied by its other literals are dropped). stats (two
+// counters, or null): the entries read and the number of dropped literals are added to stats[0] and [1].
+// Returns the number of clauses appended.
 int analyze_propagation_conflict(const BoundTrail& trail, const SparseMatrix& rows, const std::vector<double>& row_lb,
                                  const std::vector<double>& row_ub, const std::vector<char>& is_int,
                                  const std::vector<double>& glb, const std::vector<double>& gub, Index max_lits,
-                                 int max_clauses, std::vector<Conflict>& out);
+                                 int max_clauses, std::vector<Conflict>& out, bool first_only = false,
+                                 long long* stats = nullptr, bool minimize = false);
 
 // Per-worker pool of conflicts with column occurrence lists for propagation.
 // Bounded size: conflicts that have not propagated anything for the longest
 // time are dropped first.
 class ConflictPool {
  public:
-  ConflictPool(Index num_cols, size_t capacity) : occ_(num_cols), wocc_(num_cols), capacity_(capacity) {}
+  ConflictPool(Index num_cols, size_t capacity)
+      : occ_(2 * static_cast<size_t>(num_cols)), wocc_(num_cols), capacity_(capacity) {}
 
   void add(std::shared_ptr<const Conflict> c, long long now);
   // Propagates the conflicts that contain a seed column (and, transitively,
@@ -103,6 +109,7 @@ class ConflictPool {
     long long last_used = 0;
     int w0 = 0, w1 = 0;        // clauses: positions of the watched literals
     Index wk0 = -1, wk1 = -1;  // and their bound keys 2 * column + (literal is x <= v)
+    double idle_room = -1.0;   // linear: the slack from which nothing can be tightened (-1: not computed yet)
   };
   void shrink();
   void add_occ(Index id);
@@ -110,7 +117,8 @@ class ConflictPool {
   bool propagate_watched(Index id, std::vector<double>& lb, std::vector<double>& ub, std::vector<Index>& tightened,
                          bool& changed, BoundTrail* trail, long long& work);
   std::vector<Entry> entries_;  // null c: removed
-  std::vector<std::vector<Index>> occ_;   // linear conflicts, per column: 2 * entry + (coefficient < 0)
+  // Linear conflicts: at 2 * column the entries triggered by its lower bound, at 2 * column + 1 by its upper.
+  std::vector<std::vector<Index>> occ_;
   std::vector<std::vector<Index>> wocc_;  // clause watches, per column: 2 * entry + (literal is x <= v)
   std::vector<char> queued_;
   std::vector<Index> queue_;

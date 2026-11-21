@@ -322,7 +322,10 @@ bool SparseCholesky::analyze(Index n, const std::vector<Index>& start, const std
     sn_xstart_[s + 1] = sn_xstart_[s] + w * rows;
     factor_nnz_ += static_cast<long long>(w * rows - w * (w - 1) / 2);
   }
-  lx_.assign(sn_xstart_[ns], 0.0);
+  // The factor's values are allocated by the first factorize(): an analysis that only serves a comparison or a
+  // budget check (the barrier analyzes two systems and keeps one; neos-5104907-jarama: 4.2 GB zero-filled here
+  // for the system not used, 10.5 GB peak under an 8 GB limit) costs no factor memory.
+  std::vector<double>().swap(lx_);
 
   // Where each input entry goes.
   entry_pos_.assign(static_cast<size_t>(nnz_in_), 0);
@@ -351,7 +354,7 @@ bool SparseCholesky::analyze(Index n, const std::vector<Index>& start, const std
 bool SparseCholesky::factorize(const std::vector<double>& value) {
   if (threads > 1 && (!pool_ || pool_->size() != threads) && flops_ > 1e7) pool_ = std::make_unique<WorkerPool>(threads);
   if (threads <= 1) pool_.reset();
-  std::fill(lx_.begin(), lx_.end(), 0.0);
+  lx_.assign(sn_xstart_.back(), 0.0);
   for (Index k = 0; k < nnz_in_; ++k) lx_[entry_pos_[k]] += value[k];
   const Index ns = num_supernodes();
   for (Index s = 0; s < ns; ++s) {

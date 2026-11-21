@@ -143,6 +143,21 @@ struct CutPoolOptions {
   double obj_weight = 0.1, int_weight = 0.1;
   double good_score = 0.9;
   double max_parallelism_weak = 0.98;
+  // Density rule (MILP_CUT_DENSE = x, default 8, off at 0): a cut with more than dense_len nonzeros competes with its score
+  // times sqrt(dense_len / nonzeros), and is not selected when its efficacy scaled that way is below dense_share
+  // of the round's best efficacy. Dense cut rows stay in the tree's LPs and make every basis solve denser.
+  Index dense_len = 0;
+  double dense_share = 0.5;
+  bool dense_gomory_only = false;  // mode 3: the rule applies to tableau cuts (gomory, tmir, zerohalf) only
+  bool dense_root = false;         // statistics: the pool belongs to a root cut loop
+  // Sets dense_len from MILP_CUT_DENSE = x: max(MILP_CUT_DENSE_FLOOR (10), x times the model's average row length).
+  // root: the pool of a root cut loop (else a node cut round). MILP_CUT_DENSE_MODE (default 6): 0 everywhere, 1 node rounds
+  // only, 2 root loops only, 3 tableau cuts only, 4 as 0 but a root loop applies it only once its bound has
+  // stopped moving (dense_mode() == 4: the loop switches dense_len per round), 5 as 0 with a length limit of at
+  // least sqrt(columns). 6: tableau cuts always, the other families in a root loop only once its bound
+  // has stopped moving (3 and 4 together).
+  void set_dense(const MipProblem& p, bool root);
+  static int dense_mode();
 };
 
 class CutPool {

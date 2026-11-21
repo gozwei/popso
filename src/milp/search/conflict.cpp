@@ -53,7 +53,7 @@ bool derive_conflict(const DualSimplex& lp, const std::vector<double>& mu, doubl
   double maxmu = 0.0;
   for (double v : mu) maxmu = std::max(maxmu, std::abs(v));
   if (!(maxmu > 0.0) || !std::isfinite(maxmu)) return false;
-  const SparseMatrix& R = lp.row_matrix();
+  const SparseMatrix& R = lp.scaled_row_matrix();  // entry * row_unscale(row): the model's coefficient, exactly
   for (Index i = 0; i < m; ++i) {
     const double u = mu[i];
     if (std::abs(u) <= 1e-12 * maxmu) continue;  // dropping a multiplier keeps the aggregation valid
@@ -61,7 +61,8 @@ bool derive_conflict(const DualSimplex& lp, const std::vector<double>& mu, doubl
     const double b = u > 0 ? -lp.var_lower(n + i) : -lp.var_upper(n + i);
     if (!is_finite(b) || std::abs(b) > kBigBound) continue;
     rhs += u * b;
-    for (Index k = R.begin(i); k < R.end(i); ++k) g[R.index[k]] += u * R.value[k];
+    const double us = lp.row_unscale(i);
+    for (Index k = R.begin(i); k < R.end(i); ++k) g[R.index[k]] += u * (R.value[k] * us);
   }
   double gmax = 0.0;
   for (double v : g) gmax = std::max(gmax, std::abs(v));
@@ -179,7 +180,8 @@ bool propagate_clause(const Conflict& c, std::vector<double>& lb, std::vector<do
 }  // namespace
 
 bool propagate_conflict(const Conflict& c, const std::vector<char>& is_int, std::vector<double>& lb,
-                        std::vector<double>& ub, std::vector<Index>* tightened, bool* changed, BoundTrail* trail) {
+                        std::vector<double>& ub, std::vector<Index>* tightened, bool* changed, BoundTrail* trail,
+                        double idle_room) {
   if (c.is_clause()) return propagate_clause(c, lb, ub, tightened, changed, trail);
   int ninf = 0;
   size_t inf_pos = 0;
@@ -187,6 +189,14 @@ bool propagate_conflict(const Conflict& c, const std::vector<char>& is_int, std:
   const double tol = conflict_tol(c.rhs);
   if (ninf == 0 && minact > c.rhs + tol) return false;
   if (ninf >= 2) return true;
+  // The slack covers the largest |a| (u - l) the columns can have (idle_room, from bounds that contain the current
+  // ones, with a term for the rounding of a x at a bound): the loop below would move no bound, since each implied
+  // bound lies at or beyond the column's own (the margin covers the rounding of the slack there).
+  const bool known_idle =
+      ninf == 0 && (c.rhs + tol) - minact - 1e-12 * (std::abs(c.rhs + tol) + std::abs(minact)) >= idle_room;
+#ifndef MILP_PROP_CHECK
+  if (known_idle) return true;
+#endif
   for (size_t k = 0; k < c.idx.size(); ++k) {
     if (ninf == 1 && k != inf_pos) continue;
     const Index j = c.idx[k];
@@ -196,6 +206,10 @@ bool propagate_conflict(const Conflict& c, const std::vector<char>& is_int, std:
     // a x_j <= rhs + tol - (minact - own)
     const double slack = c.rhs + tol - (minact - own);
     const double v = slack / a;
+    if (known_idle && (a > 0 ? std::floor(v + 1e-9 * (1.0 + std::abs(v))) < ub[j] - 0.5
+                             : std::ceil(v - 1e-9 * (1.0 + std::abs(v))) > lb[j] + 0.5)) {
+      std::abort();  // MILP_PROP_CHECK only
+    }
     if (a > 0) {
       const double nu = std::floor(v + 1e-9 * (1.0 + std::abs(v)));
       if (nu < ub[j] - 0.5) {
@@ -233,7 +247,13 @@ void ConflictPool::add_occ(Index id) {
     if (e.w1 != e.w0) wocc_[c.idx[e.w1]].push_back(2 * id + trigger_bit(c, e.w1));
     return;
   }
-  for (size_t k = 0; k < c.idx.size(); ++k) occ_[c.idx[k]].push_back(2 * id + trigger_bit(c, k));
+  // Per column one list of the conflicts triggered by its lower bound and one of those triggered by its upper
+  // bound, each in entry order (entries are added in increasing order). Two lists, so an addition appends (one
+  // list with the first group in front needed an insertion in the middle for it: 2.5% of the thread time on
+  // markshare_4_0, which learns a conflict at most nodes).
+  for (size_t k = 0; k < c.idx.size(); ++k) {
+    occ_[2 * static_cast<size_t>(c.idx[k]) + static_cast<size_t>(trigger_bit(c, k))].push_back(id);
+  }
 }
 
 void ConflictPool::add(std::shared_ptr<const Conflict> c, long long now) {
@@ -341,11 +361,23 @@ bool ConflictPool::propagate(const std::vector<char>& is_int, const std::vector<
     const bool lin = work <= limit, cl = cwork <= climit;
     if ((!lb_tight && !ub_tight) || (!lin && !cl)) return;
     if (lin) {
-      for (Index e : occ_[j]) {
-        const Index id = e >> 1;
-        if (!queued_[id] && ((e & 1) ? ub_tight : lb_tight)) queued_[id] = 1, queue_.push_back(id);
+      // Only the list of a tight bound is read; with both tight, the two lists merged in entry order.
+      const std::vector<Index>& o0 = occ_[2 * static_cast<size_t>(j)], &o1 = occ_[2 * static_cast<size_t>(j) + 1];
+      const size_t n0 = o0.size(), n1 = o1.size(), n = n0 + n1;
+      auto push = [&](Index id) {
+        if (!queued_[id]) queued_[id] = 1, queue_.push_back(id);
+      };
+      if (lb_tight && ub_tight) {
+        size_t a = 0, b = 0;
+        while (a < n0 && b < n1) push(o0[a] <= o1[b] ? o0[a++] : o1[b++]);
+        while (a < n0) push(o0[a++]);
+        while (b < n1) push(o1[b++]);
+      } else if (lb_tight) {
+        for (size_t a = 0; a < n0; ++a) push(o0[a]);
+      } else {
+        for (size_t b = 0; b < n1; ++b) push(o1[b]);
       }
-      work += static_cast<long long>(occ_[j].size()) / 4;
+      work += static_cast<long long>(n) / 4;
     }
     if (cl) {
       std::vector<Index>& o = wocc_[j];
@@ -377,7 +409,23 @@ bool ConflictPool::propagate(const std::vector<char>& is_int, const std::vector<
     } else {
       if (work > limit) continue;
       work += static_cast<long long>(e.c->idx.size()) + 4;
-      ok = propagate_conflict(*e.c, is_int, lb, ub, &tightened, &changed, trail);
+      if (e.idle_room < 0.0) {
+        // Once per conflict, from the global bounds (they only tighten, and the local ones lie within them) of
+        // its integer columns (the others are not tightened).
+        double span = 0.0, own = 0.0;
+        for (size_t k = 0; k < e.c->idx.size(); ++k) {
+          if (!is_int[e.c->idx[k]]) continue;
+          const double gl = glb[e.c->idx[k]], gu = gub[e.c->idx[k]], a = std::abs(e.c->val[k]);
+          if (std::abs(gl) > kBigBound || std::abs(gu) > kBigBound) {
+            span = kInf;
+            break;
+          }
+          span = std::max(span, a * (gu - gl));
+          own = std::max(own, a * std::max(std::abs(gl), std::abs(gu)));
+        }
+        e.idle_room = span + 1e-12 * own;
+      }
+      ok = propagate_conflict(*e.c, is_int, lb, ub, &tightened, &changed, trail, e.idle_room);
     }
     if (trail && (!ok || changed)) trail->hold(e.c);
     if (!ok) {
@@ -408,9 +456,22 @@ class PropAnalyzer {
                const std::vector<double>& row_ub, const std::vector<char>& is_int, const std::vector<double>& glb,
                const std::vector<double>& gub)
       : tr_(tr), rows_(rows), row_lb_(row_lb), row_ub_(row_ub), is_int_(is_int), glb_(glb), gub_(gub) {
+    // The work arrays live in a per-thread store between calls (an analysis runs at every node closed by
+    // propagation: their allocation was a few percent of the thread time on models with very cheap nodes).
+    Scratch& sc = scratch();
+    need_.swap(sc.need), state_.swap(sc.state), touched_.swap(sc.touched), lits_.swap(sc.lits);
+    lvl_cnt_.swap(sc.lvl_cnt), terms_.swap(sc.terms), cands_.swap(sc.cands), order_.swap(sc.order);
+    touched_.clear(), lits_.clear(), terms_.clear(), cands_.clear(), order_.clear();
     need_.assign(tr.e.size(), 0.0);
     state_.assign(tr.e.size(), kFree);
   }
+  ~PropAnalyzer() {
+    Scratch& sc = scratch();
+    need_.swap(sc.need), state_.swap(sc.state), touched_.swap(sc.touched), lits_.swap(sc.lits);
+    lvl_cnt_.swap(sc.lvl_cnt), terms_.swap(sc.terms), cands_.swap(sc.cands), order_.swap(sc.order);
+  }
+  PropAnalyzer(const PropAnalyzer&) = delete;
+  PropAnalyzer& operator=(const PropAnalyzer&) = delete;
 
   // Explains the failure, then derives up to max_clauses clauses: the first
   // unique implication point (UIP) cut of the last decision level, then the
@@ -461,8 +522,10 @@ class PropAnalyzer {
       fresh = false;
       // Literals on continuous columns cannot be kept in a clause: replace them by their reasons.
       if (resolve_cont_ && !resolve_continuous()) return found;
+      if (first && minimize_) minimize(level);
       Conflict c;
       if (emit(max_lits, c)) out.push_back(std::move(c)), ++found;
+      else if (first_only_) break;  // too long at the deepest level: the lower levels are not tried
     }
     return found;
   }
@@ -493,7 +556,92 @@ class PropAnalyzer {
   }
  public:
   bool resolve_cont_ = false;
+  bool first_only_ = false;  // stop when the clause of the deepest level cannot be emitted
+  bool minimize_ = false;    // drop literals of the first clause that its other literals imply
+  long long min_work_ = 0, min_dropped_ = 0;
+  long long explain_work_ = 0;  // row and clause entries read by the explanations
  private:
+  // Clause minimization: an implied literal below the top level is dropped when its reason holds under the
+  // clause's other literals alone (those before it on the trail, with the values the clause states). A dropped
+  // literal is implied by the remaining ones (by induction along the trail), so the shorter clause is valid.
+  void minimize(int top_level) {
+    order_.clear();
+    for (int src : touched_) {
+      const BoundTrail::Entry& e = tr_.e[src];
+      if (state_[src] == kActive && e.kind != BoundTrail::kDecision && e.level < top_level) order_.push_back(src);
+    }
+    std::sort(order_.begin(), order_.end(), std::greater<int>());
+    const long long limit = 20000 + 50 * static_cast<long long>(touched_.size());
+    for (int src : order_) {
+      if (min_work_ > limit) break;
+      if (!redundant(src)) continue;
+      state_[src] = kResolved;
+      --lvl_cnt_[tr_.e[src].level];
+      ++min_dropped_;
+    }
+  }
+  // The tightest value the clause's literals on this bound state, among those before trail position t.
+  bool clause_bound(Index j, bool up, int t, double* n) {
+    int k = tr_.last[2 * static_cast<size_t>(j) + up];
+    while (k >= t) k = tr_.e[k].prev;
+    bool found = false;
+    for (; k >= 0; k = tr_.e[k].prev) {
+      ++min_work_;
+      if (state_[k] != kActive && state_[k] != kKept) continue;
+      if (!found || implies(up, need_[k], *n)) *n = need_[k];
+      found = true;
+    }
+    return found;
+  }
+  bool redundant(int src) {
+    const BoundTrail::Entry& e = tr_.e[src];
+    const bool up = e.upper != 0;
+    const double v = need_[src];
+    if (!is_int_[e.col]) return false;
+    if (e.kind != BoundTrail::kRow) {
+      const Conflict& c = *e.conf;
+      if (!c.is_clause()) return false;
+      min_work_ += static_cast<long long>(c.idx.size());
+      for (size_t k = 0; k < c.idx.size(); ++k) {
+        const bool lup = c.upper[k] != 0;
+        if (c.idx[k] == e.col && lup == !up) continue;
+        if (implies(lup, global(c.idx[k], lup), c.val[k])) continue;
+        double n;
+        if (!clause_bound(c.idx[k], lup, src, &n) || !implies(lup, n, c.val[k])) return false;
+      }
+      return true;
+    }
+    // Row reason: sum_k g_k x_k <= R with every other column at the bound the clause (else the model) gives
+    // must still exclude the next value of this column.
+    double a = 0.0;
+    for (Index k = rows_.begin(e.row); k < rows_.end(e.row); ++k) {
+      if (rows_.index[k] == e.col) a = rows_.value[k];
+    }
+    if (a == 0.0) return false;
+    const bool upper_side = (a > 0) == up;
+    const double sgn = upper_side ? 1.0 : -1.0;
+    const double R = upper_side ? row_ub_[e.row] : -row_lb_[e.row];
+    if (!is_finite(R) || std::abs(R) > kBigBound) return false;
+    min_work_ += rows_.end(e.row) - rows_.begin(e.row);
+    double M = 0.0, gj = 0.0;
+    for (Index k = rows_.begin(e.row); k < rows_.end(e.row); ++k) {
+      const Index col = rows_.index[k];
+      const double g = sgn * rows_.value[k];
+      if (col == e.col) {
+        gj += g;
+        continue;
+      }
+      const bool kup = g < 0;
+      double b = global(col, kup), n;
+      if (clause_bound(col, kup, src, &n) && implies(kup, n, b)) b = n;
+      if (!is_finite(b)) return false;
+      M += g * b;
+    }
+    if (up ? !(gj > 0) : !(gj < 0)) return false;
+    const double margin = gj * (up ? v + 1.0 : v - 1.0) - (R - M);
+    return margin >= 1e-6 * (1.0 + std::abs(R) + std::abs(M));
+  }
+  std::vector<int> order_;
   // Pops the latest literal: a decision is kept, an implied bound is replaced by its reason.
   bool pop_resolve() {
     const int src = top();
@@ -595,6 +743,7 @@ class PropAnalyzer {
   bool explain_linear(double R, Index skip, bool up, double v, int t) {
     double M = 0.0, gj = 0.0;
     cands_.clear();
+    explain_work_ += static_cast<long long>(terms_.size());
     for (const auto& [k, g] : terms_) {
       if (k == skip) {
         gj += g;
@@ -653,6 +802,7 @@ class PropAnalyzer {
   bool explain_conflict(const Conflict& c, Index skip, bool up, double v, int t) {
     cutoff_ = std::min(cutoff_, c.cutoff);
     if (c.is_clause()) {
+      explain_work_ += static_cast<long long>(c.idx.size());
       // The bound on `skip` negates its literal; all other literals held.
       for (size_t k = 0; k < c.idx.size(); ++k) {
         if (c.idx[k] == skip && (c.upper[k] != 0) == !up) continue;
@@ -671,6 +821,18 @@ class PropAnalyzer {
     bool up;
     double b, g;
   };
+  struct Scratch {
+    std::vector<double> need;
+    std::vector<char> state;
+    std::vector<int> touched, lvl_cnt, order;
+    std::vector<std::pair<int, double>> lits;
+    std::vector<std::pair<Index, double>> terms;
+    std::vector<Cand> cands;
+  };
+  static Scratch& scratch() {
+    thread_local Scratch s;
+    return s;
+  }
   const BoundTrail& tr_;
   const SparseMatrix& rows_;
   const std::vector<double>&row_lb_, &row_ub_;
@@ -693,7 +855,8 @@ class PropAnalyzer {
 int analyze_propagation_conflict(const BoundTrail& trail, const SparseMatrix& rows, const std::vector<double>& row_lb,
                                  const std::vector<double>& row_ub, const std::vector<char>& is_int,
                                  const std::vector<double>& glb, const std::vector<double>& gub, Index max_lits,
-                                 int max_clauses, std::vector<Conflict>& out) {
+                                 int max_clauses, std::vector<Conflict>& out, bool first_only, long long* stats,
+                                 bool minimize) {
   if (!trail.usable()) return 0;
   PropAnalyzer a(trail, rows, row_lb, row_ub, is_int, glb, gub);
   static const bool resolve_cont = [] {
@@ -701,7 +864,11 @@ int analyze_propagation_conflict(const BoundTrail& trail, const SparseMatrix& ro
     return v ? std::atoi(v) != 0 : false;
   }();
   a.resolve_cont_ = resolve_cont;
-  return a.run(max_lits, max_clauses, out);
+  a.first_only_ = first_only;
+  a.minimize_ = minimize;
+  const int n = a.run(max_lits, max_clauses, out);
+  if (stats) stats[0] += a.min_work_ + a.explain_work_, stats[1] += a.min_dropped_;
+  return n;
 }
 
 }  // namespace milp

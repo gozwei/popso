@@ -110,7 +110,12 @@ bool solve_sub_mip(const MipProblem& p, const std::vector<double>& lb, const std
     r.status = r.has_solution ? Status::Optimal : Status::Infeasible;
   } else if (ps == PresolveStatus::Reduced) {
     sp.time_limit = std::max(0.0, limits.time_limit - timer.elapsed());
+    // q's matrix (a copy of p's) is not read while the reduced problem is searched: dropped on a large problem
+    // (12 bytes per nonzero in every running sub-MIP) and copied back for the check of a postsolved point.
+    const bool lend = p.A.nnz() >= 1000000;
+    if (lend) q.A = SparseMatrix();
     r = branch_and_bound(pre.reduced(), sp, log, timer, opts);
+    if (lend && r.has_solution) q.A = p.A;
     if (r.has_solution) {
       r.x = pre.postsolve(r.x);
       if (q.max_violation(r.x) > 1e-6) {
@@ -315,7 +320,9 @@ bool lp_rens(const MipProblem& p, const DualSimplex& root, double cutoff, const 
   LpRensStats local;
   LpRensStats& st = out ? *out : local;
   if (ints == 0 || attempts <= 0) return false;
-  DomainPropagator prop(p);
+  const bool shared = limits.prop_rows && limits.prop_rows->num_minor == p.num_cols() &&
+                      (limits.prop_rows->num_major == p.num_rows() || limits.prop_rows->num_major == p.num_rows() + 1);
+  DomainPropagator prop(p, shared ? limits.prop_rows : nullptr);
   SubMipStats ss_total;
   // Shared budget (time; deterministic: LP iterations incl. the dives) of all attempts.
   auto used_iters = [&] { return st.dive_iterations + ss_total.lp_iterations; };

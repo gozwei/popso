@@ -79,9 +79,31 @@ struct PresolveOptions {
   bool sparsify_protect = true;
   bool clique_merging = true;
   bool clique_extension = true;  // extend set-packing rows by the conflict graph of all rows
+  // Propagation over one-of groups and shaving of integer cost columns (presolve/group_prop.hpp;
+  // MILP_GROUP_PROP=0 switches it off).
+  bool group_prop = true;
+  // Integer columns whose values are all congruent modulo a divisor g are replaced by x = g x' + r
+  // (PresolveWork::int_divisors; MILP_INT_DIV=1 switches it on).
+  bool int_divisors = false;
+  // Of two complementary binaries x + y = 1 the member of a packing or partitioning row is the one kept by
+  // the doubleton aggregation (MILP_KEEP_MEMBERS=1 switches it on).
+  bool keep_members = false;
+  // Probing does not lift a row that the fixings of the same pass made redundant (MILP_LIFT_LIVE=1 switches it on).
+  bool lift_live = false;
+  // Liftings and coefficient tightenings of rows whose coefficients are multiples of 1/1024 (with integral
+  // bounds) are computed without a rounding margin, like those of integral rows: 0.25 + 0.75 gives 1, not
+  // 0.9999999996, and the row stays a clique (ProbingOptions::lift_dyadic; MILP_LIFT_DYADIC=1 switches it on).
+  bool lift_dyadic = false;
+  // Rows whose coefficients share one absolute value other than 1 are divided by it (PresolveWork::unit_rows;
+  // MILP_UNIT_ROWS=1 switches it on).
+  bool unit_rows = false;
   bool implied_int = true;       // implied-integer detection on the reduced problem (presolve/implied_int.hpp)
   bool implied_int_dual = true;  // ... including the dual rule
   double probing_effort = 1.0;  // scales the probing work limit
+  // Batched probing (probing.hpp): candidates per batch (MILP_PROBE_PAR; 0: off; -1: min(4, threads), off on one
+  // thread) and the threads it may use (set by the top-level solve; sub-MIP presolves stay on their one thread).
+  int probing_batch = -1;
+  int threads = 1;
   // Optional (sub-MIPs): no further round or step once *stop is set or time_limit seconds have passed since the
   // start; the reductions so far are kept. The top-level presolve sets neither (work limits only).
   const std::atomic<bool>* stop = nullptr;
@@ -121,6 +143,9 @@ struct PresolveStats {
   long long sparsify_protected = 0;                    // equations not used for their variable-bound columns
   int sparsify_runs = 0;
   long long clique_extended = 0, clique_dominated = 0, clique_fixed = 0;
+  long long group_fixed = 0, group_bounds = 0, group_shaved = 0;  // one-of group propagation (group_prop.hpp)
+  int group_runs = 0;
+  long long int_divisors = 0;  // integer columns rescaled by a divisor
   long long implied_primal = 0, implied_dual = 0, implied_int = 0;  // new by rule; flagged in total
   int rounds = 0;
   double time = 0.0;
@@ -143,6 +168,8 @@ class Presolver {
 
   // One postsolve step. Fixed: x[col] = rhs. Substitution: x[col] = (rhs - sum terms) / coef, clamped to
   // [lb, ub] (the column's bounds when it was substituted; a clamp only moves rounding errors into the row).
+  // A single term on the column itself is a rescaled integer column: x[col] = rhs + g x[col] with terms
+  // {{col, -g}} (crush inverts it).
   //
   // Split (merged parallel columns, other >= 0): x[other] holds y = x[other] + coef * x[col]; it is split into
   // x[col] in [lb, ub] and x[other] in [olb, oub] (integral values if integer).

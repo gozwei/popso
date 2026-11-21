@@ -45,7 +45,7 @@ void GomorySeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   const MipProblem& p = ctx.p;
   DualSimplex& lp = ctx.lp;
   const Index n = lp.num_cols(), m = lp.num_rows();
-  const SparseMatrix& R = lp.row_matrix();
+  const SparseMatrix& R = lp.scaled_row_matrix();  // entry * row_unscale(row): the model's coefficient, exactly
   const double* x = ctx.x;
   const size_t out_size0 = out.size();
   work_ = R.nnz();  // the pass below
@@ -53,8 +53,10 @@ void GomorySeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
   // Rows whose logical is integer for integer x: integer coefficients on integer columns.
   int_row_.assign(m, 1);
   for (Index i = 0; i < m; ++i) {
+    const double us = lp.row_unscale(i);
     for (Index k = R.begin(i); k < R.end(i) && int_row_[i]; ++k) {
-      int_row_[i] = int_col(p, R.index[k]) && R.value[k] == std::round(R.value[k]);
+      const double a = R.value[k] * us;
+      int_row_[i] = int_col(p, R.index[k]) && a == std::round(a);
     }
   }
 
@@ -183,7 +185,8 @@ void GomorySeparator::separate(const SepaContext& ctx, std::vector<Cut>& out) {
       } else {
         // x_j = s_i = -a_i x.
         const Index i = j - n;
-        for (Index k = R.begin(i); k < R.end(i); ++k) add(R.index[k], -gx * R.value[k]);
+        const double us = lp.row_unscale(i);
+        for (Index k = R.begin(i); k < R.end(i); ++k) add(R.index[k], -gx * (R.value[k] * us));
       }
     }
     Cut c;

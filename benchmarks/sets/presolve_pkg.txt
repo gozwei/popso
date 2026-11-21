@@ -1,0 +1,12 @@
+benchmarks/miplib/traininstance2.mps.gz
+benchmarks/miplib/traininstance6.mps.gz
+benchmarks/miplib/supportcase33.mps.gz
+benchmarks/miplib/milo-v12-6-r2-40-1.mps.gz
+benchmarks/miplib/net12.mps.gz
+benchmarks/miplib/app1-2.mps.gz
+benchmarks/miplib/rocI-4-11.mps.gz
+benchmarks/miplib/lectsched-5-obj.mps.gz
+benchmarks/miplib/brazil3.mps.gz
+benchmarks/miplib/neos-4387871-tavua.mps.gz
+benchmarks/miplib/rocII-5-11.mps.gz
+benchmarks/miplib/momentum1.mps.gz

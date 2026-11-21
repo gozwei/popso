@@ -3,7 +3,7 @@
 #   python3 tools/bench_slot.py -- bash tools/gate.sh [build-dir]
 # 1. ctest (unit, CLI tooling, C API, Python);
 # 2. identity: deterministic node / LP iteration counts that must not change unless a change is meant to alter
-#    the search (Mac, 2 threads): cflp_medium_1 2100 / 124833, gap_medium_1 2205 / 72936, mas74 (2000 nodes) 2062 / 21826;
+#    the search (Mac, 2 threads): cflp_medium_1 3068 / 129049, gap_medium_1 3439 / 96982, mas74 (2000 nodes) 2103 / 21902;
 # 3. the gate instances (119, medium and smaller) in both modes: solved 119 / 119, WRONG 0;
 # 4. the quadratic families in both modes (32 / 33 default, 31 / 33 deterministic; qcrand_hard_1 / portqc_hard_1 open).
 cd "$(dirname "$0")/.." || exit 1

@@ -11,6 +11,10 @@ for cfg in "gcc g++-15" "clang clang++-21"; do
   ctest --test-dir ci-$1 --output-on-failure 2>&1 | tail -4
   python benchmarks/run.py --solver ci-$1/popso --sizes tiny -t 20 --threads 2 --mem-limit 1000 --no-save --strict 2>&1 | grep -E '^instances|WRONG'
   python benchmarks/run.py --solver "ci-$1/popso --deterministic" --sizes tiny -t 20 --threads 2 --mem-limit 1000 --no-save --strict 2>&1 | grep -E '^instances|WRONG'
+  # Two restarts with a rejected start (v0.11.1): x86 builds reported 6313945 here, the optimum is 6307996.
+  [ -f benchmarks/miplib/neos-3083819-nubu.mps.gz ] && ci-$1/popso benchmarks/miplib/neos-3083819-nubu.mps.gz --threads 4 \
+    --seed 76 --deterministic --time-limit 100 --mem-limit 4000 --gap 1e-6 | grep -E '^Objective' | grep -q 6307996 \
+    || echo "nubu seed 76: WRONG or missing"
 done
 echo "=== asan"
 cmake -S . -B ci-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPOPSO_BUILD_TESTS=ON -DPOPSO_SANITIZE=ON -DPOPSO_WERROR=ON -DCMAKE_CXX_COMPILER=clang++-21 -DCMAKE_C_COMPILER=clang-21 > ci-asan.cfg.log 2>&1 || { echo "configure failed"; tail -20 ci-asan.cfg.log; exit 1; }

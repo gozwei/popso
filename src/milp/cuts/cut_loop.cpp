@@ -156,6 +156,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   const long long iters0 = lp.iterations();
   if (opt.on_lp) opt.on_lp(lp);
   const double t_lp_end = timer.elapsed(), initial_lp_time = t_lp_end - t_lp0;
+  stats.initial_lp_time = initial_lp_time;
   log.log(2, "  initial LP: %lld iterations, %.2fs (%d rows, %d cols)\n", iters0 - iters_start, initial_lp_time,
           static_cast<int>(lp.num_rows()), static_cast<int>(lp.num_cols()));
   // Work of the loop after the initial solve (flat_work_factor): the cut probing budget (its time counts for
@@ -261,6 +262,8 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     for (Index l : len) max_row = std::max(max_row, l);
   }
   popt.max_nnz = std::max<Index>({50, n / 4 + 20, 2 * max_row});
+  popt.set_dense(p, true);
+  const Index dense_len_set = popt.dense_len;
   if (const char* v = std::getenv("MILP_SEL_HYBRID")) popt.hybrid = *v && *v != '0';
   if (const char* v = std::getenv("MILP_SEL_PAR")) popt.max_parallelism_weak = std::atof(v);
   if (const char* v = std::getenv("MILP_SEL_PARGOOD")) popt.max_parallelism = std::atof(v);
@@ -463,7 +466,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
       Index nfrac = 0;
       for (Index j = 0; j < n; ++j) nfrac += p.is_int[j] && std::abs(x[j] - std::round(x[j])) > itol;
       loop_work += static_cast<double>(std::min<Index>(nfrac, 500)) *
-                   static_cast<double>(lp.row_matrix().nnz() + lp.num_rows());
+                   static_cast<double>(lp.scaled_row_matrix().nnz() + lp.num_rows());
     }
 
     // Separate. Cuts dropped earlier for slack compete again when violated (on
@@ -476,6 +479,20 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     // extra cuts derail it (root 100% -> 84% closed, solve 10 s -> TL; mzzv11 is not degenerate).
     ctx.expensive = !initial_degenerate &&
                     !(last_degenerate && obj - stats.bound_before <= 1e-9 * std::max(1.0, std::abs(obj)));
+    if (dense_len_set > 0 && CutPoolOptions::dense_mode() == 4) {
+      // Long cuts compete unhindered while the bound moves: the last round gained at least a twentieth of
+      // the loop's gain so far (the first round counts as moving).
+      const size_t hh = history.size();
+      const double total = obj - stats.bound_before, last = hh >= 2 ? history[hh - 1] - history[hh - 2] : kInf;
+      const bool moving = hh < 2 || (total > 1e-9 * std::max(1.0, std::abs(obj)) && last >= 0.05 * total);
+      popt.dense_len = moving ? 0 : dense_len_set;
+    }
+    if (dense_len_set > 0 && CutPoolOptions::dense_mode() == 6) {
+      // Modes 3 and 4 together: tableau cuts always, the other families only once the bound has stopped moving.
+      const size_t hh = history.size();
+      const double total = obj - stats.bound_before, last = hh >= 2 ? history[hh - 1] - history[hh - 2] : kInf;
+      popt.dense_gomory_only = hh < 2 || (total > 1e-9 * std::max(1.0, std::abs(obj)) && last >= 0.05 * total);
+    }
     CutPool pool(p, popt);
     std::vector<Cut> cand;
     int found[16] = {0}, raw[16] = {0}, from_pool = 0;
@@ -496,6 +513,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
       seps[s]->separate(ctx, cand);
       round_sep_time[s] = timer.elapsed() - ts;
       sep_time[s] += round_sep_time[s];
+      stats.sep_time += round_sep_time[s];
       raw[s] = static_cast<int>(cand.size());
       if (opt.sepa_work) loop_work += static_cast<double>(seps[s]->work());
       for (Cut& c : cand) {

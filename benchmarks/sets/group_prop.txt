@@ -1,0 +1,13 @@
+# instances whose presolved model changes with MILP_GROUP_PROP=1 (survey 2026-11-19)
+benchmarks/miplib/30n20b8.mps.gz
+benchmarks/miplib/neos8.mps.gz
+benchmarks/miplib/neos-3656078-kumeu.mps.gz
+benchmarks/miplib/rocII-5-11.mps.gz
+benchmarks/miplib/proteindesign121hz512p9.mps.gz
+benchmarks/miplib/proteindesign122trx11p8.mps.gz
+benchmarks/miplib/physiciansched3-3.mps.gz
+benchmarks/miplib/piperout-08.mps.gz
+benchmarks/miplib/piperout-27.mps.gz
+benchmarks/miplib/rocI-4-11.mps.gz
+benchmarks/miplib/neos-3216931-puriri.mps.gz
+benchmarks/miplib/drayage-25-23.mps.gz

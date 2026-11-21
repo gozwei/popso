@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 
 namespace milp {
@@ -18,7 +19,11 @@ Index find_root(std::vector<Index>& parent, Index a) {
 
 }  // namespace
 
-McfNetwork detect_mcf_network(const MipProblem& p) {
+int g_mcf_drop_long = -1;
+
+namespace {
+
+McfNetwork detect(const MipProblem& p, bool drop_long) {
   McfNetwork net;
   const Index n = p.num_cols(), m = p.num_rows();
   if (n == 0 || m == 0) return net;
@@ -46,7 +51,19 @@ McfNetwork detect_mcf_network(const MipProblem& p) {
   // 2. A flow column lies in at most two flow rows: columns in more drop their inequality rows first,
   // then all of them.
   std::vector<Index> cnt(n);
-  for (int pass = 0; pass < 4; ++pass) {
+  // drop_long (MILP_MCF_LONG=1, the second attempt of detect_mcf_network): a column in more than two
+  // candidate equality rows drops only the longest of them (per
+  // pass), not all: models that carry, next to the commodities' conservation rows, equations with the same
+  // unit coefficients over many flow columns (an arc's total flow T_a = sum_k f_ak, or the conservation of
+  // the totals, n5-3) kept no flow row at all, although those rows are much longer than a conservation row.
+  std::vector<Index> row_len;
+  if (drop_long) {
+    row_len.assign(m, 0);
+    for (Index i = 0; i < m; ++i) {
+      for (Index k = R.begin(i); k < R.end(i); ++k) row_len[i] += active(R.index[k]);
+    }
+  }
+  for (int pass = 0; pass < (drop_long ? 12 : 4); ++pass) {
     bool changed = false;
     for (Index j = 0; j < n; ++j) {
       cnt[j] = 0;
@@ -58,6 +75,24 @@ McfNetwork detect_mcf_network(const MipProblem& p) {
       for (Index k = C.begin(j); k < C.end(j); ++k) {
         const Index i = C.index[k];
         any_ineq = any_ineq || (scale[i] > 0.0 && p.row_lb[i] != p.row_ub[i]);
+      }
+      if (drop_long && !any_ineq) {
+        // The longest candidate row of the column, if it is longer than the column's shortest: dropped alone
+        // (the counts are those of the pass's start, so a row dropped for another column is seen next pass).
+        Index longest = -1, shortest = -1;
+        for (Index k = C.begin(j); k < C.end(j); ++k) {
+          const Index i = C.index[k];
+          if (scale[i] <= 0.0) continue;
+          if (longest < 0 || row_len[i] > row_len[longest]) longest = i;
+          if (shortest < 0 || row_len[i] < row_len[shortest]) shortest = i;
+        }
+        Index left = 0;
+        for (Index k = C.begin(j); k < C.end(j); ++k) left += scale[C.index[k]] > 0.0;
+        if (left > 2 && longest >= 0 && row_len[longest] > row_len[shortest]) {
+          scale[longest] = 0.0, changed = true;
+          continue;
+        }
+        if (left <= 2) continue;
       }
       for (Index k = C.begin(j); k < C.end(j); ++k) {
         const Index i = C.index[k];
@@ -316,6 +351,17 @@ McfNetwork detect_mcf_network(const MipProblem& p) {
   net.node_start.assign(nnodes + 1, 0);
   for (const auto& fr : net.flow_rows) ++net.node_start[fr.node + 1];
   for (Index v = 0; v < nnodes; ++v) net.node_start[v + 1] += net.node_start[v];
+  return net;
+}
+
+}  // namespace
+
+McfNetwork detect_mcf_network(const MipProblem& p) {
+  static const bool env_long = [] { const char* v = std::getenv("MILP_MCF_LONG"); return v && *v && *v != '0'; }();
+  McfNetwork net = detect(p, false);
+  // Only where the first rule finds nothing: the second rule can lose a network the first one finds
+  // (neos-3627168-kasai), so it never replaces a found one.
+  if (net.empty() && (g_mcf_drop_long >= 0 ? g_mcf_drop_long != 0 : env_long)) net = detect(p, true);
   return net;
 }
 

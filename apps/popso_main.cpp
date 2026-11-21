@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include "milp/io/lp_reader.hpp"
 #include "milp/io/mps_reader.hpp"
 #include "milp/io/solution.hpp"
+#include "milp/search/node_store.hpp"
 #include "milp/solver/profile.hpp"
 #include "milp/solver/solver.hpp"
 
@@ -268,6 +270,12 @@ int main(int argc, char** argv) {
   milp::SolveResult result;
   params.interrupt = &g_interrupt;
   std::signal(SIGINT, on_sigint);
+  // Past the time limit the process only reports and exits: the open nodes are not freed one by one first.
+  if (std::isfinite(params.time_limit) && params.time_limit < 1e9) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(params.time_limit);
+    milp::bnb::g_leak_pools_after_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+  }
   try {
     result = milp::solve(model, params, start);
   } catch (const std::exception& e) {

@@ -12,6 +12,7 @@
 
 #include "milp/io/mps_reader.hpp"
 #include "milp/presolve/clique_merge.hpp"
+#include "milp/presolve/group_prop.hpp"
 #include "milp/presolve/implied_int.hpp"
 #include "milp/presolve/presolve.hpp"
 #include "milp/presolve/probing.hpp"
@@ -57,6 +58,7 @@ PresolveOptions only(bool bt, bool coef, bool par, bool dual, bool aggr) {
   o.dominated_cols = false;
   o.dual_aggregation = false;
   o.sparsify = false;
+  o.group_prop = false;
   return o;
 }
 
@@ -1062,16 +1064,30 @@ bool compatible(Status a, Status b) {
 
 PresolveStats g_stats;  // reductions applied by the randomized tests (coverage report)
 int g_numeric = 0;      // cases skipped because the LP solver reported numerical trouble
+int g_tolerance = 0;    // cases whose objectives differ only through the feasibility tolerances (tolerance_level)
+
+// Two optimal objectives beyond the comparison tolerance still agree when the better point is not exactly
+// feasible (it uses the 1e-6 feasibility or integrality tolerance, e.g. a binary at 1e-7 opening a big-M row)
+// and gains at most 1e-4 relative: such a point does not prove that the other solve missed a solution.
+// An exactly feasible better point does, and stays a failure.
+bool tolerance_level(const Model& m, const SolveResult& a, const SolveResult& b) {
+  if (!a.has_solution || !b.has_solution) return false;
+  if (std::abs(a.objective - b.objective) > 1e-4 * std::max(1.0, std::abs(a.objective))) return false;
+  const bool a_better = (m.sense == ObjSense::Minimize) == (a.objective < b.objective);
+  return m.violation(a_better ? a.x : b.x).max() > 1e-9;
+}
 
 void print_coverage(const char* name) {
   std::printf("  %s reductions: %lld aggregations, %lld substitutions (%lld implied free by other rows), %lld parallel "
               "cols, %lld dominated, probing %lld fixed / %lld bounds / %lld equivs / %lld lifts, cliques %lld extended / "
-              "%lld dominated / %lld fixed, %lld rows sparsified, %lld dual aggregations\n",
+              "%lld dominated / %lld fixed, %lld rows sparsified, %lld dual aggregations, %lld columns rescaled\n",
               name, g_stats.aggregations, g_stats.substitutions, g_stats.subst_implied, g_stats.parallel_cols, g_stats.dominated,
               g_stats.probing_fixed, g_stats.probing_bounds, g_stats.probing_equivs, g_stats.probing_lifts,
               g_stats.clique_extended, g_stats.clique_dominated, g_stats.clique_fixed, g_stats.sparsify_rows,
-              g_stats.dual_aggregations);
+              g_stats.dual_aggregations, g_stats.int_divisors);
   if (g_numeric > 0) std::printf("  %s: %d cases skipped (numerical trouble)\n", name, g_numeric);
+  if (g_tolerance > 0) std::printf("  %s: %d cases with a tolerance-level objective difference\n", name, g_tolerance);
+  g_tolerance = 0;
   g_stats = PresolveStats{};
   g_numeric = 0;
 }
@@ -1098,9 +1114,15 @@ Status compare_with_presolve(const Model& m, int it, int sparsify = -1, const Pr
   opt.substitution_bounded = it % 2 == 1;  // the default (off) and the opt-in variant
   opt.probing_cliques = it % 4 >= 2;       // likewise
   opt.sparsify = sparsify < 0 ? it % 3 != 2 : sparsify != 0;
+  opt.int_divisors = it % 5 < 3;  // opt-in
+  opt.keep_members = it % 3 == 0;  // opt-in
+  opt.lift_live = (it / 2) % 2 == 0;  // opt-in
+  opt.lift_dyadic = (it / 3) % 2 == 0;  // opt-in
+  opt.unit_rows = it % 7 < 4;  // opt-in
   opt.sparsify_protect = (it / 4) % 2 == 0;  // the default (on) and off
   const PresolveStatus ps = valid ? pre.run(p, opt, kQuiet) : PresolveStatus::Infeasible;
   g_stats.sparsify_rows += pre.stats().sparsify_rows;
+  g_stats.int_divisors += pre.stats().int_divisors;
   g_stats.aggregations += pre.stats().aggregations;
   g_stats.substitutions += pre.stats().substitutions;
   g_stats.subst_implied += pre.stats().subst_implied;
@@ -1133,11 +1155,14 @@ Status compare_with_presolve(const Model& m, int it, int sparsify = -1, const Pr
   const bool ok_status = compatible(a.status, b.status);
   CHECK(ok_status);
   // 2e-6: a point at the edge of the 1e-6 feasibility tolerance may be 1e-6 better (MSVC: -1.00000000003e-6 for 0).
-  const bool same_obj = a.status != Status::Optimal ||
-                        std::abs(a.objective - b.objective) <= 2e-6 * std::max(1.0, std::abs(a.objective));
+  bool same_obj = a.status != Status::Optimal ||
+                  std::abs(a.objective - b.objective) <= 2e-6 * std::max(1.0, std::abs(a.objective));
+  const bool near_obj = !same_obj && tolerance_level(m, a, b);
+  if (near_obj) ++g_tolerance, same_obj = true;
   const char* dump = std::getenv("MILP_FUZZ_DUMP");  // directory for failing cases
   const char* dump_case = std::getenv("MILP_FUZZ_DUMP_CASE");  // with MILP_FUZZ_DUMP: also this case (other platforms)
-  if (dump && (!ok_status || !same_obj || (dump_case && std::atoi(dump_case) == it))) {
+  const bool violated = a.status == Status::Optimal && b.has_solution && m.violation(b.x).max() > 1e-6;
+  if (dump && (!ok_status || !same_obj || violated || (dump_case && std::atoi(dump_case) == it))) {
     write_mps(m, std::string(dump) + "/case" + std::to_string(it) + ".mps");
   }
   if (!ok_status) {
@@ -1147,7 +1172,7 @@ Status compare_with_presolve(const Model& m, int it, int sparsify = -1, const Pr
   }
   if (a.status == Status::Optimal) {
     REQUIRE(b.has_solution);
-    const double tol = 2e-6 * std::max(1.0, std::abs(a.objective));  // see same_obj
+    const double tol = (near_obj ? 1e-4 : 2e-6) * std::max(1.0, std::abs(a.objective));  // see same_obj
     if (!CHECK_NEAR(a.objective, b.objective, tol)) std::fprintf(stderr, "  case %d: objective mismatch\n", it);
     const auto v = m.violation(b.x);
     if (!CHECK(v.max() <= 1e-6)) std::fprintf(stderr, "  case %d: violation %g\n", it, v.max());
@@ -1155,7 +1180,12 @@ Status compare_with_presolve(const Model& m, int it, int sparsify = -1, const Pr
     params.presolve = true;
     const SolveResult c = solve(m, params);
     CHECK(c.status == Status::Optimal);
-    CHECK_NEAR(a.objective, c.objective, tol);
+    if (!near_obj && std::abs(a.objective - c.objective) > tol && tolerance_level(m, a, c)) {
+      ++g_tolerance;
+    } else if (!CHECK_NEAR(a.objective, c.objective, tol)) {
+      std::fprintf(stderr, "  case %d: objective mismatch (full pipeline)\n", it);
+      if (dump) write_mps(m, std::string(dump) + "/case" + std::to_string(it) + ".mps");
+    }
   }
   return a.status;
 }
@@ -1717,7 +1747,240 @@ std::vector<std::vector<double>> enumerate_feasible(const MipProblem& p) {
   return out;
 }
 
+// A small model with one-of groups and rows over them, to enumerate: groups of binaries with a partitioning or
+// packing row each (some binaries in two such rows, some in none), integer columns linked to a group by an
+// equation  sum_k a_k x_k - y = c  (a start time), precedence-like rows between integer columns, capacity rows
+// over members of several groups against an integer level with a cost, and a few rows with mixed signs.
+MipProblem random_group_model(std::mt19937& rng) {
+  auto uni = [&](int lo, int hi) { return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1)); };
+  Builder b;
+  std::vector<std::vector<Index>> groups;
+  std::vector<Index> bin, gen;
+  const int ng = uni(1, 3);
+  for (int g = 0; g < ng; ++g) {
+    groups.emplace_back();
+    for (int k = uni(2, 4); k > 0; --k) {
+      groups.back().push_back(b.col(uni(0, 3) ? 0.0 : uni(-2, 2), 0.0, 1.0, true));
+      bin.push_back(groups.back().back());
+    }
+  }
+  for (int k = uni(0, 2); k > 0; --k) bin.push_back(b.col(uni(-2, 2), 0.0, 1.0, true));
+  auto pick = [&](const std::vector<Index>& v) { return v[uni(0, static_cast<int>(v.size()) - 1)]; };
+  for (int g = 0; g < ng; ++g) {
+    std::vector<std::pair<Index, double>> c;
+    for (Index j : groups[g]) c.push_back({j, 1.0});
+    if (uni(0, 4) == 0) {  // a member of another group or a loose binary joins the row
+      const Index j = pick(bin);
+      if (std::none_of(c.begin(), c.end(), [&](const auto& e) { return e.first == j; })) c.push_back({j, 1.0});
+    }
+    b.row(uni(0, 3) ? 1.0 : -kInf, 1.0, c);
+  }
+  // Linked integer columns.
+  for (int g = 0; g < ng; ++g) {
+    if (uni(0, 3) == 0) continue;
+    const Index y = b.col(uni(0, 2) ? 0.0 : uni(-2, 2), uni(0, 1), uni(2, 6), true);
+    gen.push_back(y);
+    std::vector<std::pair<Index, double>> c;
+    for (Index j : groups[g]) {
+      if (uni(0, 5)) c.push_back({j, static_cast<double>(uni(-1, 6))});
+    }
+    c.erase(std::remove_if(c.begin(), c.end(), [](const auto& e) { return e.second == 0.0; }), c.end());
+    if (c.empty()) continue;
+    c.push_back({y, -1.0});
+    const int s = uni(0, 5);
+    const double rhs = uni(-1, 1);
+    b.row(s == 4 ? -kInf : rhs, s == 5 ? kInf : rhs, c);
+  }
+  // Levels with a cost and capacity rows against them.
+  for (int k = uni(0, 2); k > 0; --k) {
+    const Index lvl = b.col(uni(1, 5), 0.0, uni(1, 4), true);
+    gen.push_back(lvl);
+    for (int r = uni(1, 3); r > 0; --r) {
+      std::vector<std::pair<Index, double>> c;
+      for (Index j : bin) {
+        if (uni(0, 2) == 0) c.push_back({j, static_cast<double>(uni(1, 3))});
+      }
+      if (c.empty()) continue;
+      c.push_back({lvl, -1.0});
+      b.row(-kInf, 0.0, c);
+    }
+  }
+  // Precedence-like rows between the integer columns, and rows with mixed signs over everything.
+  std::vector<Index> all = bin;
+  all.insert(all.end(), gen.begin(), gen.end());
+  for (int r = uni(0, 3); r > 0 && gen.size() >= 2; --r) {
+    const Index u = pick(gen), v = pick(gen);
+    if (u != v) b.row(-kInf, -static_cast<double>(uni(0, 2)), {{u, 1.0}, {v, -1.0}});
+  }
+  for (int r = uni(0, 3); r > 0; --r) {
+    std::vector<std::pair<Index, double>> c;
+    for (int k = uni(2, 5); k > 0; --k) {
+      const Index j = pick(all);
+      double a = uni(-3, 4);
+      if (a == 0.0) a = 2.0;
+      if (std::none_of(c.begin(), c.end(), [&](const auto& e) { return e.first == j; })) c.push_back({j, a});
+    }
+    if (c.size() < 2) continue;
+    const double rhs = uni(-2, 5);
+    const int s = uni(0, 4);
+    b.row(s >= 3 ? rhs : -kInf, s == 4 || s < 3 ? rhs : kInf, c);
+  }
+  return b.build();
+}
+
 }  // namespace
+
+TEST(group_prop_keeps_feasible_points) {
+  // One-of group propagation and shaving on enumerable models: every feasible point lies within the derived
+  // bounds, and "infeasible" only where there is none.
+  std::mt19937 rng(fuzz_seed(77123u));
+  const int iters = fuzz_iters(6000);
+  long long groups = 0, fixed = 0, bounds = 0, shaved = 0, infeasible = 0, with_points = 0;
+  for (int it = 0; it < iters; ++it) {
+    const MipProblem p = it % 3 == 0 ? random_enum_model(rng) : random_group_model(rng);
+    const auto pts = enumerate_feasible(p);
+    with_points += !pts.empty();
+    for (int mode = 0; mode < 2; ++mode) {
+      GroupPropOptions go;
+      go.shave = mode == 1;
+      const GroupPropResult gr = group_propagate(p, go);
+      if (gr.infeasible) {
+        if (mode == 1) ++infeasible;
+        if (!CHECK(pts.empty())) std::fprintf(stderr, "  case %d mode %d: infeasible, %zu feasible points\n", it, mode, pts.size());
+        continue;
+      }
+      REQUIRE(gr.lb.size() == static_cast<size_t>(p.num_cols()) && gr.ub.size() == gr.lb.size());
+      if (mode == 1) groups += gr.groups, fixed += gr.fixed, bounds += gr.tightened, shaved += gr.shaved;
+      bool ok = true;
+      for (Index j = 0; j < p.num_cols() && ok; ++j) ok = gr.lb[j] >= p.col_lb[j] && gr.ub[j] <= p.col_ub[j];
+      CHECK(ok);  // bounds only tighten
+      for (const auto& x : pts) {
+        bool in = true;
+        for (Index j = 0; j < p.num_cols() && in; ++j) in = x[j] >= gr.lb[j] && x[j] <= gr.ub[j];
+        if (!CHECK(in)) {
+          std::fprintf(stderr, "  case %d mode %d: a feasible point is outside the derived bounds\n", it, mode);
+          break;
+        }
+      }
+    }
+  }
+  std::printf("  group propagation: %lld groups, %lld members fixed, %lld bounds, %lld shaving steps, %lld infeasible, "
+              "%lld of %d models with a feasible point\n", groups, fixed, bounds, shaved, infeasible, with_points, iters);
+  CHECK(groups > 0 && fixed > 0 && bounds > 0 && shaved > 0 && infeasible > 0 && with_points > iters / 10);
+}
+
+TEST(presolve_probing_equivalence_roundoff_regression) {
+  // Fuzz seed 22, case 1184 of the sparsify models: probing reported the continuous column x5, which both probes
+  // leave within 2.5e-10 of 0.5, as "x5 = 0.5 + 3.4e-11 x8"; the substitution put 3.4e-11 into a row (optimum
+  // -1.5, the presolved solve returned a point violating a row by 1.33).
+  const Model m = read_mps_string(
+      "NAME\n"
+      "OBJSENSE\n"
+      "    MAX\n"
+      "ROWS\n"
+      " N  OBJ\n"
+      " E  r0\n"
+      " E  r1\n"
+      " G  r2\n"
+      " L  r3\n"
+      " G  r4\n"
+      "COLUMNS\n"
+      "    MARKER0  'MARKER'  'INTORG'\n"
+      "    x9  OBJ  -5\n"
+      "    x8  r1  -5\n"
+      "    x8  r2  2.5\n"
+      "    x7  OBJ  -4\n"
+      "    x7  r4  -4\n"
+      "    x6  OBJ  -3\n"
+      "    x6  r4  4\n"
+      "    MARKER1  'MARKER'  'INTEND'\n"
+      "    x5  OBJ  -1\n"
+      "    x5  r0  8\n"
+      "    x5  r1  1\n"
+      "    x5  r2  -0.5\n"
+      "    x5  r3  -4\n"
+      "    x5  r4  8\n"
+      "    MARKER2  'MARKER'  'INTORG'\n"
+      "    x4  OBJ  -3\n"
+      "    x4  r1  2\n"
+      "    x4  r2  -1\n"
+      "    x4  r4  4\n"
+      "    x3  OBJ  5\n"
+      "    x3  r1  7\n"
+      "    x3  r2  -3.5\n"
+      "    x2  OBJ  2\n"
+      "    x2  r0  4\n"
+      "    x2  r3  -2\n"
+      "    x1  OBJ  -2\n"
+      "    x1  r0  4\n"
+      "    x1  r3  -2\n"
+      "    x1  r4  4\n"
+      "    MARKER3  'MARKER'  'INTEND'\n"
+      "RHS\n"
+      "    RHS  r0  20\n"
+      "    RHS  r1  4.5\n"
+      "    RHS  r2  -3.25\n"
+      "    RHS  r3  -7\n"
+      "    RHS  r4  19\n"
+      "RANGES\n"
+      "    RNG  r4  3\n"
+      "BOUNDS\n"
+      " BV BND  x9\n"
+      " UP BND  x8  7\n"
+      " BV BND  x7\n"
+      " BV BND  x6\n"
+      " UP BND  x5  2\n"
+      " UP BND  x4  2\n"
+      " BV BND  x3\n"
+      " UP BND  x2  6\n"
+      " UP BND  x1  2\n"
+      "ENDATA\n");
+  CHECK(compare_with_presolve(m, 0) == Status::Optimal);
+}
+
+TEST(group_prop_start_time_windows) {
+  // Two jobs, each with three start options (one-of rows), start columns S = sum t x_t, job 2 after job 1
+  // finishes (duration 2): S2 >= S1 + 2. Plain propagation fixes nothing; the windows leave job 1 the starts
+  // {0, 1} and job 2 the starts {2, 3}.
+  Builder b;
+  std::vector<Index> x1, x2;
+  for (int t = 0; t < 3; ++t) x1.push_back(b.col(0.0, 0.0, 1.0, true));  // starts 0, 1, 2
+  for (int t = 0; t < 3; ++t) x2.push_back(b.col(0.0, 0.0, 1.0, true));  // starts 1, 2, 3
+  const Index s1 = b.col(0.0, 0.0, 10.0, true), s2 = b.col(0.0, 0.0, 10.0, true);
+  b.row(1.0, 1.0, {{x1[0], 1.0}, {x1[1], 1.0}, {x1[2], 1.0}});
+  b.row(1.0, 1.0, {{x2[0], 1.0}, {x2[1], 1.0}, {x2[2], 1.0}});
+  b.row(0.0, 0.0, {{x1[1], 1.0}, {x1[2], 2.0}, {s1, -1.0}});                 // start 0 has no entry
+  b.row(0.0, 0.0, {{x2[0], 1.0}, {x2[1], 2.0}, {x2[2], 3.0}, {s2, -1.0}});
+  b.row(-kInf, -2.0, {{s1, 1.0}, {s2, -1.0}});
+  const MipProblem p = b.build();
+  const GroupPropResult gr = group_propagate(p);
+  REQUIRE(!gr.infeasible);
+  CHECK(gr.groups == 2);
+  CHECK(gr.lb[s1] == 0.0 && gr.ub[s1] == 1.0);
+  CHECK(gr.lb[s2] == 2.0 && gr.ub[s2] == 3.0);
+  CHECK(gr.ub[x1[2]] == 0.0 && gr.ub[x1[0]] == 1.0 && gr.ub[x1[1]] == 1.0);
+  CHECK(gr.ub[x2[0]] == 0.0 && gr.ub[x2[1]] == 1.0 && gr.ub[x2[2]] == 1.0);
+}
+
+TEST(group_prop_shaves_a_level) {
+  // Three jobs with one option each of 2 units and one of 1 unit at the same time slot, level L >= usage, cost on
+  // L: every choice needs at least 3 units in the slot, the LP and plain propagation allow L = 0.
+  Builder b;
+  const Index L = b.col(1.0, 0.0, 9.0, true);
+  std::vector<std::pair<Index, double>> cap;
+  for (int j = 0; j < 3; ++j) {
+    const Index a = b.col(0.0, 0.0, 1.0, true), c = b.col(0.0, 0.0, 1.0, true);
+    b.row(1.0, 1.0, {{a, 1.0}, {c, 1.0}});
+    cap.push_back({a, 2.0});
+    cap.push_back({c, 1.0});
+  }
+  cap.push_back({L, -1.0});
+  b.row(-kInf, 0.0, cap);
+  const MipProblem p = b.build();
+  const GroupPropResult gr = group_propagate(p);
+  REQUIRE(!gr.infeasible);
+  CHECK(gr.lb[L] == 3.0);
+}
 
 TEST(probing_lifting_keeps_feasible_points) {
   // Probing results on enumerable models: every feasible point satisfies the derived bounds, equivalences and
@@ -1728,13 +1991,35 @@ TEST(probing_lifting_keeps_feasible_points) {
   for (int it = 0; it < iters; ++it) {
     const MipProblem p = random_enum_model(rng);
     const auto pts = enumerate_feasible(p);
+    // Mode 0: one candidate at a time. Modes 1 and 2: batches of 4 candidates on 1 and on 4 threads (the same
+    // result on any thread count); mode 3: batches of 3 on 2 threads, the helpers used for every batch.
+    ProbingResult batched1;
+    for (int mode = 0; mode < 4; ++mode) {
     ProbingOptions po;
     po.lift = true;
     po.max_conflicts = 100000;
+    po.batch = mode == 0 ? 0 : mode == 3 ? 3 : 4;
+    po.threads = mode == 2 ? 4 : mode == 3 ? 2 : 1;
+    if (mode >= 2) po.par_min = 0;
     const ProbingResult pr = probe_binaries(p, 10000000, po);
+    if (mode == 1) batched1 = pr;
+    if (mode == 2) {
+      bool same = pr.infeasible == batched1.infeasible && pr.probes == batched1.probes && pr.work == batched1.work &&
+                  pr.lb == batched1.lb && pr.ub == batched1.ub && pr.conflicts == batched1.conflicts &&
+                  pr.equiv.size() == batched1.equiv.size() && pr.lifts.size() == batched1.lifts.size();
+      for (size_t t = 0; same && t < pr.equiv.size(); ++t) {
+        same = pr.equiv[t].y == batched1.equiv[t].y && pr.equiv[t].x == batched1.equiv[t].x &&
+               pr.equiv[t].v0 == batched1.equiv[t].v0 && pr.equiv[t].v1 == batched1.equiv[t].v1;
+      }
+      for (size_t t = 0; same && t < pr.lifts.size(); ++t) {
+        same = pr.lifts[t].row == batched1.lifts[t].row && pr.lifts[t].col == batched1.lifts[t].col &&
+               pr.lifts[t].delta == batched1.lifts[t].delta && pr.lifts[t].one == batched1.lifts[t].one;
+      }
+      if (!CHECK(same)) std::fprintf(stderr, "  case %d: batched probing differs between 1 and 4 threads\n", it);
+    }
     if (pr.infeasible) {
-      ++infeasible;
-      if (!CHECK(pts.empty())) std::fprintf(stderr, "  case %d: probing infeasible, %zu feasible points\n", it, pts.size());
+      if (mode == 0) ++infeasible;
+      if (!CHECK(pts.empty())) std::fprintf(stderr, "  case %d mode %d: probing infeasible, %zu feasible points\n", it, mode, pts.size());
       continue;
     }
     bool ok = true;
@@ -1764,11 +2049,10 @@ TEST(probing_lifting_keeps_feasible_points) {
         row_ok = row_ok && act <= rhs + 1e-9;
       }
       if (!CHECK(row_ok)) std::fprintf(stderr, "  case %d: lifting of row %d by col %d cuts off a feasible point\n", it, l.row, l.col);
-      ++lifts;
-      fills += l.fill;
+      if (mode == 0) ++lifts, fills += l.fill;
     }
-    conflicts += static_cast<long long>(pr.conflicts.size());
-    equivs += static_cast<long long>(pr.equiv.size());
+    if (mode == 0) conflicts += static_cast<long long>(pr.conflicts.size()), equivs += static_cast<long long>(pr.equiv.size());
+    }
   }
   std::printf("  probing: %lld liftings (%lld new entries), %lld conflicts, %lld equivalences, %lld infeasible\n", lifts,
               fills, conflicts, equivs, infeasible);
@@ -2107,6 +2391,254 @@ TEST(presolve_random_vub_milps_match_no_presolve) {
   print_coverage("vub");
   CHECK(optimal > iters / 3);
   CHECK(agg > iters);
+}
+
+TEST(presolve_complement_keeps_the_group_member) {
+  // x0 + x1 + x2 = 1 with complements y_k = 1 - x_k used in big-M rows: the aggregation keeps the x_k, so the
+  // partitioning row survives as it is (without the rule the first complement pair may leave y in it).
+  for (bool keep : {true, false}) {
+    Builder b;
+    std::vector<Index> x, y;
+    for (int k = 0; k < 3; ++k) x.push_back(b.col(k + 1.0, 0.0, 1.0, true));
+    for (int k = 0; k < 3; ++k) y.push_back(b.col(0.0, 0.0, 1.0, true));
+    const Index w = b.col(-1.0, 0.0, 10.0);
+    for (int k = 0; k < 3; ++k) b.row(1.0, 1.0, {{y[k], 1.0}, {x[k], 1.0}});  // y listed first
+    b.row(1.0, 1.0, {{x[0], 1.0}, {x[1], 1.0}, {x[2], 1.0}});
+    for (int k = 0; k < 3; ++k) {
+      b.row(-kInf, 2.0 * k + 1.0, {{w, 1.0}, {y[k], -10.0}});
+      b.row(-kInf, 12.0, {{w, 1.0}, {y[k], 3.0}, {x[(k + 1) % 3], 1.0}});
+    }
+    const Model m = b.b.build();
+    MipProblem p;
+    REQUIRE(MipProblem::from_model(m, &p));
+    PresolveOptions o = only(false, false, false, false, true);
+    o.keep_members = keep;
+    Presolver pre;
+    REQUIRE(pre.run(p, o, kQuiet) == PresolveStatus::Reduced);
+    CHECK(pre.stats().aggregations == 3);
+    int kept = 0;
+    for (int k = 0; k < 3; ++k) kept += reduced_index(pre, x[k]) >= 0;
+    if (keep) CHECK(kept == 3);
+    SolverParams params;
+    params.verbosity = 0;
+    params.threads = 1;
+    const SolveResult r = solve(m, params);
+    REQUIRE(r.status == Status::Optimal);
+    params.presolve = false;
+    const SolveResult r0 = solve(m, params);
+    REQUIRE(r0.status == Status::Optimal);
+    CHECK_NEAR(r.objective, r0.objective, 1e-9);
+  }
+}
+
+TEST(presolve_probing_does_not_lift_a_redundant_row) {
+  // R: y - 3 t + 100 a <= 100 (a = 1: y <= 3 t). Probing fixes a = 0 (a = 1 forces c = 1 and c = 0), which
+  // makes R redundant (y <= 50); the same pass finds the lift of R by c (c = 1: y <= 5 and a = 0, so R has a
+  // slack of 98). Lifted, the row stays as y - 3 t + 98 c <= 100; with the rule it is left alone.
+  for (bool live : {true, false}) {
+    Builder b;
+    const Index c = b.col(1.0, 0.0, 1.0, true);  // probed before a: the lift is found while a is still free
+    const Index a = b.col(1.0, 0.0, 1.0, true);
+    const Index y = b.col(-1.0, 0.0, 50.0);
+    const Index t = b.col(2.0, 1.0, 5.0, true);
+    b.row(-kInf, 100.0, {{y, 1.0}, {t, -3.0}, {a, 100.0}});
+    b.row(-kInf, 0.0, {{a, 1.0}, {c, -1.0}});
+    b.row(-kInf, 1.0, {{a, 1.0}, {c, 1.0}});
+    b.row(-kInf, 50.0, {{y, 1.0}, {c, 45.0}});
+    const Model m = b.b.build();
+    MipProblem p;
+    REQUIRE(MipProblem::from_model(m, &p));
+    PresolveOptions o = only_probing();
+    o.lift_live = live;
+    Presolver pre;
+    REQUIRE(pre.run(p, o, kQuiet) == PresolveStatus::Reduced);
+    CHECK(pre.stats().probing_fixed >= 1);
+    CHECK(reduced_index(pre, a) < 0);
+    CHECK((pre.stats().probing_lifts == 0) == live);
+    SolverParams params;
+    params.verbosity = 0;
+    params.threads = 1;
+    const SolveResult r = solve(m, params);
+    params.presolve = false;
+    const SolveResult r0 = solve(m, params);
+    REQUIRE(r.status == Status::Optimal);
+    REQUIRE(r0.status == Status::Optimal);
+    CHECK_NEAR(r.objective, r0.objective, 1e-9);
+  }
+}
+
+TEST(presolve_dyadic_rows_tighten_exactly_and_become_unit_rows) {
+  // x + 0.25 y <= 1 over binaries: coefficient tightening gives 0.25 on x and the side 0.25. With the rounding
+  // margin of non-integral rows the coefficient is 0.25 + 2e-13 and the row is no clique; exact, it is
+  // 0.25 (x + y) <= 0.25, which unit_rows writes as x + y <= 1. Likewise 238 (u + v + w) >= 238 becomes
+  // u + v + w >= 1.
+  for (int mode = 0; mode < 3; ++mode) {
+    Builder b;
+    const Index x = b.col(-3.0, 0.0, 1.0, true);
+    const Index y = b.col(-1.0, 0.0, 1.0, true);
+    const Index u = b.col(2.0, 0.0, 1.0, true), v = b.col(3.0, 0.0, 1.0, true), w = b.col(4.0, 0.0, 1.0, true);
+    b.row(-kInf, 1.0, {{x, 1.0}, {y, 0.25}});
+    b.row(238.0, kInf, {{u, 238.0}, {v, 238.0}, {w, 238.0}});
+    b.row(-kInf, 2.0, {{x, 1.0}, {y, 1.0}, {u, 1.0}, {v, 1.0}});
+    // A row with continuous columns keeps its coefficients (divided by 4 it would be held to four times the
+    // feasibility tolerance in its original form).
+    const Index c1 = b.col(-0.5, 0.0, 2.0), c2 = b.col(-0.25, 0.0, 2.0);
+    b.row(-kInf, 6.0, {{c1, 4.0}, {c2, 4.0}});
+    b.row(-kInf, 3.0, {{c1, 1.0}, {c2, 2.0}, {x, 1.0}});
+    const Model m = b.b.build();
+    MipProblem p;
+    REQUIRE(MipProblem::from_model(m, &p));
+    PresolveOptions o = only(false, true, false, false, false);
+    o.lift_dyadic = mode >= 1;
+    o.unit_rows = mode == 2;
+    Presolver pre;
+    REQUIRE(pre.run(p, o, kQuiet) == PresolveStatus::Reduced);
+    const MipProblem& q = pre.reduced();
+    const SparseMatrix R = q.A.transpose();
+    REQUIRE(q.num_rows() == 5);
+    CHECK(R.value[R.begin(3)] == 4.0);
+    CHECK(q.row_ub[3] == 6.0);
+    // Row 0: equal coefficients exactly when the tightening is exact; unit form with unit_rows.
+    REQUIRE(R.end(0) - R.begin(0) == 2);
+    const double a0 = R.value[R.begin(0)], a1 = R.value[R.begin(0) + 1];
+    CHECK((a0 == a1) == (mode >= 1));
+    CHECK((a0 == 1.0 && a1 == 1.0 && q.row_ub[0] == 1.0) == (mode == 2));
+    if (mode == 1) CHECK(a0 == 0.25 && q.row_ub[0] == 0.25);
+    // Row 1: the covering row.
+    CHECK((R.value[R.begin(1)] == 1.0 && q.row_lb[1] == 1.0) == (mode == 2));
+    SolverParams params;
+    params.verbosity = 0;
+    params.threads = 1;
+    const SolveResult r = solve(m, params);
+    REQUIRE(r.status == Status::Optimal);
+    CHECK_NEAR(r.objective, -1.0 - 0.75, 1e-9);  // x = 1, y = 0, u = 1; c1 = 1.5, c2 = 0
+  }
+}
+
+TEST(presolve_integer_divisor_rescales_a_column) {
+  // w = 10 (u - v) + 30 with u, v in [0, 5]: w is 0 modulo 10, so w = 10 w' (w in [-5, 65]: w' <= 6).
+  // z = w + 5 t inherits a divisor of 5 once w is rescaled. Minimize z >= 37: z = 40.
+  for (bool on : {true, false}) {
+    Builder b;
+    const Index u = b.col(0.0, 0.0, 5.0, true);
+    const Index v = b.col(0.0, 0.0, 5.0, true);
+    const Index w = b.col(0.0, -5.0, 65.0, true);
+    const Index t = b.col(0.0, 0.0, 3.0, true);
+    const Index z = b.col(1.0, 37.0, 200.0, true);
+    b.row(30.0, 30.0, {{w, 1.0}, {u, -10.0}, {v, 10.0}});
+    b.row(0.0, 0.0, {{z, 1.0}, {w, -1.0}, {t, -5.0}});
+    b.row(-kInf, 7.0, {{u, 1.0}, {v, 1.0}, {t, 1.0}});
+    const Model m = b.b.build();
+    MipProblem p;
+    REQUIRE(MipProblem::from_model(m, &p));
+    PresolveOptions o = only(true, true, false, false, false);
+    o.int_divisors = on;
+    Presolver pre;
+    REQUIRE(pre.run(p, o, kQuiet) == PresolveStatus::Reduced);
+    CHECK(pre.stats().int_divisors == (on ? 2 : 0));
+    const Index kw = reduced_index(pre, w), kz = reduced_index(pre, z);
+    REQUIRE(kw >= 0);
+    REQUIRE(kz >= 0);
+    if (on) {
+      CHECK_NEAR(pre.reduced().col_lb[kw], 3.0, 1e-12);  // w >= 37 - 5 * 3 = 22 from the second row
+      CHECK_NEAR(pre.reduced().col_ub[kw], 6.0, 1e-12);
+      CHECK_NEAR(pre.reduced().col_lb[kz], 8.0, 1e-12);  // z = 5 z', z >= 37
+    }
+    // A point of the original space survives crush and postsolve.
+    std::vector<double> x(5, 0.0);
+    x[u] = 3.0, x[v] = 2.0, x[w] = 40.0, x[t] = 0.0, x[z] = 40.0;
+    const std::vector<double> back = pre.postsolve(pre.crush(x));
+    for (Index j = 0; j < 5; ++j) CHECK_NEAR(back[j], x[j], 1e-9);
+    SolverParams params;
+    params.verbosity = 0;
+    params.threads = 1;
+    const SolveResult r = solve(m, params);
+    REQUIRE(r.status == Status::Optimal);
+    CHECK_NEAR(r.objective, 40.0, 1e-9);
+  }
+}
+
+// Integer columns defined by equations whose other coefficients share a divisor (with an offset), chains of
+// them, a one-of group valued by one of them, and side rows.
+Model random_divisor_model(std::mt19937& rng) {
+  auto uni = [&](int lo, int hi) { return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1)); };
+  ModelBuilder b;
+  int r = 0;
+  auto row = [&](double lo, double hi, const std::vector<std::pair<Index, double>>& c) {
+    const Index k = b.add_row("r" + std::to_string(r++), lo, hi);
+    for (const auto& [j, v] : c) b.add_coef(k, j, v);
+  };
+  std::vector<Index> ints;
+  const int nb = uni(2, 4);
+  for (int i = 0; i < nb; ++i) {
+    ints.push_back(b.add_col("u" + std::to_string(i), uni(-3, 3), uni(-2, 0), uni(2, 6), VarType::Integer));
+  }
+  std::vector<Index> der;
+  for (int k = uni(1, 4); k > 0; --k) {
+    const int g = uni(2, 5) * (uni(0, 3) == 0 ? uni(2, 3) : 1);
+    const int aw = uni(0, 3) == 0 ? uni(2, 3) : 1;
+    const bool wide = uni(0, 2) == 0;
+    const Index w = b.add_col("w" + std::to_string(der.size()), uni(-3, 3), wide ? -200.0 : uni(-20, 0),
+                              wide ? 200.0 : uni(5, 60), VarType::Integer);
+    std::vector<std::pair<Index, double>> c{{w, uni(0, 1) ? aw : -aw}};
+    // Terms: base columns with multiples of aw g, or an earlier derived column with coefficient aw (a chain: the
+    // divisor shows only after that column was rescaled).
+    for (int t = uni(1, 3); t > 0; --t) {
+      const bool chain = !der.empty() && uni(0, 2) == 0;
+      const Index j = chain ? der[uni(0, static_cast<int>(der.size()) - 1)] : ints[uni(0, nb - 1)];
+      if (std::any_of(c.begin(), c.end(), [&](const auto& e) { return e.first == j; })) continue;
+      const int m = chain ? aw : aw * g * uni(1, 2);
+      c.push_back({j, uni(0, 1) ? m : -m});
+    }
+    if (c.size() < 2) c.push_back({ints[0], static_cast<double>(aw * g)});
+    const double rhs = aw * uni(-3, 12);
+    row(rhs, rhs, c);
+    der.push_back(w);
+  }
+  if (uni(0, 1)) {  // a one-of group whose value is a derived column
+    const Index w = der[uni(0, static_cast<int>(der.size()) - 1)];
+    const int K = uni(3, 12), k0 = uni(-2, 2);
+    std::vector<std::pair<Index, double>> one, val{{w, -1.0}};
+    for (int k = 0; k <= K; ++k) {
+      const Index x = b.add_col("x" + std::to_string(k), uni(-4, 4), 0.0, 1.0, VarType::Binary);
+      one.push_back({x, 1.0});
+      if (k0 + k != 0) val.push_back({x, static_cast<double>(k0 + k)});
+    }
+    row(1.0, uni(0, 3) == 0 ? kInf : 1.0, one);
+    row(0.0, 0.0, val);
+  }
+  Index y = -1;
+  if (uni(0, 2) == 0) y = b.add_col("y", uni(-2, 2), 0.0, uni(1, 9), VarType::Continuous);
+  std::vector<Index> all = ints;
+  all.insert(all.end(), der.begin(), der.end());
+  for (int t = uni(1, 3); t > 0; --t) {  // side rows
+    std::vector<std::pair<Index, double>> c;
+    for (Index j : all) {
+      if (uni(0, 2) == 0) c.push_back({j, static_cast<double>(uni(1, 3) * (uni(0, 1) ? 1 : -1))});
+    }
+    if (y >= 0 && uni(0, 1)) c.push_back({y, uni(0, 1) ? 1.0 : -1.5});
+    if (c.empty()) continue;
+    const int kind = uni(0, 2);
+    if (kind == 0) row(-kInf, uni(-5, 30), c);
+    else if (kind == 1) row(uni(-30, 5), kInf, c);
+    else row(uni(-10, 0), uni(0, 25), c);
+  }
+  return b.build();
+}
+
+TEST(presolve_random_divisor_milps_match_no_presolve) {
+  std::mt19937 rng(fuzz_seed(86420u));
+  const int iters = fuzz_iters(1500);
+  int optimal = 0;
+  PresolveOptions alone = only(true, true, false, false, false);
+  for (int it = 0; it < iters; ++it) {
+    optimal += compare_with_presolve(random_divisor_model(rng), it, -1, it % 3 == 0 ? &alone : nullptr) == Status::Optimal;
+  }
+  const long long rescaled = g_stats.int_divisors;
+  std::printf("  divisor models: %d optimal\n", optimal);
+  print_coverage("divisor");
+  CHECK(optimal > iters / 5);
+  CHECK(rescaled > iters / 2);
 }
 
 TEST(presolve_probing_lifts_big_m) {

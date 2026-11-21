@@ -351,6 +351,17 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
         cmd += ["--profile", str(prof_path)]
     log_path = tmpdir / f"{name}.log"
     grace = max(10.0, 0.2 * args.time_limit)
+    if args.pair:
+        # Paired comparison (ab.py): the other side's run of this instance should start at the same moment, so
+        # both see the same load. Wait here, holding no slot, until the other side has reached this instance
+        # too (both sides take the instances in the same order: no deadlock), or has ended.
+        pdir, side = Path(args.pair), args.pair_side
+        other = "B" if side == "A" else "A"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / f"{name}.{side}").touch()
+        t_end = time.time() + 3600
+        while not (pdir / f"{name}.{other}").exists() and not (pdir / f"done.{other}").exists() and time.time() < t_end:
+            time.sleep(0.2)
     # POPSO_SLOTS: wait for the run's threads and memory in the shared pool first (slots.py), outside the timing.
     with slots.slot(args.threads, args.mem_limit or 0), open(log_path, "wb") as log:
         # RSS watchdog: kill at 125% of the limit given to the solver
@@ -411,6 +422,10 @@ def run_one(path, args, solver_cmd, tmpdir, refs):
         m = re.search(r"^Nodes: (\d+)$", text, re.M)
         if m:
             rec["nodes"] = int(m.group(1))
+        if "postsolved solution violates the original problem" in text:
+            # The solver's own check caught a wrong presolved point and solved again without presolve: the
+            # answer is right, a presolve reduction was not (the summary line counts these).
+            rec["presolve_fallback"] = True
         m = re.search(r"^Restarts: (\d+) root, (\d+) in-tree$", text, re.M)
         if m:
             rec["restarts"], rec["tree_restarts"] = int(m.group(1)), int(m.group(2))
@@ -526,6 +541,8 @@ def main(argv=None):
     ap.add_argument("--int-tol", type=float, default=1e-6)
     ap.add_argument("--out-dir", default=str(BENCH / "results"))
     ap.add_argument("--tag", default="", help="label appended to the result file name")
+    ap.add_argument("--pair", metavar="DIR", help="rendezvous directory of a paired comparison (set by ab.py)")
+    ap.add_argument("--pair-side", choices=["A", "B"], default="A")
     ap.add_argument("--no-save", action="store_true", help="do not write result files")
     ap.add_argument("--keep-sols", action="store_true", help="keep .sol/.log under results/tmp")
     ap.add_argument("--starts", metavar="DIR",
@@ -697,6 +714,9 @@ def main(argv=None):
             print(f"continue with the same command plus  --resume {_shown(jsonl)}", file=sys.stderr)
         return 130
     finally:
+        if args.pair:  # release the other side's waiting runs
+            Path(args.pair).mkdir(parents=True, exist_ok=True)
+            (Path(args.pair) / f"done.{args.pair_side}").touch()
         signal.signal(signal.SIGTERM, old_term)
     order = {inst_name(f): i for i, f in enumerate(skipped + files)}
     recs.sort(key=lambda r: order.get(r["instance"], -1))
@@ -743,9 +763,14 @@ def main(argv=None):
             summary[f"ours_sgm_time_on_{key}_set"] = sgm([p[0] for p in pairs])
 
     print("-" * len(hdr))
+    fallbacks = [r["instance"] for r in recs if r.get("presolve_fallback")]
+    summary["presolve_fallbacks"] = len(fallbacks)
     print(f"instances {n}  solved {solved}  unsolved {by.get(UNSOLVED, 0)}  memlimit {by.get(MEMLIMIT, 0)}  "
           f"errors {by.get(ERROR, 0)}  "
-          f"WRONG {len(wrong)}")
+          f"WRONG {len(wrong)}" + (f"  PRESOLVE FALLBACKS {len(fallbacks)}" if fallbacks else ""))
+    if fallbacks:
+        print(f"!!! presolve fallback (postsolved point violated the model, solved again without presolve): "
+              f"{', '.join(fallbacks[:20])}")
     pis = [r["primal_integral"] for r in recs if r.get("primal_integral") is not None]
     if pis:
         summary["primal_integral_mean"] = sum(pis) / len(pis)

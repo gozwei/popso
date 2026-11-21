@@ -11,6 +11,7 @@
 // started from the previous (dual feasible) basis.
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <random>
@@ -50,6 +51,9 @@ struct LpOptions {
   // feasibility-jump helper's solutions there during a long root LP.
   std::function<bool(long long)> checkpoint;
   long long checkpoint_every = 0;
+  // Threads for the exact dual steepest-edge weights of a new basis (set_basis: one unit btran per row; the
+  // weights do not depend on the thread count). Used above 20000 rows; for a caller whose other threads idle.
+  int weight_threads = 1;
 };
 
 class DualSimplex {
@@ -80,6 +84,7 @@ class DualSimplex {
     std::vector<VarStatus> status;
     std::vector<Index> basic;
     std::vector<double> dse;
+    bool dse_ok = false;
     LuFactor lu;
     bool has_factor = false;
     std::vector<double> x, d;
@@ -113,10 +118,22 @@ class DualSimplex {
   // entries of the index list (all n + m when the row was scanned densely).
   long long tableau_row_work() const { return tableau_work_; }
   const std::vector<Index>& basic_vars() const { return basic_; }
-  // Rows are scaled internally (row i by rscale_[i], a power of two); every
-  // accessor below reports unscaled data.
-  const SparseMatrix& row_matrix() const { return At_orig_; }  // CSR of all rows (incl. added)
-  const SparseMatrix& col_matrix() const { return A_orig_; }   // CSC
+  // Rows are scaled internally (row i by rscale_[i], a power of two). No unscaled copy of the matrix is kept
+  // (12 bytes per nonzero each, in every LP copy): the CSR and CSC below hold each entry times its row's scale,
+  // and entry * row_unscale(row) (= entry / row_scale(row)) is the model's coefficient, exactly.
+  const SparseMatrix& scaled_row_matrix() const { return At_; }  // CSR of all rows (incl. added)
+  const SparseMatrix& scaled_col_matrix() const { return A_; }   // CSC
+  double row_scale(Index i) const { return rscale_[i]; }
+  double row_unscale(Index i) const { return 1.0 / rscale_[i]; }
+  // An unscaled CSR copy of all rows (diagnostics and one-off uses: it allocates the whole matrix).
+  SparseMatrix unscaled_rows() const {
+    SparseMatrix R = At_;
+    for (Index i = 0; i < m_; ++i) {
+      const double us = 1.0 / rscale_[i];
+      for (Index p = R.begin(i); p < R.end(i); ++p) R.value[p] *= us;
+    }
+    return R;
+  }
   // Strict safe bounds (default off): a dual infeasibility inside the tolerance on a column or row whose range is
   // infinite on that side makes the safe bound -inf (unless it is at rounding level), instead of being charged at
   // the variable's current size. That charge is no proof: a product column near 2e8 with a reduced cost of -2e-8
@@ -173,8 +190,24 @@ class DualSimplex {
   struct CheckCounts {
     long long farkas_checked = 0, farkas_failed = 0, farkas_retried_ok = 0;
     long long unscaled_solves = 0, unscaled_iterations = 0;
+    // All LPs of the process: solves, those that began without a factorization, refactorizations, row edits.
+    long long solves = 0, cold_solves = 0, refactors = 0, row_adds = 0, row_removes = 0;
+    // Recomputations of all steepest-edge weights (one solve per row, after a basis was set) and their time.
+    long long weight_calls = 0, weight_ns = 0, weight_given = 0;
   };
   static CheckCounts check_counts();
+  // Threads for the recomputation of all steepest-edge weights on large bases (at least 20000 rows), used
+  // when LpOptions::weight_threads asks for fewer. The result does not depend on the thread count. Copies
+  // keep the setting.
+  void set_weight_threads(int t) { weight_threads_ = t; }
+  // Steepest-edge weights of the basic variables with index < nvars, in ascending variable order (single
+  // precision). False if the weights at hand are not those of the current basis (kept exact from a basis
+  // whose weights were exact).
+  bool basic_weights(Index nvars, std::vector<float>& out) const;
+  // Right after set_basis with the basis basic_weights() was read for: installs these weights in place of
+  // the recomputation for all rows; rows whose basic variable is >= nvars (basic logicals of rows added
+  // since) are computed at the next solve. False (nothing changed) if the count does not fit.
+  bool set_basic_weights(Index nvars, const float* w, Index count);
   // Values of all n + m variables (structurals first, logicals unscaled).
   const double* x() const;
   long long iterations() const { return total_iterations_; }
@@ -249,8 +282,19 @@ class DualSimplex {
   std::vector<VarStatus> status_;
   std::vector<Index> basic_;  // position -> variable
   std::vector<double> x_, d_, dse_;
+  // Updates between factorizations. MILP_LP_REFACTOR = N (experiment): N instead of LpOptions::refactor_interval;
+  // N < 0: max(interval, rows / -N). LuFactor::wants_refactor (update work above the factorization's) still
+  // applies.
+  int refactor_interval(const LpOptions& opt) const {
+    static const int knob = [] { const char* v = std::getenv("MILP_LP_REFACTOR"); return v ? std::atoi(v) : 0; }();
+    if (knob > 0) return knob;
+    if (knob < 0) return std::max(opt.refactor_interval, static_cast<int>(m_ / -knob));
+    return opt.refactor_interval;
+  }
   int dse_exact_ = 0;      // recompute all DSE weights at the next solve (set_basis, MILP_LP_DSE_KEEP=2)
   std::vector<Index> dse_new_;  // basis positions of added rows whose DSE weight is computed at the next solve
+  bool dse_ok_ = false;         // dse_ holds the current basis's weights, exact up to update drift
+  int weight_threads_ = 1;
   // Warm start: after an optimal solve x_ and d_ (true costs) stay valid while
   // only bounds change; nonbasic value changes are queued in moves_ and applied
   // to x_B with one ftran at the next solve.
@@ -261,6 +305,7 @@ class DualSimplex {
   // Dual pricing candidates: basis positions whose value violates its bounds.
   std::vector<Index> infeas_list_, infeas_pos_;  // infeas_pos_[p]: index in the list or -1
   bool infeas_dirty_ = true;
+  std::vector<double> blb_, bub_, btol_;  // working bounds / tolerance of the basic variable at each position
   std::vector<double> arow_;
   // arow_ entry j is part of the current row iff arow_mark_[j] == arow_gen_ (no clearing pass);
   // other entries of arow_ hold stale values and are never read.
@@ -268,8 +313,8 @@ class DualSimplex {
   uint32_t arow_gen_ = 1;
   std::vector<Index> arow_nz_;  // nonzero positions of arow_: the first arow_count_
   Index arow_count_ = 0;
+  Index arow_all_ = 0;  // entries of the row including basic columns (the work count; pivot_row lists nonbasic ones)
   LuFactor lu_;
-  SparseMatrix At_orig_, A_orig_;  // unscaled CSR / CSC of all rows (as passed in)
   std::vector<double> rscale_;    // per row
   std::vector<double> ftol_;      // per variable: primal tolerance factor (min(1, rscale) for logicals)
   std::vector<double> dftol_;     // per variable: dual tolerance factor (min(1, 1 / rscale) for logicals)

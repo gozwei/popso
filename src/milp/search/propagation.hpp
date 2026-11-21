@@ -3,6 +3,8 @@
 // variable bounds implied by the current bounds of the other variables and
 // detects infeasible nodes without solving the LP.
 
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "milp/search/mip_problem.hpp"
@@ -12,7 +14,11 @@ namespace milp {
 
 class DomainPropagator {
  public:
-  explicit DomainPropagator(const MipProblem& p);
+  // rows: shared_rows(p), to share one row copy among the propagators of a problem (a worker each); else an own copy.
+  explicit DomainPropagator(const MipProblem& p, std::shared_ptr<const SparseMatrix> rows = nullptr);
+  // The rows of p (CSR) with the objective row appended when a cost is nonzero: what a propagator holds after
+  // enable_objective. Read-only, so one copy serves any number of propagators (12 bytes per nonzero each before).
+  static std::shared_ptr<const SparseMatrix> shared_rows(const MipProblem& p);
 
   // Propagates starting from the rows of the `seeds` columns. Bounds are
   // tightened in place; every tightened column is appended to `tightened`.
@@ -34,7 +40,7 @@ class DomainPropagator {
 
   // Rows as propagated: the model rows, plus the objective row (index num_rows(), see
   // enable_objective) when enabled. Conflict analysis explains bounds with these.
-  const SparseMatrix& rows() const { return rows_; }
+  const SparseMatrix& rows() const { return *rows_; }
   const std::vector<double>& row_lb() const { return row_lb_; }
   const std::vector<double>& row_ub() const { return row_ub_; }
 
@@ -46,13 +52,17 @@ class DomainPropagator {
 
  private:
   const MipProblem& p_;
-  SparseMatrix rows_;  // CSR copy of A (+ the objective row)
+  std::shared_ptr<const SparseMatrix> rows_;  // CSR copy of A (+ the objective row), possibly shared
   std::vector<double> row_lb_, row_ub_;
   Index obj_row_ = -1;
   std::vector<char> queued_;
   std::vector<char> cont_mark_;     // continuous column tightened in the current call
   std::vector<Index> cont_marked_;
   std::vector<Index> queue_;
+  // Rows found idle in the current call and the room they have left: see propagate().
+  std::vector<uint32_t> room_stamp_;
+  std::vector<double> room_hi_, room_lo_;
+  uint32_t room_call_ = 0;
 };
 
 }  // namespace milp

@@ -1,0 +1,12 @@
+benchmarks/miplib/CMS750_4.mps.gz
+benchmarks/miplib/supportcase18.mps.gz
+benchmarks/miplib/neos-1171737.mps.gz
+benchmarks/miplib/neos-960392.mps.gz
+benchmarks/miplib/bnatt400.mps.gz
+benchmarks/miplib/mas74.mps.gz
+benchmarks/miplib/swath3.mps.gz
+benchmarks/miplib/eil33-2.mps.gz
+benchmarks/miplib/pg5_34.mps.gz
+benchmarks/miplib/timtab1.mps.gz
+benchmarks/miplib/neos-911970.mps.gz
+benchmarks/miplib/mcsched.mps.gz

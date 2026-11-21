@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -218,8 +219,14 @@ class PackedBasis {
  public:
   // size < 0: all of b. ref: reference of the sparse form (null: dense). pool_nb: nonbasic pool
   // rows (pool id, status), ids ascending (null: none). One reference (the caller's).
+  // weights: steepest-edge weights of the basic variables among the first `size` (DualSimplex::basic_weights),
+  // kept after the pool stream as a count and single-precision values (null or empty: none).
   static PackedBasis* make(const Basis& b, Index size, const std::vector<VarStatus>* ref,
-                           const std::vector<std::pair<int, VarStatus>>* pool_nb);
+                           const std::vector<std::pair<int, VarStatus>>* pool_nb,
+                           const std::vector<float>* weights = nullptr);
+  bool has_weights() const { return (nbits_ & kWeights) != 0; }
+  // Copies the stored weights; false if there are none.
+  bool weights(std::vector<float>& out) const;
   void retain() const { refs_.fetch_add(1, std::memory_order_relaxed); }
   // Drops a reference; true if it was the last one (the caller then calls destroy()).
   bool unref() const { return refs_.fetch_sub(1, std::memory_order_acq_rel) == 1; }
@@ -229,10 +236,11 @@ class PackedBasis {
   }
   Index size() const { return size_; }
   bool sparse() const { return (nbits_ & kSparse) != 0; }
+  uint32_t status_bytes() const { return nbits_ & ~(kSparse | kWeights); }
   int npool() const { return npool_; }
   template <class F>
   void for_each_pool(F&& f) const {
-    const uint8_t* q = data() + (nbits_ & ~kSparse);
+    const uint8_t* q = data() + status_bytes();
     int id = -1;
     for (int k = 0; k < npool_; ++k) {
       const uint64_t v = get_varint(q);
@@ -247,12 +255,13 @@ class PackedBasis {
 
  private:
   PackedBasis() = default;
-  static constexpr uint32_t kSparse = 1u << 31;
+  static constexpr uint32_t kSparse = 1u << 31, kWeights = 1u << 30;
+  const uint8_t* pool_end() const;
   const uint8_t* data() const { return reinterpret_cast<const uint8_t*>(this + 1); }
   uint8_t* data() { return reinterpret_cast<uint8_t*>(this + 1); }
   mutable std::atomic<int32_t> refs_{0};
   int32_t size_ = 0;
-  uint32_t nbits_ = 0;  // bytes of the status stream; kSparse: difference form
+  uint32_t nbits_ = 0;  // bytes of the status stream; kSparse: difference form; kWeights: weights follow the pool stream
   int32_t npool_ = 0;   // nonbasic pool rows
 };
 static_assert(sizeof(PackedBasis) == 16, "basis header");
@@ -386,6 +395,12 @@ class TreeWeight {
   std::array<std::atomic<long long>, kMaxDepth> cnt_{};
   std::atomic<long long> leaves_{0};
 };
+
+// Process-wide: a pool destroyed after this point in time (steady clock, nanoseconds since its epoch) leaves its
+// open nodes' memory to the operating system. Set only by the command-line program, to the end of its time
+// limit: the process exits right after the solve, and freeing millions of nodes one by one first only delays
+// the result (markshare2: 0.3 s per minute of a 4-thread search). Never set for library use.
+inline std::atomic<long long> g_leak_pools_after_ns{std::numeric_limits<long long>::max()};
 
 class NodePool {
  public:
@@ -594,6 +609,7 @@ class NodePool {
 
   BasisOwner* owner_;
   std::atomic<long long>* path_acct_;
+  int threads_ = 1;  // the search's thread count: the destructor frees the open nodes on that many threads
   TreeWeight* tw_ = nullptr;
   mutable std::mutex mu_;
   std::condition_variable cv_;

@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <thread>
 
 namespace milp::bnb {
 
@@ -10,7 +11,8 @@ size_t alloc16(size_t b) { return (b + 15) & ~size_t(15); }
 }  // namespace
 
 PackedBasis* PackedBasis::make(const Basis& b, Index size_in, const std::vector<VarStatus>* ref,
-                               const std::vector<std::pair<int, VarStatus>>* pool_nb) {
+                               const std::vector<std::pair<int, VarStatus>>* pool_nb,
+                               const std::vector<float>* weights) {
   thread_local std::vector<uint8_t> bits, pool;
   bits.clear();
   pool.clear();
@@ -43,21 +45,29 @@ PackedBasis* PackedBasis::make(const Basis& b, Index size_in, const std::vector<
     }
     np = static_cast<int>(pool_nb->size());
   }
-  void* mem = ::operator new(sizeof(PackedBasis) + bits.size() + pool.size());
+  const bool with_w = weights && !weights->empty();
+  const size_t wbytes = with_w ? sizeof(uint32_t) + weights->size() * sizeof(float) : 0;
+  void* mem = ::operator new(sizeof(PackedBasis) + bits.size() + pool.size() + wbytes);
   PackedBasis* p = new (mem) PackedBasis();
   p->refs_.store(1, std::memory_order_relaxed);
   p->size_ = size;
-  p->nbits_ = static_cast<uint32_t>(bits.size()) | (sparse ? kSparse : 0u);
+  p->nbits_ = static_cast<uint32_t>(bits.size()) | (sparse ? kSparse : 0u) | (with_w ? kWeights : 0u);
   p->npool_ = np;
   if (!bits.empty()) std::memcpy(p->data(), bits.data(), bits.size());
   if (!pool.empty()) std::memcpy(p->data() + bits.size(), pool.data(), pool.size());
+  if (with_w) {
+    uint8_t* q = p->data() + bits.size() + pool.size();
+    const uint32_t cnt = static_cast<uint32_t>(weights->size());
+    std::memcpy(q, &cnt, sizeof cnt);
+    std::memcpy(q + sizeof cnt, weights->data(), weights->size() * sizeof(float));
+  }
   return p;
 }
 
 void PackedBasis::unpack(Basis& b, const std::vector<VarStatus>* ref) const {
   b.status.resize(size_);
   const uint8_t* q = data();
-  const uint32_t nbits = nbits_ & ~kSparse;
+  const uint32_t nbits = status_bytes();
   if (!sparse()) {
     for (Index j = 0; j < size_; ++j) b.status[j] = static_cast<VarStatus>((q[j >> 2] >> ((j & 3) * 2)) & 3);
     return;
@@ -76,28 +86,72 @@ void PackedBasis::unpack(Basis& b, const std::vector<VarStatus>* ref) const {
   }
 }
 
+const uint8_t* PackedBasis::pool_end() const {
+  const uint8_t* q = data() + status_bytes();
+  for (int k = 0; k < npool_; ++k) get_varint(q);
+  return q;
+}
+
+bool PackedBasis::weights(std::vector<float>& out) const {
+  if (!has_weights()) return false;
+  const uint8_t* q = pool_end();
+  uint32_t cnt = 0;
+  std::memcpy(&cnt, q, sizeof cnt);
+  out.resize(cnt);
+  std::memcpy(out.data(), q + sizeof cnt, static_cast<size_t>(cnt) * sizeof(float));
+  return true;
+}
+
 long long PackedBasis::bytes() const {
-  size_t pool_len = 0;
-  if (npool_ > 0) {
-    const uint8_t* q0 = data() + (nbits_ & ~kSparse);
-    const uint8_t* q = q0;
-    for (int k = 0; k < npool_; ++k) get_varint(q);
-    pool_len = static_cast<size_t>(q - q0);
+  const uint8_t* q = pool_end();
+  size_t len = static_cast<size_t>(q - data());
+  if (has_weights()) {
+    uint32_t cnt = 0;
+    std::memcpy(&cnt, q, sizeof cnt);
+    len += sizeof cnt + static_cast<size_t>(cnt) * sizeof(float);
   }
-  return static_cast<long long>(alloc16(sizeof(PackedBasis) + (nbits_ & ~kSparse) + pool_len));
+  return static_cast<long long>(alloc16(sizeof(PackedBasis) + len));
 }
 
 // ---------------------------------------------------------------------------------------------
 
 NodePool::NodePool(int workers, BasisOwner* owner, std::atomic<long long>* path_acct)
-    : owner_(owner), path_acct_(path_acct), wbound_(workers, kInf) {
+    : owner_(owner), path_acct_(path_acct), threads_(std::max(1, workers)), wbound_(workers, kInf) {
   update_bytes();
 }
 
+// The open nodes' paths and bases: an allocation or two per node, scattered over the heap. Freed one by one on
+// the calling thread this was 0.3 s per 7 million nodes of a 4-thread minute (markshare2), and 7-8 s past a
+// 600 s limit on 10 threads. Chunks of slots are dealt out to the search's thread count (the reference counts
+// are atomic; a shared ancestor segment is freed by whoever drops its last reference), and the owner's
+// accounting of the bases is skipped: the pool is destroyed with its search.
 NodePool::~NodePool() {
-  for (uint32_t s = 0; s < nslots_; ++s) {
-    if (slot(s).depth >= 0) free_slot(s);
+  if (count_ >= 50000 && std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count() >=
+                             g_leak_pools_after_ns.load(std::memory_order_relaxed)) {
+    return;  // the command-line program past its time limit: see g_leak_pools_after_ns
   }
+  const uint32_t nchunks = (nslots_ + kChunk - 1) >> kChunkBits;
+  const uint32_t nt = count_ < 50000 ? 1u : std::min<uint32_t>({static_cast<uint32_t>(threads_), 16u, nchunks});
+  std::atomic<uint32_t> next{0};
+  auto run = [this, nchunks, &next] {
+    for (uint32_t c = next.fetch_add(1); c < nchunks; c = next.fetch_add(1)) {
+      const uint32_t end = std::min(nslots_, (c + 1) << kChunkBits);
+      for (uint32_t s = c << kChunkBits; s < end; ++s) {
+        QNode& q = slot(s);
+        if (q.depth < 0) continue;
+        PathSeg::release(q.path);
+        BasisRef::drop(q.basis, nullptr);
+      }
+    }
+  };
+  std::vector<std::thread> helpers;
+  try {
+    for (uint32_t t = 1; t < nt; ++t) helpers.emplace_back(run);
+  } catch (...) {  // no thread to be had: this one frees what the others do not take
+  }
+  run();
+  for (auto& th : helpers) th.join();
 }
 
 void NodePool::resize_workers(int workers) {

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <thread>
 
 #include "milp/core/interrupt.hpp"
 #include "milp/core/timer.hpp"
@@ -101,6 +102,8 @@ double dual_tol_factor(double rs) { return kUnscaledDual ? std::min(1.0, 1.0 / r
 // DualSimplex::check_counts (statistics only).
 std::atomic<long long> g_farkas_checked{0}, g_farkas_failed{0}, g_farkas_retried_ok{0};
 std::atomic<long long> g_unscaled_solves{0}, g_unscaled_iterations{0};
+std::atomic<long long> g_solves{0}, g_cold_solves{0}, g_refactors{0}, g_row_adds{0}, g_row_removes{0};
+std::atomic<long long> g_weight_calls{0}, g_weight_ns{0}, g_weight_given{0};  // exact steepest-edge weights for all rows
 }  // namespace
 
 void DualSimplex::load(const SparseMatrix& A, const std::vector<double>& cost, const std::vector<double>& col_lb,
@@ -108,21 +111,21 @@ void DualSimplex::load(const SparseMatrix& A, const std::vector<double>& cost, c
                        const std::vector<double>& row_ub) {
   n_ = A.num_major;
   m_ = A.num_minor;
-  A_orig_ = A;
-  At_orig_ = A.transpose();
-  // Geometric row scaling by powers of two (exact; makes badly scaled rows tractable).
+  // Geometric row scaling by powers of two (exact; makes badly scaled rows tractable). The rows are kept scaled
+  // only: an unscaled entry is the scaled one times 1 / rscale_ (row_unscale), exactly.
+  At_ = A.transpose();
   rscale_.assign(m_, 1.0);
   static const bool no_scale = std::getenv("MILP_NO_LP_SCALING") != nullptr;
   if (!no_scale) {
     for (Index i = 0; i < m_; ++i) {
-      compute_row_scale(i, At_orig_.index.data() + At_orig_.begin(i), At_orig_.value.data() + At_orig_.begin(i),
-                        At_orig_.end(i) - At_orig_.begin(i));
+      compute_row_scale(i, At_.index.data() + At_.begin(i), At_.value.data() + At_.begin(i), At_.end(i) - At_.begin(i));
+      const double rs = rscale_[i];
+      for (Index p = At_.begin(i); p < At_.end(i); ++p) At_.value[p] *= rs;
     }
   }
   A_ = A;
   for (Index j = 0; j < n_; ++j)
     for (Index p = A_.begin(j); p < A_.end(j); ++p) A_.value[p] *= rscale_[A_.index[p]];
-  At_ = A_.transpose();
   const Index N = n_ + m_;
   cost_.assign(N, 0.0);
   lb_.resize(N);
@@ -191,6 +194,7 @@ void DualSimplex::reset_basis() {
   }
   for (Index j = 0; j < n_; ++j) place_nonbasic(j);
   dse_.assign(m_, 1.0);
+  dse_ok_ = true;  // exact for the slack basis
   dse_new_.clear();
   has_factor_ = false;
   values_ok_ = false;
@@ -244,6 +248,7 @@ void DualSimplex::set_basis(const Basis& b) {
     }
   }
   dse_exact_ = keep >= 2 ? keep : 0;
+  dse_ok_ = false;
   has_factor_ = false;
   values_ok_ = false;
   moves_.clear();
@@ -253,6 +258,7 @@ void DualSimplex::save_state(State& s) const {
   s.status = status_;
   s.basic = basic_;
   s.dse = dse_;
+  s.dse_ok = dse_ok_ && dse_exact_ == 0 && dse_new_.empty();
   s.has_factor = has_factor_;
   if (has_factor_) s.lu = lu_;
   s.has_values = values_ok_ && moves_.empty();
@@ -266,6 +272,7 @@ void DualSimplex::restore_state(const State& s) {
   status_ = s.status;
   basic_ = s.basic;
   dse_ = s.dse;
+  dse_ok_ = s.dse_ok;
   dse_new_.clear();
   has_factor_ = s.has_factor;
   if (has_factor_) lu_ = s.lu;
@@ -392,6 +399,7 @@ void DualSimplex::unit_btran(Index r) {
 }
 
 bool DualSimplex::refactor(bool renumber) {
+  g_refactors.fetch_add(1, std::memory_order_relaxed);
   std::vector<Index>&start = fac_start_, &index = fac_index_;
   std::vector<double>& value = fac_value_;
   start.assign(m_ + 1, 0);
@@ -420,6 +428,7 @@ bool DualSimplex::refactor(bool renumber) {
     basic_[p] = n_ + row;
     status_[n_ + row] = VarStatus::Basic;
     dse_[p] = 1.0;
+    dse_ok_ = false;
   }
   if (renumber) {
     // Position p becomes the column pivoted in row p: ftran/btran results need no permutation.
@@ -455,22 +464,28 @@ void DualSimplex::count_iteration_work(Index rho_count, Index col_count) {
   const long long per = F / std::max<Index>(1, m_) + 1;
   auto solve = [&](Index c) { return std::min(F, kWorkSolve * per * c) + c; };
   const long long row = static_cast<long long>(rho_count) * (A_.nnz() / std::max<Index>(1, m_) + 1);
-  work_ += kWorkRows * m_ + kWorkPivotRow * (std::min<long long>(row, A_.nnz()) + arow_count_) + solve(rho_count) +
+  work_ += kWorkRows * m_ + kWorkPivotRow * (std::min<long long>(row, A_.nnz()) + arow_all_) + solve(rho_count) +
            2 * solve(col_count);
 }
 
 void DualSimplex::rebuild_infeasible(double ptol) {
   infeas_pos_.assign(m_, -1);
   infeas_list_.clear();
+  // The basic variables' working bounds and tolerances by basis position (valid with the list): the loops over
+  // positions read them in order instead of four arrays indexed by the variable.
+  blb_.resize(m_), bub_.resize(m_), btol_.resize(m_);
+  for (Index p = 0; p < m_; ++p) {
+    const Index j = basic_[p];
+    blb_[p] = wlb_[j], bub_[p] = wub_[j], btol_[p] = ptol * ftol_[j];
+  }
   for (Index p = 0; p < m_; ++p) update_infeasible(p, ptol);
   infeas_dirty_ = false;
 }
 
-void DualSimplex::update_infeasible(Index p, double ptol) {
-  const Index j = basic_[p];
-  const double v = x_[j];
-  const double t = ptol * ftol_[j];
-  const bool inf = v < wlb_[j] - t || v > wub_[j] + t;
+void DualSimplex::update_infeasible(Index p, double) {
+  const double v = x_[basic_[p]];
+  const double t = btol_[p];
+  const bool inf = v < blb_[p] - t || v > bub_[p] + t;
   Index& k = infeas_pos_[p];
   if (inf == (k >= 0)) return;
   if (inf) {
@@ -592,6 +607,10 @@ Index DualSimplex::count_dual_infeasibilities(bool flip_boxed, bool unscaled) {
   return count;
 }
 
+namespace {
+const double kPertNnz = [] { const char* v = std::getenv("MILP_LP_PERT_NNZ"); return v ? std::atof(v) : 0.0; }();
+}  // namespace
+
 void DualSimplex::perturb_costs(double mul) {
   // Nonbasic structurals only, pushing d_j further into its feasible side, so
   // the duals stay valid without a recomputation (d_j moves with c_j).
@@ -606,7 +625,15 @@ void DualSimplex::perturb_costs(double mul) {
     const VarStatus st = status_[j];
     if (st == VarStatus::Basic || st == VarStatus::AtZero || lb_[j] == ub_[j]) continue;
     const double one = pert_col_.empty() ? 1.0 : pert_col_[j];
-    const double xi = (one + std::abs(cost_[j])) * base * (1.0 + perturb_rand_[j]);
+    double xi = (one + std::abs(cost_[j])) * base * (1.0 + perturb_rand_[j]);
+    if (kPertNnz > 0.0) {
+      // Koberstein (2005, sec. 6.3.1): the perturbation grows with the column's nonzero count, so that dense
+      // columns lose ties in the ratio test and the basis stays sparse. MILP_LP_PERT_NNZ = d (opt-in): his weights
+      // divided by d.
+      static const double kW[11] = {0.01, 0.01, 0.1, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 100.0};
+      const Index len = A_.end(j) - A_.begin(j);
+      xi *= kW[std::min<Index>(len, 10)] / kPertNnz;
+    }
     const double delta = st == VarStatus::AtLower ? xi : -xi;
     wcost_[j] = cost_[j] + delta;
     d_[j] += delta;
@@ -714,17 +741,27 @@ void DualSimplex::pivot_row(const HVector& rho, bool nonbasic_only) {
         mark[j] = gen;
         nz[cnt++] = j;
       }
+      Index all = cnt;
       for (Index k = 0; k < rho.count; ++k) {
         const Index i = rho.nz[k];
         if (rho.dense[i] == 0.0) continue;
         arow_[n_ + i] = rho.dense[i];
         mark[n_ + i] = gen;
-        nz[cnt++] = n_ + i;
+        nz[cnt] = n_ + i;
+        cnt += status_[n_ + i] != VarStatus::Basic;
+        ++all;
       }
       arow_count_ = cnt;
+      arow_all_ = all;
       return;
     }
   }
+  // nonbasic_only: basic columns are computed (the scatter does not know them apart cheaply enough to skip the
+  // arithmetic) but not listed: a third to almost half of a row's entries in the tree's node LPs, which the
+  // ratio test and the dual update then skipped one by one. The listed ones keep their order.
+  const VarStatus* stat = status_.data();
+  const bool all_cols = !nonbasic_only;
+  Index all = 0;
   for (Index k = 0; k < rho.count; ++k) {
     const Index i = rho.nz[k];
     const double r = rho.dense[i];
@@ -737,15 +774,19 @@ void DualSimplex::pivot_row(const HVector& rho, bool nonbasic_only) {
       const Index j = idx[p];
       const bool seen = mark[j] == gen;
       nz[cnt] = j;
-      cnt += !seen;
+      cnt += (!seen) & (all_cols | (stat[j] != VarStatus::Basic));
+      all += !seen;
       mark[j] = gen;
       ar[j] = (seen ? ar[j] : 0.0) + r * val[p];
     }
     arow_[n_ + i] = r;
     mark[n_ + i] = gen;
-    nz[cnt++] = n_ + i;
+    nz[cnt] = n_ + i;
+    cnt += all_cols | (stat[n_ + i] != VarStatus::Basic);
+    ++all;
   }
   arow_count_ = cnt;
+  arow_all_ = all;
 }
 
 bool DualSimplex::limits_hit(const LpOptions& opt, LpStatus* st) const {
@@ -860,6 +901,50 @@ bool DualSimplex::farkas_check_enabled() {
   return on;
 }
 
+bool DualSimplex::basic_weights(Index nvars, std::vector<float>& out) const {
+  out.clear();
+  if (!dse_ok_ || dse_exact_ != 0 || !dse_new_.empty() || static_cast<Index>(dse_.size()) != m_ ||
+      static_cast<Index>(basic_.size()) != m_) {
+    return false;
+  }
+  thread_local std::vector<float> by_var;
+  by_var.assign(static_cast<size_t>(nvars), 0.0f);
+  Index cnt = 0;
+  for (Index p = 0; p < m_; ++p) {
+    const Index j = basic_[p];
+    if (j < 0 || j >= nvars) continue;
+    by_var[j] = static_cast<float>(std::max(dse_[p], 1e-6));
+    ++cnt;
+  }
+  out.reserve(static_cast<size_t>(cnt));
+  for (Index j = 0; j < nvars; ++j) {
+    if (by_var[j] > 0.0f) out.push_back(by_var[j]);
+  }
+  return static_cast<Index>(out.size()) == cnt;
+}
+
+bool DualSimplex::set_basic_weights(Index nvars, const float* w, Index count) {
+  if (dse_exact_ != 2 || static_cast<Index>(basic_.size()) != m_) return false;  // only right after set_basis
+  Index cnt = 0;
+  for (Index p = 0; p < m_; ++p) cnt += basic_[p] < nvars;
+  if (cnt != count) return false;
+  for (Index p = 1; p < m_; ++p) {
+    if (basic_[p] < basic_[p - 1]) return false;  // set_basis lists the basic variables in ascending order
+  }
+  // The others are basic logicals of rows the weights do not cover: computed at the next solve like added
+  // rows' (dse_new_ holds positions; the refactorization renumbers them with the basis).
+  dse_new_.clear();
+  Index k = 0;
+  for (Index p = 0; p < m_; ++p) {
+    if (basic_[p] < nvars) dse_[p] = std::max(static_cast<double>(w[k++]), 1e-6);
+    else dse_new_.push_back(p);
+  }
+  dse_exact_ = 0;
+  dse_ok_ = true;
+  g_weight_given.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 DualSimplex::CheckCounts DualSimplex::check_counts() {
   CheckCounts c;
   c.farkas_checked = g_farkas_checked.load(std::memory_order_relaxed);
@@ -867,6 +952,14 @@ DualSimplex::CheckCounts DualSimplex::check_counts() {
   c.farkas_retried_ok = g_farkas_retried_ok.load(std::memory_order_relaxed);
   c.unscaled_solves = g_unscaled_solves.load(std::memory_order_relaxed);
   c.unscaled_iterations = g_unscaled_iterations.load(std::memory_order_relaxed);
+  c.solves = g_solves.load(std::memory_order_relaxed);
+  c.cold_solves = g_cold_solves.load(std::memory_order_relaxed);
+  c.refactors = g_refactors.load(std::memory_order_relaxed);
+  c.row_adds = g_row_adds.load(std::memory_order_relaxed);
+  c.row_removes = g_row_removes.load(std::memory_order_relaxed);
+  c.weight_calls = g_weight_calls.load(std::memory_order_relaxed);
+  c.weight_ns = g_weight_ns.load(std::memory_order_relaxed);
+  c.weight_given = g_weight_given.load(std::memory_order_relaxed);
   return c;
 }
 
@@ -910,6 +1003,8 @@ LpStatus DualSimplex::verify_infeasible(const LpOptions& opt) {
 
 LpStatus DualSimplex::run(const LpOptions& opt) {
   wcost_ = cost_;
+  g_solves.fetch_add(1, std::memory_order_relaxed);
+  if (!has_factor_) g_cold_solves.fetch_add(1, std::memory_order_relaxed);
   if (values_ok_ && has_factor_ && lu_.num_updates() <= opt.refactor_interval / 2) {
     // Warm: same basis and costs as the last optimal solve, only bounds moved
     // (the working bounds equal the true ones outside of run()).
@@ -927,19 +1022,85 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
   if (dse_exact_) {
     // 2: all rows; 3, 4: only the rows that are primal infeasible now (the dual simplex prices
     // those; rows becoming infeasible later keep their kept (3) or unit (4) weights).
+    const int exact_mode = dse_exact_;
     const bool all = dse_exact_ == 2;
     dse_exact_ = 0;
-    for (Index p = 0; p < m_; ++p) {
-      if (!all) {
-        const Index j = basic_[p];
-        const double t = opt.tol.primal_feas * ftol_[j];
-        if (x_[j] >= lb_[j] - t && x_[j] <= ub_[j] + t) continue;
+    // One solve per row: on a large basis this takes seconds (opm2-z10-s4: 160000 rows, a node LP ended
+    // 0.9-1.5 s past the time limit), so the limits are checked every 256 rows. Stopped early, the request
+    // stays for the next solve.
+    auto out_of_time = [&] {
+      return (opt.time_limit < kInf && t_timer.elapsed() - solve_start_ > opt.time_limit) ||
+             (opt.stop && opt.stop->load(std::memory_order_relaxed)) || interrupted();
+    };
+    bool stopped = false;
+    const auto w_t0 = std::chrono::steady_clock::now();
+    // MILP_WEIGHT_THREADS=0: off (one thread).
+    static const bool wt_on = [] {
+      const char* v = std::getenv("MILP_WEIGHT_THREADS");
+      return !v || std::atoi(v) != 0;
+    }();
+    const int wt = wt_on ? std::max(opt.weight_threads, weight_threads_) : 1;
+    if (all && wt > 1 && m_ >= 20000) {
+      const int nt = std::min(wt, 16);
+      std::atomic<Index> next{0};
+      std::atomic<bool> halt{false};
+      const double dens = dens_rho_;
+      // Only the calling thread checks the limits (the LP's timer is per thread).
+      auto work = [&](bool check) {
+        HVector v;
+        v.resize(m_);
+        for (;;) {
+          const Index p0 = next.fetch_add(256, std::memory_order_relaxed);
+          if (p0 >= m_) break;
+          if (check && out_of_time()) {
+            halt.store(true, std::memory_order_relaxed);
+            next.store(m_, std::memory_order_relaxed);
+            break;
+          }
+          for (Index p = p0; p < std::min<Index>(p0 + 256, m_); ++p) {
+            v.clear();
+            v.dense[p] = 1.0;
+            v.nz[v.count++] = p;
+            lu_.btran(v, dens);
+            double w = 0.0;
+            for (Index e = 0; e < v.count; ++e) w += v.dense[v.nz[e]] * v.dense[v.nz[e]];
+            dse_[p] = std::max(w, 1e-6);
+          }
+        }
+      };
+      std::vector<std::thread> pool;
+      for (int t = 1; t < nt; ++t) pool.emplace_back(work, false);
+      work(true);
+      for (std::thread& t : pool) t.join();
+      stopped = halt.load();
+    } else {
+      for (Index p = 0; p < m_; ++p) {
+        if ((p & 255) == 0 && p > 0 && out_of_time()) {
+          stopped = true;
+          break;
+        }
+        if (!all) {
+          const Index j = basic_[p];
+          const double t = opt.tol.primal_feas * ftol_[j];
+          if (x_[j] >= lb_[j] - t && x_[j] <= ub_[j] + t) continue;
+        }
+        unit_btran(p);
+        double w = 0.0;
+        for (Index e = 0; e < rho_.count; ++e) w += rho_.dense[rho_.nz[e]] * rho_.dense[rho_.nz[e]];
+        dse_[p] = std::max(w, 1e-6);
       }
-      unit_btran(p);
-      double w = 0.0;
-      for (Index e = 0; e < rho_.count; ++e) w += rho_.dense[rho_.nz[e]] * rho_.dense[rho_.nz[e]];
-      dse_[p] = std::max(w, 1e-6);
     }
+    if (all) {
+      g_weight_calls.fetch_add(1, std::memory_order_relaxed);
+      g_weight_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w_t0).count(),
+          std::memory_order_relaxed);
+    }
+    if (stopped) {
+      dse_exact_ = exact_mode;
+      return LpStatus::TimeLimit;
+    }
+    dse_ok_ = all;
     dse_new_.clear();
   }
   if (!dse_new_.empty()) {
@@ -1009,6 +1170,7 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
       const LpStatus st = primal_loop(popt);
       if (st == LpStatus::IterationLimit && !(opt.iteration_limit >= 0 && opt.iteration_limit <= cap)) {
         dse_.assign(m_, 1.0);  // the primal pivots do not maintain the weights
+        dse_ok_ = false;
       } else if (st != LpStatus::Optimal && st != LpStatus::NumericalError) {
         return st;
       }
@@ -1084,9 +1246,15 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
     // change the duals.
     bool basic_shifted = false;
     for (Index p = 0; p < m_ && !basic_shifted; ++p) basic_shifted = wcost_[basic_[p]] != cost_[basic_[p]];
+    // duals_fresh: the duals were just recomputed from the true costs with this factorization (with the check
+    // of the final verdict below, which then takes them as they are instead of computing the same values again:
+    // a perturbed column entered the basis in most node solves, so every such solve did the recomputation, a
+    // pass over the matrix, twice).
+    bool duals_fresh = false, duals_ok = true;
     if (basic_shifted) {
       wcost_ = cost_;
-      compute_duals();
+      duals_ok = compute_duals(lu_.num_updates() != 0);
+      duals_fresh = true;
     } else {
       for (Index j = 0; j < n_ + m_; ++j) {
         if (wcost_[j] == cost_[j]) continue;
@@ -1115,7 +1283,10 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
       const char* v = std::getenv("MILP_LP_FLIP_ROUNDS");
       return v ? std::atoi(v) : 0;
     }();
-    if (round >= kFlipRounds && count_dual_infeasibilities(false, true) > 0) {
+    // clean: the count just below found nothing, and nothing changed since: the same test with flips (which
+    // would find and flip nothing) is not repeated (one pass over all columns per solve).
+    bool clean = false;
+    if (round >= kFlipRounds && !(clean = count_dual_infeasibilities(false, true) == 0)) {
       bool primal_feasible = true;
       for (Index p = 0; p < m_ && primal_feasible; ++p) {
         const Index j = basic_[p];
@@ -1131,10 +1302,10 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
         if (trace) std::fprintf(stderr, "LPTRACE round %d: primal cleanup %s %lld it\n", round, to_string(st), total_iterations_ - it_p);
         if (st == LpStatus::Optimal) continue;
         if (st != LpStatus::IterationLimit || (opt.iteration_limit >= 0 && opt.iteration_limit <= cap)) return st;
-        if (!kPrimalDse) dse_.assign(m_, 1.0);  // the primal pivots do not maintain the weights
+        if (!kPrimalDse) dse_.assign(m_, 1.0), dse_ok_ = false;  // the primal pivots do not maintain the weights
       }
     }
-    if (count_dual_infeasibilities(true, true) == 0) {
+    if (clean || count_dual_infeasibilities(true, true) == 0) {
       // Never trust incrementally updated values for the final verdict: the
       // primal values must pass a residual check (else they are recomputed),
       // the duals are recomputed, and if the updated factorization leaves
@@ -1148,18 +1319,22 @@ LpStatus DualSimplex::run(const LpOptions& opt) {
         compute_primal();
         ok = fresh || primal_residuals_small();
       }
-      ok = compute_duals(!fresh) && ok;
+      // Reused: nothing they depend on (costs, basis, factorization) changed since, and the count above found
+      // no dual infeasibility in them, so the count below would find none either.
+      bool reused = clean && duals_fresh;
+      ok = (reused ? duals_ok : compute_duals(!fresh)) && ok;
       if (!ok && !fresh) {
         refactor();
         compute_primal();
         compute_duals();
+        reused = false;
       }
       if (debug_drift) {
         double drift = 0.0;
         for (Index p = 0; p < m_; ++p) drift = std::max(drift, std::abs(x_[basic_[p]] - x_old[basic_[p]]));
         if (drift > 1e-6) std::fprintf(stderr, "LP drift %.3g at optimality (round %d)\n", drift, round);
       }
-      if (count_dual_infeasibilities(true, true) > 0) {
+      if (!reused && count_dual_infeasibilities(true, true) > 0) {
         if (trace) std::fprintf(stderr, "LPTRACE round %d: dual infeasible after recompute (fresh %d ok %d)\n", round, (int)fresh, (int)ok);
         continue;
       }
@@ -1238,7 +1413,7 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
   for (;;) {
     LpStatus lim;
     if (limits_hit(opt, &lim)) return lim;
-    if (lu_.num_updates() >= opt.refactor_interval || lu_.wants_refactor()) {
+    if (lu_.num_updates() >= refactor_interval(opt) || lu_.wants_refactor()) {
       refactor();
       compute_primal();
       compute_duals();
@@ -1278,11 +1453,10 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
     Index r = -1;
     double best = 0.0;
     for (const Index p : infeas_list_) {
-      const Index j = basic_[p];
-      const double v = x_[j];
+      const double v = x_[basic_[p]];
       double infeas = 0.0;
-      if (v < wlb_[j] - ptol * ftol_[j]) infeas = wlb_[j] - v;
-      else if (v > wub_[j] + ptol * ftol_[j]) infeas = v - wub_[j];
+      if (v < blb_[p] - btol_[p]) infeas = blb_[p] - v;
+      else if (v > bub_[p] + btol_[p]) infeas = v - bub_[p];
       if (infeas == 0.0) continue;
       const double score = infeas * infeas / dse_[p];
       if (score > best) best = score, r = p;
@@ -1508,9 +1682,22 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
     // ---- Primal update ----
     const double theta_p = (x_[jl] - target) / alpha_rq;
     const std::vector<double>& alpha = alpha_.dense;
-    for (Index e = 0; e < alpha_.count; ++e) {
-      const Index p = alpha_.nz[e];
-      x_[basic_[p]] -= theta_p * alpha[p];
+    // With the pricing weights in the same pass (the entering column has hundreds to thousands of entries).
+    {
+      const Index* nz = alpha_.nz.data();
+      const double* av = alpha.data();
+      const double* tv = tau_.dense.data();
+      const Index* bas = basic_.data();
+      double* xv = x_.data();
+      double* wv = dse_.data();
+      for (Index e = 0, ne = alpha_.count; e < ne; ++e) {
+        const Index p = nz[e];
+        const double ap = av[p];
+        xv[bas[p]] -= theta_p * ap;
+        if (p == r) continue;
+        const double ratio = ap / alpha_rq;
+        wv[p] = std::max(wv[p] - 2.0 * ratio * tv[p] + ratio * ratio * wr, 1e-6);
+      }
     }
     x_[q] += theta_p;
     x_[jl] = target;
@@ -1539,13 +1726,7 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
     d_[jl] = -theta_d;
 
     // ---- DSE weight update ----
-    for (Index e = 0; e < alpha_.count; ++e) {
-      const Index p = alpha_.nz[e];
-      if (p == r) continue;
-      const double ratio = alpha[p] / alpha_rq;
-      dse_[p] = std::max(dse_[p] - 2.0 * ratio * tau_.dense[p] + ratio * ratio * wr, 1e-6);
-    }
-    dse_[r] = std::max(wr / (alpha_rq * alpha_rq), 1e-6);
+    dse_[r] = std::max(wr / (alpha_rq * alpha_rq), 1e-6);  // the other rows: with the primal update above
 
     // ---- Basis update ----
     lu_.update(r, alpha_);
@@ -1555,12 +1736,43 @@ LpStatus DualSimplex::dual_loop(const LpOptions& opt, bool phase1) {
     move_[q] = 0;
     move_[jl] = move_of(jl);
     if (!infeas_dirty_) {
-      for (Index e = 0; e < alpha_.count; ++e) update_infeasible(alpha_.nz[e], ptol);
+      blb_[r] = wlb_[q], bub_[r] = wub_[q], btol_[r] = ptol * ftol_[q];
+      {
+        // The list changes for few of these entries: test in line, call only for a change (the calls were a
+        // tenth of the tree's time on rocI-4-11, whose entering columns have 1800 entries).
+        const Index* nz = alpha_.nz.data();
+        const Index* bas = basic_.data();
+        const double* xv = x_.data();
+        const double* lo = blb_.data();
+        const double* up = bub_.data();
+        const double* tl = btol_.data();
+        const Index* pos = infeas_pos_.data();
+        for (Index e = 0, ne = alpha_.count; e < ne; ++e) {
+          const Index p = nz[e];
+          const double v = xv[bas[p]], t = tl[p];
+          const bool inf = v < lo[p] - t || v > up[p] + t;
+          if (inf != (pos[p] >= 0)) update_infeasible(p, ptol);
+        }
+      }
       if (flip_end > 0)
         for (Index e = 0; e < flipcol_.count; ++e) update_infeasible(flipcol_.nz[e], ptol);
       update_infeasible(r, ptol);
     }
     ++total_iterations_;
+    {
+      // Debug (MILP_LP_DENS=1): cumulative average nonzero counts of the iteration's vectors, every 2000 iterations.
+      static const bool dens = std::getenv("MILP_LP_DENS") != nullptr;
+      if (dens) {
+        static thread_local long long n = 0, sa = 0, sr = 0, st = 0, sf = 0, srow = 0, sinf = 0;
+        ++n, sa += alpha_.count, sr += rho_.count, st += tau_.count, sf += flip_end > 0 ? flipcol_.count : 0, srow += arow_count_;
+        sinf += static_cast<long long>(infeas_list_.size());
+        if (n % 2000 == 0) {
+          std::fprintf(stderr, "LPDENS m=%d n=%d it=%lld: column %.0f, pivot row (B^-1) %.0f, tau %.0f, flip column %.0f, row over"
+                       " nonbasics %.0f, infeasible rows %.0f, factor nnz %d, eta nnz %d\n", m_, n_, n, double(sa) / n, double(sr) / n,
+                       double(st) / n, double(sf) / n, double(srow) / n, double(sinf) / n, lu_.factor_nnz(), lu_.eta_nnz());
+        }
+      }
+    }
     count_iteration_work(rho_.count, alpha_.count);
     if (opt.verbosity >= 3 && total_iterations_ % 100 == 0) {
       double obj = 0.0, tobj = 0.0;
@@ -1584,7 +1796,7 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
     LpStatus lim;
     if (limits_hit(opt, &lim)) return lim;
     const bool bland = kBland && total_iterations_ > bland_at;
-    if (lu_.num_updates() >= opt.refactor_interval || lu_.wants_refactor()) {
+    if (lu_.num_updates() >= refactor_interval(opt) || lu_.wants_refactor()) {
       refactor();
       compute_primal();
       compute_duals();
@@ -1606,7 +1818,7 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
       }
     }
     if (q < 0) {
-      if (!kPrimalDse) dse_.assign(m_, 1.0);
+      if (!kPrimalDse) dse_.assign(m_, 1.0), dse_ok_ = false;
       return LpStatus::Optimal;
     }
     const double dir = d_[q] < 0 ? 1.0 : -1.0;
@@ -1731,6 +1943,7 @@ Index DualSimplex::pivot_out_rows(const std::vector<Index>& rows) {
     else if (is_finite(u) && (!is_finite(l) || std::abs(x_[jl] - u) < std::abs(x_[jl] - l))) status_[jl] = VarStatus::AtUpper;
     else status_[jl] = VarStatus::AtLower;
     dse_[r] = 1.0;
+    dse_ok_ = false;
     ++entered;
   }
   if (entered > 0) {
@@ -1744,13 +1957,13 @@ void DualSimplex::add_rows(Index count, const std::vector<Index>& start, const s
                            const std::vector<double>& value, const std::vector<double>& lb,
                            const std::vector<double>& ub) {
   if (count == 0) return;
+  g_row_adds.fetch_add(1, std::memory_order_relaxed);
   // Rebuild CSR then CSC with the new rows appended (scaled internally).
   static const bool no_scale = std::getenv("MILP_NO_LP_SCALING") != nullptr;
   const Index m_base = m_;
   std::vector<double> scaled;
   for (Index r = 0; r < count; ++r) {
     const Index len = start[r + 1] - start[r];
-    At_orig_.append(index.data() + start[r], value.data() + start[r], len);
     rscale_.push_back(1.0);
     if (!no_scale) compute_row_scale(m_base + r, index.data() + start[r], value.data() + start[r], len);
     scaled.assign(value.data() + start[r], value.data() + start[r] + len);
@@ -1758,9 +1971,7 @@ void DualSimplex::add_rows(Index count, const std::vector<Index>& start, const s
     At_.append(index.data() + start[r], scaled.data(), len);
   }
   At_.num_minor = n_;
-  At_orig_.num_minor = n_;
   A_ = At_.transpose();
-  A_orig_ = At_orig_.transpose();
   const Index m_old = m_;
   m_ += count;
   for (Index r = 0; r < count; ++r) {
@@ -1797,15 +2008,15 @@ void DualSimplex::add_rows(Index count, const std::vector<Index>& start, const s
 
 void DualSimplex::remove_rows(const std::vector<Index>& rows) {
   if (rows.empty()) return;
+  g_row_removes.fetch_add(1, std::memory_order_relaxed);
   dse_new_.clear();
   std::vector<char> del(m_, 0);
   for (Index i : rows) del[i] = 1;
   bool basis_ok = true;
   for (Index i : rows) basis_ok = basis_ok && status_[n_ + i] == VarStatus::Basic;
   // Row-wise rebuild.
-  SparseMatrix At, Ato;
+  SparseMatrix At;
   At.num_minor = n_;
-  Ato.num_minor = n_;
   std::vector<Index> newpos(m_, -1);
   std::vector<double> rs;
   Index m_new = 0;
@@ -1813,14 +2024,10 @@ void DualSimplex::remove_rows(const std::vector<Index>& rows) {
     if (del[i]) continue;
     newpos[i] = m_new++;
     At.append(At_.index.data() + At_.begin(i), At_.value.data() + At_.begin(i), At_.end(i) - At_.begin(i));
-    Ato.append(At_orig_.index.data() + At_orig_.begin(i), At_orig_.value.data() + At_orig_.begin(i),
-               At_orig_.end(i) - At_orig_.begin(i));
     rs.push_back(rscale_[i]);
   }
   At_ = std::move(At);
   A_ = At_.transpose();
-  At_orig_ = std::move(Ato);
-  A_orig_ = At_orig_.transpose();
   rscale_ = std::move(rs);
   auto compact = [&](auto& v) {
     Index w = n_;
@@ -1954,7 +2161,8 @@ std::vector<double> DualSimplex::reduced_costs() const {
   std::vector<double> d(n_);
   for (Index j = 0; j < n_; ++j) {
     double dj = cost_[j];
-    for (Index p = A_orig_.begin(j); p < A_orig_.end(j); ++p) dj -= A_orig_.value[p] * y[A_orig_.index[p]];
+    // The model's coefficient: the scaled entry over its row's scale (a power of two: exact).
+    for (Index p = A_.begin(j); p < A_.end(j); ++p) dj -= A_.value[p] / rscale_[A_.index[p]] * y[A_.index[p]];
     d[j] = dj;
   }
   return d;
@@ -1979,7 +2187,7 @@ void DualSimplex::set_safe_strict(bool on) {
 double DualSimplex::lagrangian_safe(const std::vector<double>& y, double tau, bool with_cost) const {
   // Rounding: every product and sum is in round-to-nearest; the error terms use eps = 2u (DBL_EPSILON),
   // twice the unit roundoff, which also covers the rounding of the error terms themselves. Scaling is by
-  // powers of two, so the unscaled data (At_orig_, bounds / rscale_) is exact.
+  // powers of two, so the unscaled data (At_ times 1 / rscale_, bounds / rscale_) is exact.
   constexpr double eps = std::numeric_limits<double>::epsilon();
   constexpr double tiny = std::numeric_limits<double>::denorm_min();  // absolute error of an underflowing product
   sb_r_.assign(n_, 0.0);
@@ -2000,9 +2208,10 @@ double DualSimplex::lagrangian_safe(const std::vector<double>& y, double tau, bo
       sum.add(t);
       S += std::abs(t);
     }
-    for (Index p = At_orig_.begin(i); p < At_orig_.end(i); ++p) {
-      const Index j = At_orig_.index[p];
-      const double v = At_orig_.value[p] * yi;
+    const double us = 1.0 / rscale_[i];
+    for (Index p = At_.begin(i); p < At_.end(i); ++p) {
+      const Index j = At_.index[p];
+      const double v = (At_.value[p] * us) * yi;
       sb_r_[j] += v;
       sb_a_[j] += std::abs(v);
       ++sb_cnt_[j];

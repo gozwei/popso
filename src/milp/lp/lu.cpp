@@ -50,6 +50,17 @@ class CountBuckets {
 
 constexpr int kSearch = 4;  // Markowitz search: candidate rows+columns examined per pivot
 
+// Work one update adds to every later iteration's solves, per update nonzero (wants_refactor: refactorize
+// once the accumulated extra work passes the factorization's). 4 assumes four solves per iteration that
+// each pass over all update entries. MILP_LU_ETA_WORK (experiment): another factor.
+double eta_work_factor() {
+  static const double f = [] {
+    const char* s = std::getenv("MILP_LU_ETA_WORK");
+    return s && *s ? std::atof(s) : 4.0;
+  }();
+  return f;
+}
+
 bool lu_stats_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("MILP_LU_STATS");
@@ -93,10 +104,18 @@ double now_seconds() {
 // Process-wide totals, printed at exit with MILP_LU_STATS=1.
 struct LuTotals {
   std::atomic<long long> factors{0}, updates{0}, factor_us{0};
+  std::atomic<long long> pf_dense{0}, pf_other{0}, pf_updates{0}, pf_entries{0}, ft_updates{0}, ft_spike{0}, ft_eta{0},
+      ft_in_dense{0}, dense_factors{0};
   ~LuTotals() {
     if (!lu_stats_enabled() || factors == 0) return;
     std::fprintf(stderr, "[lu] total: %lld factorizations, %.3f s (avg %.2f ms), %lld updates\n", factors.load(),
                  factor_us * 1e-6, factor_us * 1e-3 / factors, updates.load());
+    std::fprintf(stderr,
+                 "[lu] fallbacks to product form: %lld at a dense-block position, %lld other; %lld product-form "
+                 "updates (%lld entries) against %lld Forrest-Tomlin (%lld spike + %lld row eta entries, %lld of "
+                 "them at dense-block positions); factorizations with a dense block %lld\n",
+                 pf_dense.load(), pf_other.load(), pf_updates.load(), pf_entries.load(), ft_updates.load(),
+                 ft_spike.load(), ft_eta.load(), ft_in_dense.load(), dense_factors.load());
   }
 };
 LuTotals g_totals;
@@ -544,13 +563,29 @@ Index LuFactor::factorize(Index m, const std::vector<Index>& start, const std::v
       live_rows += !row_done[i] && K.rlen[i] > 0;
       live_cols += !col_done[i] && K.clen[i] > 0;
     }
+    // Polled every 16 steps, at every step once the kernel is large, and within a step every 256 rows of a long
+    // pivot row: a kernel that fills in makes one step cost seconds (highschool1-aigio's crossover basis,
+    // 49800 rows: the factorization ran 140 s past a 600 s limit with a poll every 16 steps only).
+    auto stop_now = [&] {
+      return (stop && stop->load(std::memory_order_relaxed)) || (interruptible && interrupted_or_expired());
+    };
+    // Smallest remaining kernel that is finished densely (MILP_LU_DENSE_MIN, default 50). A basis position whose
+    // step lies in the dense block cannot take a Forrest-Tomlin update: the first such pivot switches the factor
+    // to product-form etas (dense columns) until the next refactorization, which then comes early. On roll3000
+    // (blocks of 50-150) a run without the dense phase needs 35% fewer factorizations and 23% less time for the
+    // same number of nodes and about the same LP iterations; the search changes with the pivot order, so the
+    // default stays until a benchmark decides.
+    static const double kDenseMin = [] {
+      const char* e = std::getenv("MILP_LU_DENSE_MIN");
+      return e ? std::atof(e) : 50.0;
+    }();
     for (Index step = tri_steps; step < m; ++step) {
-      if ((step & 15) == 0 && ((stop && stop->load(std::memory_order_relaxed)) || (interruptible && interrupted_or_expired()))) {
+      if (((step & 15) == 0 || active_nnz > 200000) && stop_now()) {
         aborted_ = true;
         return 0;
       }
       const double lr = live_rows, lc = live_cols;
-      if (std::min(lr, lc) >= 50 && std::max(lr, lc) <= 1500 && active_nnz >= 0.5 * lr * lc) {
+      if (std::min(lr, lc) >= kDenseMin && std::max(lr, lc) <= 1500 && active_nnz >= 0.5 * lr * lc) {
         dense_kernel = live_cols;
         dense_phase();
         break;
@@ -625,8 +660,13 @@ Index LuFactor::factorize(Index m, const std::vector<Index>& start, const std::v
       K.clen[c] = 0;
       K.cwaste += K.ccap[c];
       K.ccap[c] = 0;
+      Index rows_done = 0;
       for (Index i : colc) {
         if (i == r) continue;
+        if (plen >= 256 && (++rows_done & 255) == 0 && stop_now()) {
+          aborted_ = true;
+          return 0;
+        }
         Index ki = K.find_in_row(i, c);
         const double l = K.rval[ki] / pv;
         const Index last = K.rbeg[i] + K.rlen[i] - 1;
@@ -801,6 +841,7 @@ void LuFactor::finish(Index num_replaced, Index kernel_dim, Index kernel_nnz, In
   }
   if (lu_stats_enabled()) {
     g_totals.factors++;
+    if (dense_n_ > 0) g_totals.dense_factors++;
     g_totals.factor_us += static_cast<long long>((now_seconds() - t0) * 1e6);
     std::fprintf(stderr,
                  "[lu] m %d basis_nnz %d kernel %d (nnz %d, dense %d) L %zu U %zu replaced %d time %.2f ms\n",
@@ -831,6 +872,7 @@ struct SolveScratch {
   std::vector<uint32_t> inlist, visit;
   uint32_t in_gen = 0, vis_gen = 0;
   std::vector<Index> stk_node, stk_pos, order, idx;
+  int fail_hint[4] = {0, 0, 0, 0};  // per stage: recent searches passed the limit (see LuFactor::reach)
   Index norder = 0;  // rows written to `order` by the last reach()
   std::vector<double> dense_x, tmp;  // tmp: all zero between uses
   Index size = 0;
@@ -905,9 +947,55 @@ bool LuFactor::use_hyper(Index count, double density) const {
 // time are appended to the list (inlist marks of the current generation). The rows with g >= 0 are
 // written to scratch().order in postorder (so the reverse is a topological order), their number to
 // scratch().norder. Returns false (values untouched) if the list grows beyond `limit`.
+//
+// A search that passes the limit is wasted, and on large factors it costs more than the dense loops that follow
+// (neos-5104907-jarama, 260k rows: a quarter of the U searches of the ftran, 0.4 ms each, 13-16% of the LP time).
+// Where the stage's recent searches failed, the reach is therefore counted first, breadth-first: the same rows and
+// the same verdict (the size of the closure does not depend on the order), but its loads do not wait for each other
+// as the depth-first chain's do. Only the time changes: the verdict, and with it every result, is the same.
 bool LuFactor::reach(const Index* gmap, const Index* start, const Index* index, Index* list, Index& count,
                      Index limit) const {
   SolveScratch& S = scratch();
+  int& hint = S.fail_hint[start == l_start_.data() ? 0 : start == u_col_start_.data() ? 1 : start == u_row_start_.data() ? 2 : 3];
+  if (hint >= 2) {
+    // The list holds exactly the rows marked in the list's generation, so once all of them are marked visited,
+    // every newly visited row is a new list entry: no look at the list marks. Rows are queued unseen (their
+    // group is read when they are taken, prefetched a few places ahead).
+    const uint32_t vg = S.new_vis();
+    uint32_t* vis = S.visit.data();
+    Index* queue = S.order.data();
+    for (Index k = 0; k < count; ++k) {
+      vis[list[k]] = vg;
+      queue[k] = list[k];
+    }
+    Index tail = count;  // also the list's size after the search
+    bool over = false;
+    for (Index head = 0; head < tail && !over; ++head) {
+#if defined(__GNUC__) || defined(__clang__)
+      if (head + 16 < tail) __builtin_prefetch(&gmap[queue[head + 16]]);
+      if (head + 6 < tail) {
+        const Index g2 = gmap[queue[head + 6]];
+        if (g2 >= 0) __builtin_prefetch(&index[start[g2]]);
+      }
+#endif
+      const Index g = gmap[queue[head]];
+      if (g < 0) continue;
+      for (Index p = start[g], e = start[g + 1]; p < e; ++p) {
+        const Index c = index[p];
+        if (vis[c] == vg) continue;
+        vis[c] = vg;
+        if (tail >= limit) {
+          over = true;
+          break;
+        }
+        queue[tail++] = c;
+      }
+    }
+    if (over) {
+      hint = std::min(hint + 1, 3);
+      return false;
+    }
+  }
   const uint32_t vg = S.new_vis(), ig = S.in_gen;
   uint32_t* vis = S.visit.data();
   uint32_t* inl = S.inlist.data();
@@ -937,7 +1025,10 @@ bool LuFactor::reach(const Index* gmap, const Index* start, const Index* index, 
         if (inl[c] != ig) {
           inl[c] = ig;
           list[count++] = c;
-          if (count > limit) return false;
+          if (count > limit) {
+            hint = std::min(hint + 1, 3);
+            return false;
+          }
         }
         const Index gc = gmap[c];
         if (gc < 0) continue;
@@ -954,6 +1045,7 @@ bool LuFactor::reach(const Index* gmap, const Index* start, const Index* index, 
     }
   }
   S.norder = no;
+  hint = std::max(hint - 1, 0);
   return true;
 }
 
@@ -1533,11 +1625,20 @@ void LuFactor::renumber_positions(std::vector<Index>& old_pos) {
   identity_ = true;
 }
 
+bool LuFactor::ft_dense_default() {
+  static const bool on = [] {
+    const char* e = std::getenv("MILP_LU_FT_DENSE");
+    return e && *e && *e != '0';
+  }();
+  return on;
+}
+
 bool LuFactor::ft_update(Index p, double alpha_p) {
   if (!forrest_tomlin || ft_off_ || !spike_ok_) return false;
   spike_ok_ = false;
   const Index s = step_of_pos_[p];
-  if (step_in_dense(s)) return false;
+  const bool in_dense = step_in_dense(s);
+  if (in_dense && !ft_dense) return false;
   const Index r = piv_row_[s], na = static_cast<Index>(ft_row_.size());
   SolveScratch& S = scratch();
   S.ensure(m_, dense_n_);
@@ -1561,6 +1662,19 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
           break;
         }
       }
+    }
+  }
+  if (in_dense) {
+    // A step of the dense block: its U row lies in the block (the columns of the later block steps), stored in
+    // the block's upper triangle; it is taken out of there.
+    const Index n = dense_n_, db = dense_begin_, a = s - db;
+    for (Index i = a + 1; i < n; ++i) {
+      double& e = dense_lu_[static_cast<size_t>(i) * n + a];
+      if (e == 0.0) continue;
+      const Index c = piv_row_[db + i];
+      u[c] = e;
+      h.nz[h.count++] = c;
+      e = 0.0;
     }
   }
   for (Index t = 0; t < na; ++t) {
@@ -1679,6 +1793,16 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
     }
     ustep_of_row_[r] = -1;
   }
+  if (in_dense) {
+    // The dense loops do not look at step_dead_: the dead step becomes the identity there (row taken out above,
+    // column cleared here in the block and in the rows of the sparse steps, pivot 1), so they pass the value of
+    // row r through unchanged; that value now belongs to the new last step.
+    const Index n = dense_n_, a = s - dense_begin_;
+    double* col = &dense_lu_[static_cast<size_t>(a) * n];
+    for (Index b = 0; b < a; ++b) col[b] = 0.0;
+    for (Index q = u_col_start_[s]; q < u_col_start_[s + 1]; ++q) u_col_value_[q] = 0.0;
+    piv_val_[s] = 1.0;
+  }
   // The spike becomes the U column of a new last step.
   step_dead_[s] = 1;
   const Index ns = static_cast<Index>(piv_row_.size());
@@ -1711,13 +1835,21 @@ bool LuFactor::ft_update(Index p, double alpha_p) {
     for (Index i : spike_idx_) take(i);
   }
   ft_col_len_.push_back(static_cast<Index>(ft_col_index_.size()) - ft_col_start_.back());
-  eta_work_ += 4.0 * eta_nnz();
-  if (lu_stats_enabled()) g_totals.updates++;
+  eta_work_ += eta_work_factor() * eta_nnz();
+  if (lu_stats_enabled()) {
+    g_totals.updates++;
+    g_totals.ft_updates++;
+    g_totals.ft_in_dense += in_dense;
+    g_totals.ft_spike += ft_col_len_.back();
+    g_totals.ft_eta += r_start_.back() - r_start_[r_start_.size() - 2];
+  }
   return true;
 }
 
 void LuFactor::update(Index p, const std::vector<double>& alpha) {
   if (ft_update(p, alpha[p])) return;
+  if (lu_stats_enabled() && forrest_tomlin && !ft_off_) (step_in_dense(step_of_pos_[p]) ? g_totals.pf_dense : g_totals.pf_other)++;
+  const size_t eta0 = eta_index_.size();
   ft_off_ = true;
   eta_pos_.push_back(row_of_pos_[p]);
   eta_pivot_.push_back(alpha[p]);
@@ -1727,12 +1859,14 @@ void LuFactor::update(Index p, const std::vector<double>& alpha) {
     eta_value_.push_back(alpha[i]);
   }
   eta_start_.push_back(static_cast<Index>(eta_index_.size()));
-  eta_work_ += 4.0 * eta_nnz();
-  if (lu_stats_enabled()) g_totals.updates++;
+  eta_work_ += eta_work_factor() * eta_nnz();
+  if (lu_stats_enabled()) g_totals.updates++, g_totals.pf_updates++, g_totals.pf_entries += eta_index_.size() - eta0;
 }
 
 void LuFactor::update(Index p, const HVector& alpha) {
   if (ft_update(p, alpha.dense[p])) return;
+  if (lu_stats_enabled() && forrest_tomlin && !ft_off_) (step_in_dense(step_of_pos_[p]) ? g_totals.pf_dense : g_totals.pf_other)++;
+  const size_t eta0 = eta_index_.size();
   ft_off_ = true;
   eta_pos_.push_back(row_of_pos_[p]);
   eta_pivot_.push_back(alpha.dense[p]);
@@ -1744,8 +1878,8 @@ void LuFactor::update(Index p, const HVector& alpha) {
     eta_value_.push_back(a);
   }
   eta_start_.push_back(static_cast<Index>(eta_index_.size()));
-  eta_work_ += 4.0 * eta_nnz();
-  if (lu_stats_enabled()) g_totals.updates++;
+  eta_work_ += eta_work_factor() * eta_nnz();
+  if (lu_stats_enabled()) g_totals.updates++, g_totals.pf_updates++, g_totals.pf_entries += eta_index_.size() - eta0;
 }
 
 }  // namespace milp

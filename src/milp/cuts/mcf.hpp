@@ -39,4 +39,8 @@ struct McfNetwork {
 // capacitated arc with an integer design column).
 McfNetwork detect_mcf_network(const MipProblem& p);
 
+// Test hook for MILP_MCF_LONG (-1: the environment decides; 0 / 1: off / on). With it on, a column in more
+// than two candidate equality flow rows drops only the longest of them instead of all (see mcf.cpp).
+extern int g_mcf_drop_long;
+
 }  // namespace milp

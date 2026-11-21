@@ -121,6 +121,90 @@ TEST(lp_add_and_remove_rows) {
   }
 }
 
+// Steepest-edge weights carried with a basis (basic_weights / set_basic_weights): the weights the dual
+// simplex maintains by updates equal the ones recomputed for the same basis, installing them does not
+// change the results of later solves, also with rows added after the basis was taken, and a count that
+// does not fit the basis is refused.
+TEST(lp_basic_weights_carry) {
+  std::mt19937 rng(11);
+  int carried = 0;
+  for (int t = 0; t < 300; ++t) {
+    const Index m = 2 + rng() % 20, n = 2 + rng() % 30;
+    RandomLp lp = random_lp(rng, m, n);
+    DualSimplex s;
+    s.load(lp.A, lp.c, lp.cl, lp.cu, lp.rl, lp.ru);
+    if (s.solve(LpOptions{}) != LpStatus::Optimal) continue;
+    const Basis b = s.get_basis();
+    std::vector<float> w, exact;
+    if (!s.basic_weights(n + m, w)) continue;  // e.g. after a primal cleanup
+    ++carried;
+    CHECK_EQ(static_cast<Index>(w.size()), m);
+    // Recomputed for the same basis (set_basis asks for exact weights at the next solve).
+    DualSimplex e = s;
+    e.set_basis(b);
+    REQUIRE(e.solve(LpOptions{}) == LpStatus::Optimal);
+    REQUIRE(e.basic_weights(n + m, exact));
+    REQUIRE(exact.size() == w.size());
+    for (size_t k = 0; k < w.size(); ++k) CHECK(std::abs(w[k] - exact[k]) <= 1e-3 * std::max(1.0f, exact[k]));
+    // A wrong count is refused; so is a call that does not follow set_basis.
+    DualSimplex r = s;
+    CHECK(!r.set_basic_weights(n + m, w.data(), static_cast<Index>(w.size())));
+    r.set_basis(b);
+    CHECK(!r.set_basic_weights(n + m, w.data(), static_cast<Index>(w.size()) - 1));
+    // Installed weights, then bound changes: same result as a cold solve.
+    DualSimplex u = s;
+    u.set_basis(b);
+    CHECK(u.set_basic_weights(n + m, w.data(), static_cast<Index>(w.size())));
+    RandomLp mod = lp;
+    for (int k = 0; k < 3; ++k) {
+      const Index j = rng() % n;
+      const double v = s.x()[j];
+      if (rng() % 2) mod.cu[j] = std::max(mod.cl[j], std::floor(v));
+      else mod.cl[j] = std::min(mod.cu[j], std::ceil(v));
+      u.set_col_bounds(j, mod.cl[j], mod.cu[j]);
+    }
+    const LpStatus warm = u.solve(LpOptions{});
+    double cold_obj;
+    const LpStatus cold = cold_solve(mod, &cold_obj);
+    CHECK(warm == cold);
+    if (warm == LpStatus::Optimal && cold == LpStatus::Optimal) CHECK_NEAR(u.objective(), cold_obj, 1e-6);
+    // Rows added since (basic logicals, not covered by the weights): accepted, same result as a cold solve.
+    DualSimplex x = s;
+    std::vector<Index> start{0}, idx, J(lp.A.index.size()), I = lp.A.index;
+    std::vector<double> val, rlb, rub, V = lp.A.value;
+    for (Index j = 0; j < n; ++j)
+      for (Index q = lp.A.begin(j); q < lp.A.end(j); ++q) J[q] = j;
+    RandomLp ext = lp;
+    for (int rr = 0; rr < 2; ++rr) {
+      for (Index j = 0; j < n; ++j) {
+        if (rng() % 3) continue;
+        const double a = static_cast<int>(rng() % 11) - 5;
+        if (a == 0) continue;
+        idx.push_back(j), val.push_back(a);
+        J.push_back(j), I.push_back(m + rr), V.push_back(a);
+      }
+      start.push_back(static_cast<Index>(idx.size()));
+      double act = 0;
+      for (Index k = start[rr]; k < start[rr + 1]; ++k) act += val[k] * s.x()[idx[k]];
+      rlb.push_back(-kInf);
+      rub.push_back(std::floor(act) - 1.0);
+      ext.rl.push_back(rlb.back());
+      ext.ru.push_back(rub.back());
+    }
+    x.add_rows(2, start, idx, val, rlb, rub);
+    Basis bx = b;
+    bx.status.resize(static_cast<size_t>(n + m + 2), VarStatus::Basic);
+    x.set_basis(bx);
+    CHECK(x.set_basic_weights(n + m, w.data(), static_cast<Index>(w.size())));
+    const LpStatus xs = x.solve(LpOptions{});
+    ext.A = SparseMatrix::from_triplets(n, m + 2, J, I, V);
+    const LpStatus xc = cold_solve(ext, &cold_obj);
+    CHECK(xs == xc);
+    if (xs == LpStatus::Optimal && xc == LpStatus::Optimal) CHECK_NEAR(x.objective(), cold_obj, 1e-6);
+  }
+  CHECK(carried > 100);
+}
+
 TEST(lp_tableau_row_consistency) {
   std::mt19937 rng(11);
   for (int t = 0; t < 50; ++t) {

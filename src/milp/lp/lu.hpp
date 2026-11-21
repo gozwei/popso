@@ -83,6 +83,12 @@ class LuFactor {
   bool wants_refactor() const { return eta_work_ > factor_work_ || ft_unstable_; }
 
   bool forrest_tomlin = true;  // false: product-form updates only
+  // Forrest-Tomlin updates also for a position whose step lies in the dense kernel block (default: the
+  // environment's MILP_LU_FT_DENSE=1, else off: such a pivot switches the factor to product-form etas).
+  bool ft_dense = ft_dense_default();
+  static bool ft_dense_default();
+  Index dense_dim() const { return dense_n_; }  // size of the dense kernel block of the last factorization
+  bool product_form() const { return ft_off_; }  // a product-form eta exists (no more Forrest-Tomlin updates)
 
   double pivot_threshold = 0.1;   // Markowitz threshold (relative to the row maximum)
   double pivot_tolerance = 1e-11; // absolute: smaller pivots are singular

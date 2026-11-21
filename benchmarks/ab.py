@@ -22,9 +22,15 @@ With -j > 1 all sides and seeds run at once and share one pool of -j x --threads
 -j x --mem-limit MB (slots.py; the machine load stays as with one run.py -j at a time), so the
 machine does not idle while one run's last instances finish. A pool given in POPSO_SLOTS (the
 benchmark server's queue sets one for all jobs) is used instead. --sequential: one run at a time.
+
+--a-cache DIR keeps each seed's A results there and reuses them in later comparisons with the same A (same
+binary contents or --a-key, arguments, environment, seed, limits and instance selection), so a second idea
+tested against the same baseline runs only its B side. A reused baseline did not run alongside B: the machine
+load may differ, so this is for screening; the comparison that decides a default runs both sides (no cache).
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -44,7 +50,26 @@ sys.path.insert(0, str(BENCH))
 from lib.primal import pgap as primal_gap  # noqa: E402
 
 
-def run_side(solver, extra, seed, args, label, env_extra=""):
+def cache_file(solver, extra, seed, args, env_extra):
+    """Where --a-cache keeps this A run (None without the option)."""
+    if not args.a_cache:
+        return None
+    ident = args.a_key or hashlib.sha256(Path(solver).read_bytes()).hexdigest()
+    sets = []
+    for st in args.set:  # by content: a set file may change under the same name
+        p = next((q for q in (Path(st), BENCH / "sets" / f"{st}.txt") if q.is_file()), None)
+        sets.append(hashlib.sha256(p.read_bytes()).hexdigest() if p else st)
+    key = json.dumps([ident, extra, env_extra, seed, args.time_limit, args.threads, args.jobs, args.mem_limit, args.gap,
+                      args.sizes, args.families, args.max_size, args.miplib, args.primal, sets, args.starts,
+                      args.instances, os.environ.get("POPSO_SLOTS", "").partition(":")[2]])
+    return Path(args.a_cache).expanduser() / (hashlib.sha256(key.encode()).hexdigest()[:24] + ".json")
+
+
+def run_side(solver, extra, seed, args, label, env_extra="", pair=None):
+    cached = cache_file(solver, extra, seed, args, env_extra) if label == "A" else None
+    if cached and cached.is_file():
+        print(f"[ab] {label} seed {seed}: reused from {cached}", flush=True)
+        return json.loads(cached.read_text())
     cmd = [sys.executable, str(RUN), "--solver", f"{solver} --seed {seed} {extra}".strip(),
            "-t", str(args.time_limit), "--threads", str(args.threads), "-j", str(args.jobs),
            "--mem-limit", str(args.mem_limit), "--gap", str(args.gap), "--tag", f"ab-{label}-s{seed}"]
@@ -60,6 +85,8 @@ def run_side(solver, extra, seed, args, label, env_extra=""):
         cmd.append("--trace")
     for st in args.set:
         cmd += ["--set", st]
+    if pair:
+        cmd += ["--pair", pair, "--pair-side", label]
     if args.starts:
         cmd += ["--starts", args.starts]
     cmd += args.instances
@@ -73,7 +100,13 @@ def run_side(solver, extra, seed, args, label, env_extra=""):
     if not m:
         sys.stderr.write(out.stdout[-3000:] + out.stderr[-3000:])
         raise SystemExit(f"[ab] run.py failed for {label} seed {seed}")
-    return json.loads(Path(m.group(1)).read_text())
+    text = Path(m.group(1)).read_text()
+    if cached:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(text)
+        tmp.replace(cached)
+    return json.loads(text)
 
 
 def family(name):
@@ -92,6 +125,9 @@ def main():
     ap.add_argument("--b-args", default="")
     ap.add_argument("--a-env", default="", help="environment for A, e.g. 'MILP_NO_RCFIX=1'")
     ap.add_argument("--b-env", default="")
+    ap.add_argument("--a-cache", metavar="DIR", help="keep and reuse the A results per seed (screening; see above)")
+    ap.add_argument("--a-key", help="with --a-cache: identifies A instead of the binary's contents (e.g. a commit "
+                                    "whose default behaviour the tested commit still has)")
     ap.add_argument("--seeds", default="1,2,3")
     ap.add_argument("-t", "--time-limit", type=float, default=60)
     ap.add_argument("--threads", type=int, default=4)
@@ -132,16 +168,22 @@ def main():
     if args.jobs > 1 and not args.sequential:
         # All runs at once over one pool (slots.py): each run.py would otherwise idle down to its last instances
         # before the next one starts (on the 12-job server, minutes per run).
-        pool = None
+        pool = pdir = None
         if not os.environ.get("POPSO_SLOTS"):
             pool = tempfile.mkdtemp(prefix="ab-slots-", dir=BENCH / "results")
             os.environ["POPSO_SLOTS"] = f"{pool}:{args.jobs * args.threads}:{args.jobs * args.mem_limit}"
         try:
             with ThreadPoolExecutor(max_workers=len(plan)) as ex:
-                futs = [ex.submit(run_side, solver, extra, seed, args, side, env)
+                # Paired: the two sides' runs of one instance and seed wait for each other before they take a
+                # slot (run.py --pair), so both run under the same load. Not with a cached A side.
+                pdir = None if args.a_cache else tempfile.mkdtemp(prefix="ab-pair-", dir=BENCH / "results")
+                futs = [ex.submit(run_side, solver, extra, seed, args, side, env,
+                                  os.path.join(pdir, f"s{seed}") if pdir else None)
                         for seed, (side, solver, extra, env) in plan]
                 results = [f.result() for f in futs]
         finally:
+            if pdir:
+                shutil.rmtree(pdir, ignore_errors=True)
             if pool:
                 shutil.rmtree(pool, ignore_errors=True)
     else:

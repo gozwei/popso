@@ -1,0 +1,7 @@
+benchmarks/miplib/mas74.mps 150000
+benchmarks/miplib/mas76.mps 130000
+benchmarks/miplib/pk1.mps 140000
+benchmarks/miplib/markshare_4_0.mps 500000
+benchmarks/miplib/neos-3046615-murg.mps 60000
+benchmarks/miplib/mik-250-20-75-4.mps 20000
+benchmarks/instances/gap_medium_1.mps 10000

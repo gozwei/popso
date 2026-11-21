@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.12.0 — 2026-11-20
+
+Performance. On the MIPLIB 2017 benchmark set (240 instances, 120 s, 4 threads) this version solves 95, 94 and
+95 instances over three seeds at a shifted geometric mean of 50.8, 50.1 and 49.1 s (v0.11.0: 84, 85, 88 at 56.7,
+55.4, 54.6 s); side by side with v0.11.1 on two further seeds it solves 186 of 480 runs against 171 and takes 9%
+less time, on the 63-instance development set 20% less (177 of 189 against 173). No wrong answer in any run.
+
+- **First solutions.** The conflict search (an LP-free depth-first search that learns clauses from dead ends) runs
+  by default on pure-integer models; it finds a first solution on models where the root LP takes minutes
+  (rail02 at 36 s, s100 at 7 s on an M4 Pro, 4 threads).
+- **Steepest-edge weights travel with a node's stored basis** by default, so a node taken from the queue does not
+  start from recomputed weights.
+- **Memory.** The barrier's setup no longer allocates the factor of a linear-system form it only analyzes for a
+  comparison (neos-5104907-jarama: peak 11.0 -> 3.0 GB under an 8 GB limit). Every LP copy keeps two matrix
+  copies where it kept four, the root LP is moved instead of copied, the original model's matrix is released during the
+  search of a large model, and the propagators of all threads share one row copy (square47: peak 6.3 -> 3.7 GB).
+- **Time limit.** The LU factorization inside the crossover checks the limit at every step of a large kernel
+  (highschool1-aigio returned 140-160 s past a 600 s limit, now 6 s). The open nodes of a long search are freed in
+  parallel, and not at all by the command-line program once its limit has passed (7-8 s late after a 600 s run of
+  a small model with millions of nodes); node cut separation and the barrier's normal equations check the limit.
+- **Cut selection prefers short cuts.** A cut longer than 8 times the model's average row length competes with
+  its score discounted by the square root of the excess and is dropped when too weak for its length: always for
+  the tableau families (Gomory, tableau MIR, zero-half), for the other families in the root loop only once the
+  bound has stopped moving, and in node rounds. Long cut rows stay in the tree's LPs and make every basis
+  factorization denser (after the root, a fresh factor was 2-30x the first one's on a third of the tree
+  instances). MIPLIB 2017 benchmark set (240, 120 s, 4 threads, two seeds): solved 172 -> 183 of 480 runs, time
+  ratio 0.96; on the 63-instance development set over three seeds 175 -> 181 of 189, ratio 0.92 (unitcal_7 116
+  -> 44 s, swath3 limit -> 45 s). `MILP_CUT_DENSE=0` restores the old selection.
+- **Fixed: a round-off "equivalence" from probing.** A continuous column that both probes of a binary leave at
+  the same value up to round-off was substituted as y = c + 3e-11 x, which left a coefficient of that size in a
+  row. The solver's check of the postsolved point caught the resulting wrong point and solved again without
+  presolve, so answers were right, at the cost of a second solve (since v0.10.0; found by the randomized
+  presolve tests at 12,000 cases).
+- **Presolve propagates over one-of groups.** Where a row says that exactly (or at most) one of a set of
+  binaries is 1, another row's activity over that set is the chosen member's coefficient, not the sum: a start
+  column S = sum t x_t gets its window, and a bound on S removes the options outside it. Integer cost columns are
+  then tested at their cheapest value and move up by one while the propagation proves it infeasible.
+  Time-indexed scheduling models gain most (30n20b8: both resource levels 0 -> 2 in presolve, the first LP
+  already gives the optimal value 302, 107 s -> 4 s at 4 threads); over the development set the rest is
+  unchanged. `MILP_GROUP_PROP=0` switches it off.
+- **Probing uses the idle threads.** Presolve probes up to four candidates side by side from the same bounds and
+  applies their results in candidate order, so the reductions depend on the batch size, not on timing (probing
+  time ex10 3.1 -> 1.6 s, neos8 1.7 -> 0.7 s, mzzv11 2.3 -> 1.1 s at 4 threads; supportcase7 64 -> 41 s end to
+  end). One thread probes as before. `MILP_PROBE_PAR=0` switches it off.
+- **Faster with the same search:** three changes in the dual simplex iteration (about 2% per node), node
+  propagation skips rows and learned conflicts it already found idle (20-48% less propagation time where it is
+  heavy), sparse triangular solves give up a too-large symbolic search sooner on very large bases, and the clique
+  extension in presolve does its counting once (square47: 10.9 -> 2.0 s over a run). The end of a dual simplex
+  solve computes the duals once instead of twice, path aggregation for MIR cuts reads packed candidate rows
+  (CMS750_4: 15% less time), and models with very cheap nodes do less fixed work per node (2-11% less time per
+  node on mas74, mas76, pk1, markshare_4_0).
+- **Threads.** Workers no longer wait on the lock of the shared conflict log at every node (5-8% of worker
+  time on models with very cheap nodes at 4 threads).
+- **Barrier.** An LP whose primal residual stops improving under the regularized normal equations is refined
+  against the unregularized system, and the choice between the two linear-system forms counts the cost of the
+  solves as well as of the factorization (supportcase19's root LP no longer stalls).
+
 ## v0.11.1 — 2026-11-15
 
 A correctness fix; nothing else changes.
@@ -12,6 +69,7 @@ A correctness fix; nothing else changes.
   objective is now carried through every restart. The one-restart case was fixed in v0.6.3; all versions from
   v0.7.0 to v0.11.0 have the two-restart case. It was rare: one run in several hundred of that instance, none
   seen on another instance.
+
 
 ## v0.11.0 — 2026-11-13
 
