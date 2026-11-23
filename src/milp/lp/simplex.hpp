@@ -104,6 +104,17 @@ class DualSimplex {
   // the largest pivot element), so that the rows can be removed with the basis kept. The basis may
   // become primal and dual infeasible; the next solve repairs it. Returns how many entered.
   Index pivot_out_rows(const std::vector<Index>& rows);
+  // After an optimal solve: primal simplex pivots inside the optimal face (only nonbasic variables with a zero
+  // reduced cost enter, the others stay where they are) that move the binary-like integer columns (range 1)
+  // towards the rounding of the current point: one projection step of a feasibility pump restricted to the
+  // optimal face. The objective value does not change. At most max_pivots pivots and max_work units of work()
+  // (< 0: no work limit); returns the number of pivots. The next solve() re-establishes the solver's state (it is
+  // optimal up to round-off).
+  // target (optional, one value per structural): the point to move towards instead of the rounding of the
+  // current one (a binary-like column is pushed to its lower bound where target is below the middle of its
+  // range, else to its upper bound).
+  long long degenerate_moves(const std::vector<char>& is_int, const LpOptions& opt, long long max_pivots,
+                             long long max_work = -1, const double* target = nullptr);
   bool row_is_basic(Index i) const { return status_[n_ + i] == VarStatus::Basic; }
   VarStatus status(Index j) const { return status_[j]; }
 
@@ -220,6 +231,7 @@ class DualSimplex {
   // Solves return TimeLimit once work() has reached this (-1: no limit): the deterministic stand-in for a
   // time limit (a sub-MIP's budget, SearchOptions::work_limit). Copies of the LP keep the count and the limit.
   void set_work_limit(long long limit) { work_limit_ = limit; }
+  long long work_limit() const { return work_limit_; }
   // Why the last solve returned NumericalError ("" otherwise).
   const char* fail_reason() const { return fail_reason_; }
 
@@ -326,6 +338,7 @@ class DualSimplex {
   long long total_iterations_ = 0;
   long long work_ = 0;  // work()
   long long work_limit_ = -1;  // set_work_limit()
+  Index primal_window_ = 0, primal_pos_ = 0;  // primal_loop: partial pricing (degenerate_moves); 0: full scans
   void count_iteration_work(Index rho_count, Index col_count);
   std::vector<double> farkas_;  // row of B^{-1} proving infeasibility of the last solve
   double farkas_sign_ = 1.0;    // see infeasible()

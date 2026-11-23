@@ -836,6 +836,67 @@ class Search : public BasisOwner {
   bool fpr_run_lp_free(const std::function<void(const std::vector<double>&, const char*)>& publish, double deadline,
                        std::vector<double>& point);
   bool fpr_run_lp(const std::vector<double>& lp_x, std::vector<double>& sol);
+  // MILP_CUTLOOP_HEUR=1 (default 0; default mode, the main search): heuristics on the LP point of every root cut
+  // round (the initial LP's too), where the root so far ran nothing LP-based until the loop was over: simple
+  // rounding and ZI rounding on the root thread, and on up to two otherwise idle threads (the search's less the
+  // root's and the FJ helper's) one task each: a dive on a copy of the LP, RENS around the point, and with an
+  // incumbent RINS between it and the point. By yield: a heuristic that did not improve the incumbent k times in
+  // a row waits 2^k rounds; the root thread's own part (rounding, the LP copies) stays below 5% of the root's
+  // time; a task may take half the root's time so far (0.2 to 5 s) and is told to end when the loop does (the
+  // root does not wait for it: a sub-MIP notices at its next node, which took up to 3 s on neos-3216931-puriri;
+  // the tasks are joined when the search ends). Every point goes through try_incumbent (the full check); the
+  // cut loop reads the new cutoff at its next round.
+  enum { kClhRound, kClhZi, kClhDive, kClhRens, kClhRins, kClhKinds };
+  struct ClhKind {
+    int fails = 0, next = 0, calls = 0, found = 0, wins = 0;
+    bool running = false;
+    double secs = 0.0;
+  };
+  struct ClhSlot {
+    std::thread th;
+    std::atomic<int> state{0};  // 0 idle, 1 running, 2 done (to be joined)
+  };
+  bool clh_on_ = false, clh_logged_ = false;
+  ClhKind clh_kind_[kClhKinds];  // guarded by clh_mu_
+  ClhSlot clh_slot_[2];
+  std::mutex clh_mu_;
+  std::atomic<bool> clh_stop_{false};
+  std::atomic<int> clh_round_{0};
+  int clh_dive_rule_ = 0;
+  double clh_inline_ = 0.0, clh_join_ = 0.0;
+  // MILP_CUTLOOP_HEUR=2: the root heuristics after the loop take the loop's record into account instead of
+  // running on top of it (60 roots, switch off -> 1: RENS after the loop 41 -> 29 improvements in 121 -> 168
+  // thread-seconds, the four dives 36 -> 18 in 180 -> 179, root time 406 -> 448 s). With an incumbent:
+  //  - RENS: no retry with fewer fixings after a sub-MIP that searched (SubMipLimits::retry_empty_only: the
+  //    retries ran to the time limit under a tight cutoff); not at all when the incumbent is within 0.5% of the
+  //    root bound (the rule of the LNS rounds) or when the loop's RENS is not due by its yield and its last call
+  //    ended with a finished sub-MIP (a larger budget on nearly the same LP point finds the same);
+  //  - no guided dive when the loop's last dive was guided, is not due and did not end at its limit (the same
+  //    dive from nearly the same LP point). The other dives stay: dropping the fractional and vector-length
+  //    dives (4 of the 18 improvements, 82 of the 179 thread-seconds) lost neos-933966's root optimum, which
+  //    only they find;
+  //  - the LNS rounds start without RINS when the loop's RINS is not due.
+  // The loop's RENS retries the same way.
+  int clh_level_ = 0;
+  bool clh_rec_ = false;                      // the loop's record below is set (level 2, at the loop's end)
+  bool clh_rec_due_[kClhKinds] = {};          // the kind would be due at the next LP point
+  bool clh_rens_exhausted_ = false;           // the last loop RENS call ended with a finished sub-MIP (clh_mu_)
+  bool clh_dive_guided_ = false, clh_dive_limit_ = false;  // the last loop dive: guided / ended at its limit (clh_mu_)
+  std::atomic<int> clh_skip_rens_{0}, clh_skip_dives_{0}, clh_skip_rins_{0};  // statistics: skipped after the loop
+  // The root heuristics after the cut loop by kind (statistics, verbosity 2): runs, with a point, improved the
+  // incumbent, seconds (thread time); and the wall time of their two phases (dives / RENS / pump, LNS rounds).
+  enum { kRhPump, kRhRens, kRhLpRens, kRhRins, kRhMutation, kRhFpr, kRhDive, kRhKinds = kRhDive + 4 };  // a dive per DiveRule
+  struct RhAcct {
+    int runs = 0, found = 0, wins = 0;
+    double secs = 0.0;
+  };
+  RhAcct rh_acct_[kRhKinds];  // guarded by rh_mu_
+  std::mutex rh_mu_;
+  double rh_wall_tasks_ = 0.0, rh_wall_lns_ = 0.0;
+  void clh_point(const DualSimplex& lp);
+  void clh_result(int kind, bool found, bool win, double secs);
+  void clh_end();
+  void clh_finish();
   std::thread fj_thread_;
   std::atomic<bool> fj_stop_{false};
   bool fj_sync_ = false;
@@ -3493,6 +3554,18 @@ int Search::root_strong_branching(Worker& w, double obj, const Basis& basis) {
   const long long it_start = w.sb_iters;
   const long long saved_limit = w.probe_limit;
   const long long limit = kIters > 0 ? kIters : std::clamp<long long>(root_sb_base_ / 10, 100, 500);
+  // Slow roots (default; MILP_SLOW_ROOT=0 switches it off): when a child at its iteration limit is expected to cost
+  // MILP_SLOW_ROOT_SB (default 5e8) simplex work units or more (the limit x this LP's work per iteration so
+  // far; about 1 ns per unit), the pass ends after the first probe that learns nothing instead of the
+  // MILP_ROOT_SB_ABORT-th in a row. supportcase22, square47: 4 probes, all 8 children at the limit, 10-33 s.
+  static const double kSlowChild = knob("MILP_SLOW_ROOT", 1) > 0 ? knob("MILP_SLOW_ROOT_SB", 5e8) : 0.0;
+  int abort_after = kAbort;
+  if (kSlowChild > 0.0 && kAbort > 0 && w.lp.iterations() > 0) {
+    const double child = static_cast<double>(limit) * static_cast<double>(w.lp.work()) / static_cast<double>(w.lp.iterations());
+    if (child >= kSlowChild) abort_after = 1;
+    log_.log(2, "  slow root: a child at the limit costs about %.3g work units%s\n", child,
+             abort_after == 1 ? ": the pass ends at the first probe that learns nothing" : "");
+  }
   w.probe_limit = limit;
   double est_sum = 0.0, ps_scale = 1.0;
   // Restarted roots with carried pseudocosts (opt-in MILP_RESTART_SB_REL = k > 0): candidates with at
@@ -3572,7 +3645,7 @@ int Search::root_strong_branching(Worker& w, double obj, const Basis& basis) {
       ++no_improve;
     }
     idle_run = ex_dn && ex_up ? 0 : idle_run + 1;
-    if (kAbort > 0 && idle_run >= kAbort) {
+    if (abort_after > 0 && idle_run >= abort_after) {
       aborted = true;
       ++root_sb_aborted_;
       break;
@@ -3693,10 +3766,160 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
            " cols, cutoff %s, time left %.2fs, resident %lld MB\n", w.lp.iterations(), root_lp0_iters_, root_lp_equiv_iters_, t_root,
            p_.num_rows(), p_.num_cols(), is_finite(cutoff(w)) ? "yes" : "no", params_.time_limit - timer_.elapsed(),
            resident_bytes() >> 20);
+  // MILP_HEUR_MOVES = k (default 0: off; the main search only): the root heuristics that start from the root LP
+  // point get a copy of the root LP moved inside its optimal face towards the rounding of the point
+  // (DualSimplex::degenerate_moves: fewer fractional integer columns at the same objective). Bit 1: the dives,
+  // RENS, the LP sub-MIP, the feasibility pump and one more simple rounding; bit 2: the root RINS as well. The
+  // LP the cut loop left and the tree continues from is not touched. Up to three passes while the count falls
+  // by a tenth; a pass that raises it is undone; at most 4 x the root LP's first iterations (at least 1000)
+  // pivots and 1e9 units of LP work (about a second).
+  static const int heur_moves = static_cast<int>(knob("MILP_HEUR_MOVES", 0));
+  std::unique_ptr<DualSimplex> moved_lp;
+  std::vector<double> moved_x;
+  if ((heur_moves & 3) && opts_.sub_mip_heuristics && (part != 2 || (heur_moves & 2)) && !solved_.load()) {
+    const double itol = params_.tol.integrality;
+    const Index n = p_.num_cols();
+    auto count_frac = [&](const double* x) {
+      Index k = 0;
+      for (Index j = 0; j < n; ++j) k += p_.is_int[j] && std::abs(x[j] - std::round(x[j])) > itol;
+      return k;
+    };
+    const Index first = count_frac(w.lp.x());
+    if (first > 0) {
+      const double t0 = timer_.elapsed();
+      auto lp = std::make_unique<DualSimplex>(w.lp);
+      lp->set_weight_threads(1);
+      LpOptions lo;
+      lo.tol = params_.tol;
+      const double z0 = lp->objective();
+      const long long pivot_budget = std::max<long long>(1000, 4 * std::max<long long>(root_lp0_iters_, 0));
+      const long long work_budget = 1000000000LL;
+      long long pivots = 0, work = 0;
+      Index before = first;
+      bool ok = true;
+      for (int pass = 0; pass < 3 && pivots < pivot_budget && work < work_budget; ++pass) {
+        const Basis keep = lp->get_basis();
+        lo.time_limit = std::max(0.0, params_.time_limit - timer_.elapsed());
+        const long long cap = std::min(pivot_budget - pivots, std::max<long long>(200, 10LL * before));
+        const long long w0 = lp->work();
+        const long long piv = lp->degenerate_moves(p_.is_int, lo, cap, work_budget - work);
+        work += lp->work() - w0;
+        pivots += piv;
+        const LpStatus st = lp->solve(lo);
+        const Index now = st == LpStatus::Optimal ? count_frac(lp->x()) : before + 1;
+        if (st != LpStatus::Optimal || std::abs(lp->objective() - z0) > 1e-7 * std::max(1.0, std::abs(z0)) || now > before) {
+          lp->set_basis(keep);
+          ok = lp->solve(lo) == LpStatus::Optimal;
+          break;
+        }
+        const bool go_on = piv > 0 && now * 10 <= before * 9;
+        before = now;
+        if (!go_on) break;
+      }
+      const Index last = ok ? count_frac(lp->x()) : first;
+      log_.log(2, "  root heuristics: LP point moved inside the optimal face, %d -> %d fractional integer columns, %lld "
+               "pivots, %.2fs\n", static_cast<int>(first), static_cast<int>(last), pivots, timer_.elapsed() - t0);
+      if (ok && last < first) {
+        moved_x.assign(lp->x(), lp->x() + n);
+        moved_lp = std::move(lp);
+        if ((heur_moves & 1) && part != 2 && rounding_.run(moved_x.data(), w.sol)) try_incumbent(w, w.sol, "rounding");
+      }
+    }
+  }
+  // Bit 4: a feasibility pump inside the optimal face of the root LP. Each round moves the LP point towards the
+  // rounding of the last one by degenerate moves (the objective stays at the root bound); a rounding that
+  // repeats gets 10-30 of its entries with the largest distance flipped. An integral point is a solution at the
+  // root bound, so the search ends with it. Only where every integer column is binary-like or already integral;
+  // at most 50 rounds and 2e9 units of LP work (about two seconds).
+  if ((heur_moves & 4) && opts_.sub_mip_heuristics && part != 2 && !solved_.load()) {
+    const double itol = params_.tol.integrality;
+    const Index n = p_.num_cols();
+    const double t0 = timer_.elapsed();
+    DualSimplex lp = moved_lp ? *moved_lp : w.lp;
+    lp.set_weight_threads(1);
+    LpOptions lo;
+    lo.tol = params_.tol;
+    const double z0 = lp.objective();
+    std::mt19937 rng(params_.seed * 7919u + 4409u);
+    std::vector<double> tgt(n, 0.0), last, best_x;
+    std::vector<std::pair<double, Index>> far;
+    const long long work_budget = 2000000000LL;
+    long long work = 0, pivots = 0;
+    int rounds = 0, flips = 0;
+    Index best = n + 1;
+    bool found = false;
+    for (; rounds < 50 && work < work_budget && !solved_.load(); ++rounds) {
+      const double* x = lp.x();
+      Index frac = 0;
+      bool general = false;
+      far.clear();
+      for (Index j = 0; j < n; ++j) {
+        tgt[j] = x[j];
+        if (!p_.is_int[j]) continue;
+        const double r = std::round(x[j]);
+        const bool fr = std::abs(x[j] - r) > itol;
+        frac += fr;
+        if (p_.col_ub[j] - p_.col_lb[j] == 1.0) {
+          tgt[j] = r;
+          if (fr) far.push_back({std::abs(x[j] - r), j});
+        } else if (fr) {
+          general = true;
+        }
+      }
+      if (frac < best) best = frac, best_x.assign(x, x + n);
+      if (frac == 0) {
+        std::vector<double> sol(x, x + n);
+        found = try_incumbent(w, sol, "face pump");
+        break;
+      }
+      if (general && far.empty()) break;  // only general integers are fractional: nothing to push
+      if (tgt == last) {
+        // The same rounding again: flip the entries the point is farthest from.
+        std::sort(far.begin(), far.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+        const size_t k = std::min(far.size(), static_cast<size_t>(10 + rng() % 21));
+        for (size_t t = 0; t < k; ++t) {
+          const Index j = far[t].second;
+          tgt[j] = tgt[j] == p_.col_lb[j] ? p_.col_ub[j] : p_.col_lb[j];
+        }
+        ++flips;
+      }
+      last = tgt;
+      lo.time_limit = std::max(0.0, params_.time_limit - timer_.elapsed());
+      const long long w0 = lp.work();
+      pivots += lp.degenerate_moves(p_.is_int, lo, std::max<long long>(500, 20LL * frac), work_budget - work, tgt.data());
+      const LpStatus st = lp.solve(lo);
+      work += lp.work() - w0;
+      if (st != LpStatus::Optimal || std::abs(lp.objective() - z0) > 1e-7 * std::max(1.0, std::abs(z0))) break;
+    }
+    log_.log(2, "  root face pump: %s, %d rounds (%d with flips), best %d fractional integer columns, %lld pivots, %.2fs\n",
+             found ? "found" : "failed", rounds, flips, static_cast<int>(best), pivots, timer_.elapsed() - t0);
+    // RENS around the pump's most integral point (the integer columns integral there are fixed).
+    static const bool no_submip_fp = std::getenv("MILP_NO_SUBMIP") != nullptr;
+    if (!found && !best_x.empty() && !no_submip_fp && !solved_.load()) {
+      SubMipLimits sl;
+      sl.node_limit = 500;
+      sl.work_limit = params_.deterministic ? 2000000000LL : -1;
+      sl.time_limit = params_.deterministic ? std::max(0.0, params_.time_limit - timer_.elapsed())
+                                            : std::min(std::max(0.0, params_.time_limit - timer_.elapsed()), 3.0);
+      SubMipStats ss;
+      sl.stats = &ss;
+      std::vector<double> sol;
+      const double t1 = timer_.elapsed();
+      const bool ok = rens(p_, best_x.data(), incumbent(w) + p_.offset, sl, sol);
+      if (ok) try_incumbent(w, sol, "face pump + RENS");
+      log_.log(2, "  root face pump + RENS: %s, %lld nodes, %lld iters, %.2fs\n", ok ? "found" : "failed", ss.nodes,
+               ss.lp_iterations, timer_.elapsed() - t1);
+    }
+  }
+  const bool use_moved = moved_lp && (heur_moves & 1);
+  const DualSimplex& hlp = use_moved ? *moved_lp : w.lp;          // the LP the dives, the pump and the LP sub-MIP copy
+  const std::vector<double>& hx = use_moved ? moved_x : w.xnode;  // the point RENS rounds around
+  const std::vector<double>& rins_x = moved_lp && (heur_moves & 2) ? moved_x : w.xnode;
   struct Result {
     std::vector<double> x;
     const char* source = nullptr;
     long long iters = 0, dive_iters = 0;
+    int kind = -1;  // kRh..., for the statistics
   };
   using Task = std::function<void(Result&)>;
   // Opt-in MILP_ROOT_HEUR_SKIP=1 (opportunistic mode): a heuristic task that would start once the root
@@ -3723,12 +3946,21 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
         if (restart_due()) continue;
         log_.log(hlog, "  root heuristic task %zu of %zu starts, %.2fs, resident %lld MB\n", k + 1, tasks.size(), timer_.elapsed(),
                  resident_bytes() >> 20);
+        const double t_task = timer_.elapsed();
         tasks[k](res[k]);
         log_.log(hlog, "  root heuristic task %zu of %zu done, %.2fs, resident %lld MB\n", k + 1, tasks.size(), timer_.elapsed(),
                  resident_bytes() >> 20);
-        if (early && !res[k].x.empty()) {
-          early_wins += try_incumbent(res[k].x, res[k].source);
+        const bool found = !res[k].x.empty();
+        bool win = false;
+        if (early && found) {
+          win = try_incumbent(res[k].x, res[k].source);
+          early_wins += win;
           res[k].x.clear();
+        }
+        if (res[k].kind >= 0) {
+          std::lock_guard<std::mutex> lk(rh_mu_);
+          RhAcct& a = rh_acct_[res[k].kind];
+          ++a.runs, a.found += found, a.wins += win, a.secs += timer_.elapsed() - t_task;
         }
       }
     };
@@ -3755,7 +3987,10 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
     for (Result& r : res) {
       lp_iters_ += r.iters;
       dive_iters_ += r.dive_iters;
-      if (!r.x.empty()) wins += try_incumbent(w, r.x, r.source);
+      if (r.x.empty()) continue;
+      const bool win = try_incumbent(w, r.x, r.source);
+      wins += win;
+      if (win && r.kind >= 0) ++rh_acct_[r.kind].wins;
     }
     return wins;
   };
@@ -3783,7 +4018,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
   // of its early incumbents this way): rounds of RINS plus mutation sub-MIPs (one per
   // thread), repeated while a round improves.
   static const bool no_root_lns = std::getenv("MILP_NO_ROOT_LNS") != nullptr;
-  auto lns_phase = [&] {
+  auto lns_phase_body = [&] {
     // Only after a root of some size (>= 2000 LP iterations incl. the cut loop, a barrier root as the iterations
     // it stands for): on quick roots the sub-MIP setup costs more than the tree's LNS would.
     const long long root_iters = w.lp.iterations() + (barrier_equiv() ? root_lp_equiv_iters_ : 0);
@@ -3828,6 +4063,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
     long long lns_used = 0;
     double fix = 0.7;
     bool rins_ok = true;
+    if (clh_rec_ && !clh_rec_due_[kClhRins]) rins_ok = false, ++clh_skip_rins_;  // the loop's RINS just failed
     for (int round = 0; round < max_rounds && is_finite(incumbent(w)) && !solved_.load(); ++round) {
       const double t_round = timer_.elapsed();
       // Skip when the incumbent is already within 0.5% of the root bound.
@@ -3849,14 +4085,16 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
       const bool with_rins = rins_ok;
       if (with_rins) {
         lns.push_back([&, cut](Result& r) {
+          r.kind = kRhRins;
           std::vector<double> sol;
-          if (rins(p_, w.xnode.data(), inc, cut, limits(&stats[0]), sol)) r.x = std::move(sol), r.source = "root RINS";
+          if (rins(p_, rins_x.data(), inc, cut, limits(&stats[0]), sol)) r.x = std::move(sol), r.source = "root RINS";
         });
       }
       for (int t = static_cast<int>(lns.size()), k = 0; t < std::max(nthr, 2); ++t, ++k) {
         const double f = std::min(0.95, fix + 0.1 * k);
         const unsigned seed = params_.seed * 7919u + 15485863u + static_cast<unsigned>(round * 64 + t);
         lns.push_back([&, cut, f, seed, t](Result& r) {
+          r.kind = kRhMutation;
           std::vector<double> sol;
           if (mutation(p_, inc, f, seed, cut, limits(&stats[t]), sol)) r.x = std::move(sol), r.source = "root mutation";
         });
@@ -3890,6 +4128,11 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
         if (round >= 1 || !opts_.start.empty()) break;
       }
     }
+  };
+  auto lns_phase = [&] {
+    const double t0 = timer_.elapsed();
+    lns_phase_body();
+    rh_wall_lns_ += timer_.elapsed() - t0;
   };
   if (part == 2) {
     lns_phase();
@@ -3955,12 +4198,23 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
     // start without an incumbent, every time).
     static const bool dedup = knob("MILP_DIVE_DEDUP", 1) > 0;
     std::vector<Task> tasks;
+    // The cut loop's record (MILP_CUTLOOP_HEUR=2, see clh_level_).
+    bool rec_no_guided = false;
+    if (clh_rec_ && !inc_p->empty()) {
+      std::lock_guard<std::mutex> lk(clh_mu_);
+      rec_no_guided = !clh_rec_due_[kClhDive] && clh_dive_guided_ && !clh_dive_limit_;
+    }
     for (DiveRule rule : kRules) {
       if (dedup && rule == DiveRule::Guided && inc_p->empty()) continue;
+      if (rec_no_guided && rule == DiveRule::Guided) {
+        ++clh_skip_dives_;
+        continue;
+      }
       const double cap = rule == DiveRule::VectorLength ? tl_vl : tl;
       tasks.push_back([&, rule, inc_p, budget, cap, cut](Result& r) {
+        r.kind = kRhDive + static_cast<int>(rule);
         const std::vector<double>& inc = *inc_p;
-        DualSimplex lp = w.lp;
+        DualSimplex lp = hlp;
         lp.set_weight_threads(1);  // the dives run side by side
         std::unique_ptr<DomainPropagator> prop;
         // The row copy shared with the other propagators of p_ (12 bytes per nonzero for each dive otherwise).
@@ -3998,6 +4252,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
   const bool improvement_sub = !opts_.sub_mip_heuristics && is_finite(external_cutoff_);
   if (!is_finite(incumbent(w)) && std::getenv("MILP_NO_FP") == nullptr && (sub_fp || !improvement_sub)) {
     tasks.push_back([&](Result& r) {
+      r.kind = kRhPump;
       FeasPumpLimits lim;
       lim.time_limit = capped(std::min(10.0, 0.1 * remaining()));
       lim.iteration_budget = std::max<long long>(20000, 20 * lp_iters_.load());
@@ -4006,7 +4261,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
       lim.stall_rounds = fp_stall;
       std::vector<double> closest, sol;
       const double t0 = timer_.elapsed();
-      const bool ok = feasibility_pump(p_, w.lp, lim, sol, &r.iters, &closest);
+      const bool ok = feasibility_pump(p_, hlp, lim, sol, &r.iters, &closest);
       fp_iters_ += r.iters;
       ++fp_runs_;
       log_.log(hlog, "  root feasibility pump: %s, %lld iters, %.2fs\n", ok ? "found" : "failed", r.iters,
@@ -4029,13 +4284,24 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
   static const bool fpr_lp = knob("MILP_FPR_LP", 0.0) != 0.0;  // opt-in until the end-to-end A/B
   if (fpr_lp && !is_finite(incumbent(w))) {
     tasks.push_back([&](Result& r) {  // LP-guided fix-propagate-repair (reads w.xnode only)
+      r.kind = kRhFpr;
       std::vector<double> sol;
       if (fpr_run_lp(w.xnode, sol)) r.x = std::move(sol), r.source = "fix-propagate-repair (LP)";
     });
   }
-  if (!no_submip && opts_.sub_mip_heuristics && opts_.root_heuristics) {
+  // The cut loop's record (MILP_CUTLOOP_HEUR=2, see clh_level_).
+  const bool rens_rec = clh_rec_ && is_finite(incumbent(w));
+  bool rens_skip = false;
+  if (rens_rec) {
+    std::lock_guard<std::mutex> lk(clh_mu_);
+    rens_skip = incumbent(w) - root_bound_ <= 5e-3 * std::max(1.0, std::abs(incumbent(w) + p_.offset)) ||
+                (!clh_rec_due_[kClhRens] && clh_rens_exhausted_);
+    if (rens_skip) ++clh_skip_rens_;
+  }
+  if (!no_submip && opts_.sub_mip_heuristics && opts_.root_heuristics && !rens_skip) {
     const double cut = incumbent(w) + p_.offset;
-    tasks.push_back([&, cut, d = w.lp.reduced_costs()](Result& r) {  // only FP reads w.lp concurrently
+    tasks.push_back([&, cut, d = hlp.reduced_costs()](Result& r) {  // only FP reads the root LP concurrently
+      r.kind = kRhRens;
       SubMipLimits lim;
       lim.time_limit = capped(std::min(10.0, 0.1 * remaining()));
       // At most ~3x the root's time (>= 2 s): the 1000-node limit is out of reach when nodes are
@@ -4052,11 +4318,12 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
       }
       lim.node_limit = 1000;
       lim.work_limit = det_sub_work;
+      lim.retry_empty_only = rens_rec;
       SubMipStats ss;
       lim.stats = &ss;
       std::vector<double> sol;
       const double t0 = timer_.elapsed();
-      const bool ok = rens(p_, w.xnode.data(), cut, lim, sol, &d);
+      const bool ok = rens(p_, hx.data(), cut, lim, sol, &d);
       if (ok) r.x = std::move(sol), r.source = "RENS";
       log_.log(3, "  root RENS: %s, %lld nodes, %lld iters, %.2fs\n", ok ? "found" : "failed", ss.nodes, ss.lp_iterations,
                timer_.elapsed() - t0);
@@ -4072,6 +4339,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
     // a first sub-MIP proved infeasible (lp_rens stop_blind).
     static const double lp_rens_rel = knob("MILP_LP_RENS_REL", 1.0);
     tasks.push_back([&, cut](Result& r) {
+      r.kind = kRhLpRens;
       SubMipLimits lim;
       lim.time_limit = capped(std::min(std::max(2.0, t_root), 0.1 * remaining()));
       lim.node_limit = 1000;
@@ -4090,7 +4358,7 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
       const double t0 = timer_.elapsed();
       static const double target = knob("MILP_LP_RENS_TARGET", 0.7);
       static const int attempts = static_cast<int>(knob("MILP_LP_RENS_ATTEMPTS", 4));
-      const bool ok = lp_rens(p_, w.lp, cut, lim, sol, target, attempts, &ls, lp_rens_rel > 0.0);
+      const bool ok = lp_rens(p_, hlp, cut, lim, sol, target, attempts, &ls, lp_rens_rel > 0.0);
       r.iters = ls.dive_iterations;
       if (ok) r.x = std::move(sol), r.source = "root LP sub-MIP";
       log_.log(3, "  root LP sub-MIP: %s, %d sub-MIPs, rate %.2f, %lld nodes, %lld iters, %.2fs\n", ok ? "found" : "failed",
@@ -4108,7 +4376,9 @@ void Search::root_heuristics(Worker& w, int nthreads, double t_root_in, int part
     dive_tasks.pop_back();
   }
   for (Task& t : dive_tasks) tasks.push_back(std::move(t));
+  const double t_tasks = timer_.elapsed();
   run_tasks(tasks);
+  rh_wall_tasks_ += timer_.elapsed() - t_tasks;
 
   // MILP_ROOT_LNS_FIRST (default 0: off; gozwei/popso#4 item 1): with an incumbent at the start of the root
   // heuristics (a user start, a point found before the root LP ended, the incumbent carried over a restart),
@@ -7363,7 +7633,235 @@ int Search::root_sep_threads() {
   return std::max(1, threads);
 }
 
+void Search::clh_result(int kind, bool found, bool win, double secs) {
+  std::lock_guard<std::mutex> lk(clh_mu_);
+  ClhKind& k = clh_kind_[kind];
+  ++k.calls;
+  k.found += found;
+  k.wins += win;
+  k.secs += secs;
+  k.running = false;
+  if (win) {
+    k.fails = 0;
+    k.next = 0;
+  } else {
+    k.fails = std::min(k.fails + 1, 8);
+    k.next = clh_round_.load() + (1 << k.fails);
+  }
+}
+
+void Search::clh_point(const DualSimplex& lp) {
+  const double t_in = timer_.elapsed();
+  const int round = clh_round_++;
+  if (solved_.load() || stop_.load()) return;
+  const double elapsed = std::max(0.0, t_in - t_start_);
+  const double left = params_.time_limit - t_in;
+  if (left <= 0.0) return;
+  const Index n = p_.num_cols();
+  const double* x = lp.x();
+  bool fractional = false;
+  for (Index j = 0; j < n && !fractional; ++j) {
+    fractional = p_.is_int[j] && std::abs(x[j] - std::round(x[j])) > 1e-6;
+  }
+  if (!fractional) return;  // the root node takes an integral LP point itself
+  auto due = [&](int kind) {
+    std::lock_guard<std::mutex> lk(clh_mu_);
+    return !clh_kind_[kind].running && round >= clh_kind_[kind].next;
+  };
+  // The root thread's own part: below 5% of the root's time so far (plus 5 ms).
+  auto inline_ok = [&] { return clh_inline_ <= 0.05 * elapsed + 0.005; };
+  if (inline_ok() && due(kClhRound)) {
+    std::vector<double> sol;
+    const double t0 = timer_.elapsed();
+    const bool found = rounding_.run(x, sol);
+    const bool win = found && try_incumbent(sol, "cut loop rounding");
+    clh_result(kClhRound, found, win, timer_.elapsed() - t0);
+    if (!found && due(kClhZi)) {
+      const double t1 = timer_.elapsed();
+      const bool zf = zi_rounding_.run(x, sol);
+      const bool zw = zf && try_incumbent(sol, "cut loop ZI rounding");
+      clh_result(kClhZi, zf, zw, timer_.elapsed() - t1);
+    }
+    clh_inline_ += timer_.elapsed() - t0;
+  }
+  // Tasks on the threads the root does not use: the search's less this one and the FJ helper's.
+  const int slots = std::clamp(threads_ - 2, 0, 2);
+  // Memory: a task holds a copy of the LP or of the problem (the root heuristics' estimate).
+  const long long est = 2 * (16LL * p_.A.nnz() + 200LL * (static_cast<long long>(p_.num_rows()) + n));
+  const double incumbent = incumbent_.load();
+  const double task_tl = std::min(left, std::clamp(0.5 * elapsed, 0.2, 5.0));
+  for (int s = 0; s < slots; ++s) {
+    ClhSlot& slot = clh_slot_[s];
+    if (slot.state.load() == 2) {
+      slot.th.join();
+      slot.state = 0;
+    }
+    if (slot.state.load() != 0) continue;
+    if (opts_.check_resident && mem_limit_bytes() > 0 && resident_bytes() + est > mem_limit_bytes() / 10 * 8) break;
+    int kind = -1;
+    if (is_finite(incumbent)) {
+      if (due(kClhRins)) kind = kClhRins;
+      else if (due(kClhDive) && inline_ok()) kind = kClhDive;
+      else if (due(kClhRens)) kind = kClhRens;
+    } else {
+      if (due(kClhRens)) kind = kClhRens;
+      else if (due(kClhDive) && inline_ok()) kind = kClhDive;
+    }
+    if (kind < 0) break;
+    {
+      std::lock_guard<std::mutex> lk(clh_mu_);
+      clh_kind_[kind].running = true;
+    }
+    slot.state = 1;
+    const double cut_obj = incumbent + p_.offset;  // the sub-MIPs' cutoff (with the offset)
+    if (kind == kClhDive) {
+      const double t0 = timer_.elapsed();
+      auto lpc = std::make_shared<DualSimplex>(lp);
+      auto inc = std::make_shared<std::vector<double>>();
+      if (is_finite(incumbent)) incumbent_x_global(*inc);
+      std::shared_ptr<const SparseMatrix> rows = &prop_problem() == &p_ ? prop_rows() : nullptr;
+      // Without an incumbent the rules take turns; with one the dive is guided by it.
+      static const DiveRule kTurn[] = {DiveRule::Fractional, DiveRule::VectorLength, DiveRule::Coefficient};
+      const DiveRule rule = inc->empty() ? kTurn[clh_dive_rule_++ % 3] : DiveRule::Guided;
+      DiveLimits lim;
+      lim.cutoff = cutoff_.load();
+      lim.iteration_budget = std::max<long long>(1000, lp.iterations());
+      lim.time_limit = task_tl;
+      lim.stop = &clh_stop_;
+      clh_inline_ += timer_.elapsed() - t0;
+      slot.th = std::thread(inherit_interrupt([this, &slot, lpc, inc, rows, rule, lim] {
+        const double t1 = timer_.elapsed();
+        lpc->set_weight_threads(1);
+        DomainPropagator prop(p_, rows);
+        std::vector<double> sol;
+        long long iters = 0;
+        DiveOutcome out;
+        const bool found =
+            dive(p_, *lpc, rule, rounding_, inc->empty() ? nullptr : inc.get(), lim, sol, &iters, &prop, &out);
+        const bool win = found && try_incumbent(sol, "cut loop diving");
+        log_.log(3, "  cut loop %s dive: %s, %d steps, %lld iters (budget %lld), %.2fs\n", to_string(rule),
+                 win ? "improved" : found ? "found" : out.limit_hit ? "failed at its limit" : "failed", out.steps,
+                 iters, lim.iteration_budget, timer_.elapsed() - t1);
+        lp_iters_ += iters;
+        dive_iters_ += iters;
+        {
+          std::lock_guard<std::mutex> lk(clh_mu_);
+          clh_dive_guided_ = rule == DiveRule::Guided;
+          clh_dive_limit_ = out.limit_hit;
+        }
+        clh_result(kClhDive, found, win, timer_.elapsed() - t1);
+        slot.state = 2;
+      }));
+    } else {
+      const double t0 = timer_.elapsed();
+      auto px = std::make_shared<std::vector<double>>(x, x + n);
+      auto inc = std::make_shared<std::vector<double>>();
+      auto red = std::make_shared<std::vector<double>>();
+      if (kind == kClhRins) incumbent_x_global(*inc);
+      else *red = lp.reduced_costs();
+      // Level 2: under an incumbent's cutoff RENS retries only a neighbourhood that was infeasible at once.
+      const bool empty_only = clh_level_ >= 2 && kind == kClhRens && is_finite(incumbent);
+      clh_inline_ += timer_.elapsed() - t0;
+      slot.th = std::thread(inherit_interrupt([this, &slot, px, inc, red, kind, cut_obj, task_tl, empty_only] {
+        const double t1 = timer_.elapsed();
+        SubMipStats ss;
+        SubMipLimits lim;
+        lim.time_limit = task_tl;
+        lim.node_limit = 100;
+        lim.stats = &ss;
+        lim.stop = &clh_stop_;
+        lim.retry_empty_only = empty_only;
+        std::vector<double> sol;
+        bool found = false;
+        if (kind == kClhRins && !inc->empty()) found = rins(p_, px->data(), *inc, cut_obj, lim, sol);
+        else if (kind == kClhRens) found = rens(p_, px->data(), cut_obj, lim, sol, red.get());
+        if (kind == kClhRens) {
+          std::lock_guard<std::mutex> lk(clh_mu_);
+          clh_rens_exhausted_ = !found && ss.solves > 0 && ss.exhausted;
+        }
+        const bool win = found && try_incumbent(sol, kind == kClhRins ? "cut loop RINS" : "cut loop RENS");
+        log_.log(3, "  cut loop %s: %s, %d sub-MIPs, %lld nodes, %lld iters, fixed %d of %d, %.2fs\n",
+                 kind == kClhRins ? "RINS" : "RENS", win ? "improved" : found ? "found" : "failed", ss.solves, ss.nodes,
+                 ss.lp_iterations, ss.fixed, ss.ints, timer_.elapsed() - t1);
+        lp_iters_ += ss.lp_iterations;
+        clh_result(kind, found, win, timer_.elapsed() - t1);
+        slot.state = 2;
+      }));
+    }
+  }
+}
+
+// The cut loop is over: no new tasks, the running ones are told to end. No wait for them.
+void Search::clh_end() {
+  if (!clh_on_) return;
+  clh_on_ = false;
+  clh_stop_ = true;
+  for (ClhSlot& slot : clh_slot_) {
+    if (slot.state.load() != 2) continue;
+    slot.th.join();
+    slot.state = 0;
+  }
+  if (clh_level_ >= 2 && clh_round_.load() > 0) {
+    // The record for the root heuristics that follow. A task that was still running is told to end: its kind
+    // counts as due.
+    std::lock_guard<std::mutex> lk(clh_mu_);
+    const int round = clh_round_.load();
+    for (int k = 0; k < kClhKinds; ++k) clh_rec_due_[k] = clh_kind_[k].running || round >= clh_kind_[k].next;
+    clh_rec_ = true;
+  }
+}
+
+// The search is over: joins the tasks and prints the statistics.
+void Search::clh_finish() {
+  clh_on_ = false;
+  bool any = false;
+  const double t0 = timer_.elapsed();
+  clh_stop_ = true;
+  for (ClhSlot& slot : clh_slot_) {
+    if (slot.th.joinable()) slot.th.join(), any = true;
+    slot.state = 0;
+  }
+  if (any) clh_join_ += timer_.elapsed() - t0;
+  if (clh_logged_ || clh_round_.load() == 0) return;
+  clh_logged_ = true;
+  static const char* const kNames[kClhKinds] = {"rounding", "ZI rounding", "dives", "RENS", "RINS"};
+  std::string line;
+  double task_secs = 0.0;
+  for (int k = 0; k < kClhKinds; ++k) {
+    const ClhKind& c = clh_kind_[k];
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%s%s %d (%d found, %d improved)", k ? ", " : "", kNames[k], c.calls, c.found, c.wins);
+    line += buf;
+    if (k >= kClhDive) task_secs += c.secs;
+  }
+  log_.log(2, "Cut loop heuristics: %d LP points; %s; %.2fs on the root thread, %.2f task thread-seconds, %.2fs waiting"
+           " at the search's end\n", clh_round_.load(), line.c_str(), clh_inline_, task_secs, clh_join_);
+  if (clh_level_ >= 2) {
+    log_.log(2, "Cut loop record: after the loop skipped RENS %d, dives %d, RINS in the first LNS round %d\n",
+             clh_skip_rens_.load(), clh_skip_dives_.load(), clh_skip_rins_.load());
+  }
+}
+
 void Search::fj_finish() {
+  clh_finish();  // no task outlives the search
+  if (opts_.sub_mip_heuristics) {
+    static const char* const kNames[kRhKinds] = {"pump",           "RENS",             "LP sub-MIP",  "RINS",              "mutation",
+                                                 "FPR",            "fractional dive",  "coefficient dive", "guided dive", "vector-length dive"};
+    std::string line;
+    for (int k = 0; k < kRhKinds; ++k) {
+      const RhAcct& a = rh_acct_[k];
+      if (a.runs == 0) continue;
+      char buf[96];
+      std::snprintf(buf, sizeof buf, "%s%s %d (%d found, %d improved) %.2fs", line.empty() ? "" : ", ", kNames[k], a.runs, a.found,
+                    a.wins, a.secs);
+      line += buf;
+      rh_acct_[k] = RhAcct();
+    }
+    if (!line.empty()) {
+      log_.log(2, "Root heuristics by kind: %s; wall %.2fs first phase, %.2fs LNS rounds\n", line.c_str(), rh_wall_tasks_,
+               rh_wall_lns_);
+    }
+  }
   if (!fj_thread_.joinable()) return;
   {
     std::lock_guard<std::mutex> lk(fj_mu_);
@@ -7969,6 +8467,7 @@ MipResult Search::run() {
         }
         root_lp_lb_ = std::max(root_lp_lb_, lp.objective());  // optimal LPs only: a global bound
         if (lurk) record_lurking(lp);
+        if (clh_on_) clh_point(lp);
       };
       // Reduced-cost fixing between cut rounds against the current cutoff (deterministic: the one at the start).
       const double cutoff0 = cutoff_.load();
@@ -8032,6 +8531,20 @@ MipResult Search::run() {
         }
         return k;
       };
+      // Heuristics between root cut rounds: level 2 by default (MILP_CUTLOOP_HEUR=0 switches them off). Four
+      // comparisons, all WRONG 0: screen 0.974, 240 set 0.984 [0.973, 0.997], core on new seeds 0.966 [0.933,
+      // 0.999], 240 set on new seeds 0.989 [0.977, 1.000]. Not in deterministic mode.
+      static const int clh_knob = static_cast<int>(knob("MILP_CUTLOOP_HEUR", 2));
+      clh_on_ = clh_knob > 0 && !params_.deterministic && opts_.sub_mip_heuristics && opts_.root_heuristics;
+      clh_level_ = clh_on_ ? clh_knob : 0;
+      clh_rec_ = false;
+      if (clh_on_) {  // tasks of an earlier loop of this search, if any, are gone before the flag is cleared
+        for (ClhSlot& slot : clh_slot_) {
+          if (slot.th.joinable()) slot.th.join();
+          slot.state = 0;
+        }
+        clh_stop_ = false;
+      }
       const double t_loop0 = timer_.elapsed();
       const CutLoopStats cs = root_cut_loop(p_, w.lp, params_, log_, timer_, inc0, &cut_data_,
                                             !opts_.sub_mip_heuristics || opts_.no_zerohalf,
@@ -8039,6 +8552,7 @@ MipResult Search::run() {
                                             opts_.root_cut_rounds, gap_fn,
                                             root_lp_race_iters_ + (barrier_equiv() ? root_lp_equiv_iters_ : 0),
                                             lp_checkpoint, det_root_sync, root_sep_threads(), fix_fn);
+      clh_end();
       rt_pre_lp_ = rt_lp_;
       rt_loop_ += timer_.elapsed() - t_loop0, rt_lp_ += cs.initial_lp_time, rt_sep_ += cs.sep_time, rt_resolve_ += cs.resolve_time;
       if (barrier_equiv() && root_barrier_time_ > 0.0 && root_lp_equiv_iters_ == 0 && !params_.deterministic &&

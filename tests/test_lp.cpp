@@ -296,3 +296,58 @@ TEST(lp_negligible_entries_do_not_skew_row_scaling) {
   CHECK(checked == 60);
 }
 
+
+TEST(lp_degenerate_moves_stay_optimal_and_move_towards_the_rounding) {
+  // LPs with mostly zero costs (large optimal faces) over columns in [0, 1]: after the moves the LP is still
+  // optimal at the same objective, the point is feasible, and the distance of the columns to the rounding of the
+  // point before the moves has not grown.
+  std::mt19937 rng(11);
+  int moved = 0, closer = 0;
+  for (int t = 0; t < 300; ++t) {
+    const Index m = 2 + rng() % 15, n = 3 + rng() % 30;
+    std::vector<Index> J, I;
+    std::vector<double> V, c, cl(n, 0.0), cu(n, 1.0), rl, ru;
+    for (Index j = 0; j < n; ++j)
+      for (Index i = 0; i < m; ++i)
+        if (rng() % 100 < 35) J.push_back(j), I.push_back(i), V.push_back(static_cast<int>(rng() % 9) - 3);
+    const SparseMatrix A = SparseMatrix::from_triplets(n, m, J, I, V);
+    for (Index j = 0; j < n; ++j) c.push_back(rng() % 4 == 0 ? static_cast<int>(rng() % 7) - 3 : 0);
+    for (Index i = 0; i < m; ++i) {
+      rl.push_back(rng() % 3 == 0 ? -kInf : -static_cast<double>(rng() % 3));
+      ru.push_back(0.5 + static_cast<double>(rng() % 6) * 0.5);
+    }
+    std::vector<char> is_int(n, 1);
+    for (Index j = 0; j < n; ++j) is_int[j] = rng() % 5 != 0;
+    DualSimplex s;
+    s.load(A, c, cl, cu, rl, ru);
+    if (s.solve(LpOptions{}) != LpStatus::Optimal) continue;
+    const double z0 = s.objective();
+    const std::vector<double> x0(s.x(), s.x() + n);
+    auto dist = [&](const double* x) {
+      double d = 0.0;
+      for (Index j = 0; j < n; ++j) {
+        if (is_int[j]) d += std::abs(x[j] - std::round(x0[j]));
+      }
+      return d;
+    };
+    const double d0 = dist(x0.data());
+    // A column at 0.5 has no definite rounding (the moves decide on recomputed values): no distance check then.
+    bool halves = false;
+    for (Index j = 0; j < n; ++j) halves = halves || (is_int[j] && std::abs(x0[j] - 0.5) < 1e-6);
+    const long long pivots = s.degenerate_moves(is_int, LpOptions{}, 1000);
+    REQUIRE(s.solve(LpOptions{}) == LpStatus::Optimal);
+    CHECK_NEAR(s.objective(), z0, 1e-7 * std::max(1.0, std::abs(z0)));
+    const double* x = s.x();
+    for (Index j = 0; j < n; ++j) CHECK(x[j] >= -1e-7 && x[j] <= 1.0 + 1e-7);
+    std::vector<double> act(m, 0.0);
+    for (Index j = 0; j < n; ++j)
+      for (Index k = A.begin(j); k < A.end(j); ++k) act[A.index[k]] += A.value[k] * x[j];
+    for (Index i = 0; i < m; ++i) CHECK(act[i] >= rl[i] - 1e-6 && act[i] <= ru[i] + 1e-6);
+    const double d1 = dist(x);
+    if (!halves) CHECK(d1 <= d0 + 1e-6);
+    moved += pivots > 0;
+    closer += !halves && d1 < d0 - 1e-6;
+  }
+  CHECK(moved > 30);
+  CHECK(closer > 20);
+}

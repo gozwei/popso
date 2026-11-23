@@ -1,0 +1,29 @@
+# Flat-LP stream (2026-11-20): two targets (root cuts never move the bound, or the tree is decided at the root)
+# and controls with many root cut rounds or a very fractional first LP vertex.
+benchmarks/miplib/CMS750_4.mps.gz
+benchmarks/miplib/swath3.mps.gz
+benchmarks/miplib/app1-1.mps.gz
+benchmarks/miplib/roll3000.mps.gz
+benchmarks/miplib/neos-860300.mps.gz
+benchmarks/miplib/supportcase33.mps.gz
+benchmarks/miplib/mcsched.mps.gz
+benchmarks/miplib/eil33-2.mps.gz
+benchmarks/miplib/pg5_34.mps.gz
+benchmarks/miplib/timtab1.mps.gz
+benchmarks/miplib/neos-933966.mps.gz
+benchmarks/miplib/neos-960392.mps.gz
+benchmarks/miplib/n2seq36q.mps.gz
+benchmarks/miplib/neos-1171737.mps.gz
+benchmarks/miplib/piperout-08.mps.gz
+benchmarks/miplib/neos-1171448.mps.gz
+benchmarks/miplib/drayage-25-23.mps.gz
+benchmarks/miplib/nursesched-sprint02.mps.gz
+benchmarks/miplib/physiciansched6-2.mps.gz
+benchmarks/miplib/fhnw-binpack4-4.mps.gz
+benchmarks/miplib/supportcase7.mps.gz
+benchmarks/miplib/netdiversion.mps.gz
+benchmarks/miplib/neos-3216931-puriri.mps.gz
+benchmarks/miplib/ran14x18-disj-8.mps.gz
+benchmarks/miplib/tbfp-network.mps.gz
+benchmarks/miplib/piperout-27.mps.gz
+benchmarks/miplib/neos-3381206-awhea.mps.gz

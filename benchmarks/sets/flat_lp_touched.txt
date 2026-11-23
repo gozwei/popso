@@ -1,0 +1,12 @@
+benchmarks/miplib/CMS750_4.mps.gz
+benchmarks/miplib/app1-1.mps.gz
+benchmarks/miplib/supportcase33.mps.gz
+benchmarks/miplib/neos-933966.mps.gz
+benchmarks/miplib/neos-960392.mps.gz
+benchmarks/miplib/n2seq36q.mps.gz
+benchmarks/miplib/neos-1171737.mps.gz
+benchmarks/miplib/piperout-08.mps.gz
+benchmarks/miplib/neos-1171448.mps.gz
+benchmarks/miplib/physiciansched6-2.mps.gz
+benchmarks/miplib/fhnw-binpack4-4.mps.gz
+benchmarks/miplib/swath3.mps.gz

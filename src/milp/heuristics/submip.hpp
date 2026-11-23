@@ -39,6 +39,14 @@ struct SubMipLimits {
   // otherwise: 12 bytes per nonzero).
   std::shared_ptr<const SparseMatrix> prop_rows;
   int solution_limit = 0;          // stop after this many incumbents of the sub-MIP (0: none)
+  // rens only: no retry with fewer fixings after a sub-MIP that searched (more than one node) or hit a limit;
+  // one that was infeasible at once is still retried. The retries are meant for a neighbourhood without a
+  // feasible point (air05: 5842 of 6103 fixed is infeasible at node 0, the retry with 4087 fixed finds the
+  // root's best point); under an incumbent's cutoff a sub-MIP that searched and found nothing mostly means
+  // "nothing better here", and the retries widen it up to the time limit (roll3000, cutoff 13132 from the cut
+  // loop: 511 of 731 fixed infeasible after 9 nodes in 0.17 s, 357 fixed infeasible in 0.21 s, 204 fixed 2.36 s
+  // to the time limit; with the helper's 16410 as the cutoff the first sub-MIP finds 13215 in 0.29 s).
+  bool retry_empty_only = false;
   // Fixing neighbourhoods searched before: the sub-MIP's integer bounds are hashed into *fingerprint, and
   // one whose hash is in *skip is not solved (no solve counted). Only for neighbourhoods of p itself with
   // a cutoff that does not grow (an exhausted one holds no better point later either).

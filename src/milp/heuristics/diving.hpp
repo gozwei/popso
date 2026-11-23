@@ -3,6 +3,7 @@
 // (by tightening its bound) and resolve the LP until the solution is
 // integral, the LP becomes infeasible, or the budget runs out.
 
+#include <atomic>
 #include <vector>
 
 #include "milp/heuristics/rounding.hpp"
@@ -19,6 +20,7 @@ struct DiveLimits {
   long long iteration_budget = 5000;  // total simplex iterations for the dive
   double time_limit = kInf;           // seconds
   double cutoff = kInf;               // abandon once the LP objective reaches this
+  const std::atomic<bool>* stop = nullptr;  // optional: the dive ends at its next step once set
 };
 
 // How a dive ended (optional output of dive()).

@@ -119,6 +119,29 @@ CutLoopStats root_cut_loop(const MipProblem& p, DualSimplex& lp, const SolverPar
   if (const char* v = std::getenv("MILP_CHEAP_RECENT_REL")) opt.cheap_recent_rel = std::atof(v);
   // MILP_CUT_AGE = k: slack cut rows stay for k further slack re-solves (0: removed at the first).
   if (const char* v = std::getenv("MILP_CUT_AGE")) opt.cut_age = std::atoi(v);
+  // Slow roots (default; MILP_SLOW_ROOT=0 switches it off): CutLoopOptions::resolve_work_min
+  // (MILP_SLOW_ROOT_CUT, default 5e9) and resolve_work_rel (MILP_SLOW_ROOT_CUT_REL, default 1). supportcase22
+  // (259962 rows, ~240 iterations/s): the first round's re-solve ran 59 s into the loop's time limit and was
+  // discarded.
+  if (const char* v = std::getenv("MILP_SLOW_ROOT"); !v || !*v || *v != '0') {
+    opt.resolve_work_min = 5e9;
+    if (const char* c = std::getenv("MILP_SLOW_ROOT_CUT")) opt.resolve_work_min = std::atof(c);
+    if (const char* c = std::getenv("MILP_SLOW_ROOT_CUT_REL")) opt.resolve_work_rel = std::atof(c);
+  }
+  if (!sub_mip) {
+    // Flat root loops (default; MILP_DEGEN_MOVES=0 MILP_FLAT_CUTS=0 switch them off): degenerate moves after the
+    // rounds while the bound has not moved (bit 4), and the binding cuts of such a loop stay when the moves
+    // at least halved the fractional count. Only on models with at least flat_frac of the free integer columns
+    // fractional at the first LP (CMS750_4: 19%, 60-113 s and 34-126k nodes -> 3-6 s and 45-277 nodes).
+    opt.degen_moves = 4;
+    opt.flat_cuts = 1;
+    if (const char* v = std::getenv("MILP_DEGEN_MOVES")) opt.degen_moves = std::atoi(v);
+    if (const char* v = std::getenv("MILP_FLAT_CUTS")) opt.flat_cuts = std::atoi(v);
+    if (const char* v = std::getenv("MILP_FLAT_KEEP")) opt.flat_keep = std::atof(v);
+    if (const char* v = std::getenv("MILP_FLAT_MORE")) opt.flat_more = std::atof(v);
+    if (const char* v = std::getenv("MILP_FLAT_ROWS")) opt.flat_rows = std::atof(v);
+    if (const char* v = std::getenv("MILP_FLAT_FRAC")) opt.flat_frac = std::atof(v);
+  }
   if (max_rounds >= 0) {
     opt.max_rounds = std::min(opt.max_rounds, max_rounds);
     opt.max_rounds_cheap = 0;
@@ -140,6 +163,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     return lp.solve(lpo);
   };
   const long long iters_start = lp.iterations();
+  const long long lp_work_start = lp.work();
   const double t_lp0 = timer.elapsed();
   lpo.checkpoint = opt.initial_checkpoint;
   lpo.checkpoint_every = opt.checkpoint_every;
@@ -154,6 +178,7 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   }
   lpo.checkpoint = nullptr;
   const long long iters0 = lp.iterations();
+  const long long lp_work_initial = lp.work() - lp_work_start;
   if (opt.on_lp) opt.on_lp(lp);
   const double t_lp_end = timer.elapsed(), initial_lp_time = t_lp_end - t_lp0;
   stats.initial_lp_time = initial_lp_time;
@@ -167,6 +192,12 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   // Gomory).
   const long long init_iters = iters0 - iters_start + std::max<long long>(0, opt.prior_iterations);
   const double initial_work = static_cast<double>(init_iters) * static_cast<double>(lp.num_rows() + n);
+  const long long resolve_cap =
+      opt.resolve_work_min > 0.0
+          ? static_cast<long long>(std::max(opt.resolve_work_min, opt.resolve_work_rel * std::max(static_cast<double>(lp.work()), initial_work)))
+          : 0;
+  if (resolve_cap > 0) log.log(2, "  slow root: LP work so far %.3g (initial solve %.3g), re-solve cap %.3g\n", static_cast<double>(lp.work()), initial_work,
+                               static_cast<double>(resolve_cap));
   double loop_work = 0.0;
   double plateau_work = 0.0;  // loop work of the rounds since the bound last moved
   double lp_time = 0.0;
@@ -406,6 +437,14 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   };
 
   bool lp_optimal = true;     // the LP is at an optimum (the final slack cleanup needs its basis)
+  // Fractional integer columns of the current LP point: the measure of progress while the bound is flat
+  // (MILP_FLAT_CUTS, see the end of the loop).
+  auto count_frac = [&]() {
+    const double* xx = lp.x();
+    Index k = 0;
+    for (Index j = 0; j < n; ++j) k += p.is_int[j] && std::abs(xx[j] - std::round(xx[j])) > itol;
+    return k;
+  };
   int degenerate_rounds = 0;  // rounds that ended on a dual degenerate LP
   // Dual degeneracy: share of nonbasic structurals with zero reduced cost. On such LPs
   // cuts often only move the solution to an alternative optimum for several rounds
@@ -422,6 +461,79 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
   bool last_degenerate = is_dual_degenerate();
   const bool initial_degenerate = last_degenerate;
   log.log(2, "  initial LP %s dual degenerate\n", initial_degenerate ? "is" : "is not");
+  // Degenerate moves (CutLoopOptions::degen_moves), repeated up to three times while the count of fractional
+  // integer columns falls by a tenth. CMS750_4: the bound is 250 through every round and the first vertex has
+  // 1391 fractional binaries; with the moves 1100, then 591, 402, ..., 56 after 14 rounds (the reference's log
+  // shows 36 and then 6-16); kept (flat_cuts), the 151 binding cuts and that vertex give a tree of 169 nodes
+  // instead of 76,000.
+  // Budget over the loop: 4 x the initial solve's iterations (at least 1000) pivots and the initial solve's work
+  // (the LP's work counter; at least 1e9, about a second); 10 pivots per fractional column (at least 200) per
+  // pass. A pass that leaves more fractional columns than it found is undone (the distance to the rounding can
+  // fall while the count rises); the moves stop for the rest of the loop after two such calls in a row or a call
+  // without any gain.
+  long long move_pivots = 0, move_work = 0;
+  const long long move_budget = std::max<long long>(1000, 4 * init_iters);
+  const long long move_work_budget = std::max<long long>(1000000000LL, lp_work_initial);
+  bool moves_off = false;
+  int move_fails = 0;  // calls in a row whose last pass was undone
+  int move_calls = 0;
+  auto move_to_integral = [&](const char* when) {
+    Index before = count_frac();
+    if (before == 0 || moves_off || move_pivots >= move_budget || move_work >= move_work_budget) return;
+    const Index first = before;
+    long long pivots = 0;
+    const double t0 = timer.elapsed();
+    const double z0 = lp.objective();
+    const long long w_before = lp.work();
+    bool undone = false;
+    // The loop's first call is a trial on a fifth of the work budget: unless it cuts the count by a fifth the
+    // moves stop (cryptanalysiskb128n5obj14: 3.3 s of moves without a gain; CMS750_4's first call: 1623 -> 596
+    // with 1.7e8 units).
+    const bool trial = move_calls++ == 0;
+    const long long call_work = trial ? std::min(move_work_budget, move_work + move_work_budget / 5) : move_work_budget;
+    for (int pass = 0; pass < 3 && move_pivots < move_budget && move_work < call_work; ++pass) {
+      const Basis keep = lp.get_basis();
+      lpo.time_limit = std::max(0.0, opt.time_limit - timer.elapsed());
+      const long long cap = std::min(move_budget - move_pivots, std::max<long long>(200, 10LL * before));
+      const long long w0 = lp.work();
+      const long long piv = lp.degenerate_moves(p.is_int, lpo, cap, call_work - move_work);
+      move_work += lp.work() - w0;
+      const LpStatus st = solve();
+      pivots += piv;
+      move_pivots += piv;
+      const Index now = st == LpStatus::Optimal ? count_frac() : before + 1;
+      if (st != LpStatus::Optimal || std::abs(lp.objective() - z0) > 1e-7 * std::max(1.0, std::abs(z0)) || now > before) {
+        lp.set_basis(keep);  // numerical trouble or a worse point: back to the vertex before this pass
+        solve();
+        undone = true;
+        moves_off = ++move_fails >= 2 || first == before;  // twice in a row, or a call without any gain
+        break;
+      }
+      if (now < before) move_fails = 0;
+      const bool go_on = piv > 0 && now * 10 <= before * 9;
+      before = now;
+      if (!go_on) break;
+    }
+    if (trial && before * 5 > first * 4) moves_off = true;
+    log.log(2, "  degenerate moves %s: %d -> %d fractional integer columns, %lld pivots, %.2fs%s\n", when,
+            static_cast<int>(first), static_cast<int>(count_frac()), pivots, timer.elapsed() - t0,
+            moves_off ? " (last pass undone, no further moves)" : undone ? " (last pass undone)" : "");
+    log.log(3, "  degenerate moves work %.3g (LP work counter), initial solve %.3g\n",
+            static_cast<double>(lp.work() - w_before), static_cast<double>(lp_work_initial));
+  };
+  // The flat-loop rules (degen_moves bit 4, flat_cuts) apply only where at least flat_frac of the free integer
+  // columns are fractional at the initial LP: the LP says little about the integers there (CMS750_4: 19%; the
+  // instances where the moves bought nothing or cost a second have 1-13%).
+  bool flat_lp = true;
+  if (opt.flat_frac > 0.0) {
+    Index free_ints = 0;
+    for (Index j = 0; j < n; ++j) free_ints += p.is_int[j] && lp.col_lower(j) < lp.col_upper(j);
+    flat_lp = static_cast<double>(count_frac()) >= opt.flat_frac * static_cast<double>(std::max<Index>(free_ints, 1));
+  }
+  if ((opt.degen_moves & 1) && initial_degenerate) move_to_integral("after the initial LP");
+  const Index frac_initial = count_frac();
+  Index frac_now = frac_initial, frac_best = frac_initial;
+  int frac_best_round = 0;
   std::vector<double> sep_time(seps.size(), 0.0);
   // MILP_CUT_PROFILE=1 (diagnostics, verbosity 2): per round and separator the separation time, its
   // candidates, those the pool kept, those selected and those binding after the re-solve.
@@ -603,7 +715,17 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     row_age.resize(row_cuts.size(), 0);
     if (trace) row_round.resize(row_cuts.size(), round);
     const double t_solve = timer.elapsed();
+    const long long work_before = lp.work(), outer_limit = lp.work_limit();
+    if (resolve_cap > 0) {
+      const long long lim = work_before + resolve_cap;
+      lp.set_work_limit(outer_limit >= 0 ? std::min(outer_limit, lim) : lim);
+    }
     const LpStatus st = solve();
+    if (resolve_cap > 0) {
+      lp.set_work_limit(outer_limit);
+      log.log(2, "  cut round %d: re-solve work %.3g (cap %.3g)%s\n", round, static_cast<double>(lp.work() - work_before),
+              static_cast<double>(resolve_cap), lp.work() - work_before >= resolve_cap ? ", cap reached" : "");
+    }
     const double round_lp_time = timer.elapsed() - t_solve;
     lp_time += round_lp_time;
     // Expensive re-solves (mzzv11: 300-500 cuts per round took 11-24k iterations each, so only 6 rounds
@@ -700,6 +822,17 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     const bool dual_degenerate = is_dual_degenerate();
     last_degenerate = dual_degenerate;
     degenerate_rounds += dual_degenerate;
+    // Bit 2: after every round of a dual degenerate LP; bit 4: only while the bound has not moved (flat loops).
+    if (dual_degenerate && ((opt.degen_moves & 2) ||
+                            ((opt.degen_moves & 4) && flat_lp &&
+                             obj - stats.bound_before <= 1e-9 * std::max(1.0, std::abs(obj))))) {
+      move_to_integral("after the round");
+      obj = lp.objective();
+    }
+    frac_now = count_frac();
+    if (frac_now < frac_best) frac_best = frac_now, frac_best_round = round;
+    log.log(3, "  round %d: %d fractional integer columns (initial LP %d)\n", round, static_cast<int>(frac_now),
+            static_cast<int>(frac_initial));
 
     if (log.verbosity() >= 2) {
       char buf[400];
@@ -731,7 +864,11 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
           log.log(3, "  flat round %d: loop work %.3g of max(%.3g, %.3g x initial %.3g)\n", round, loop_work,
                   opt.flat_work_min, opt.flat_work_factor, initial_work);
         }
-        if (flat && dual_degenerate && !flat_time_ok) break;
+        // flat_cuts bit 2: the flat rounds go on past their work cap while the count of fractional integer columns
+        // reached a new low within the last two rounds.
+        const bool frac_falls = (opt.flat_cuts & 2) && round - frac_best_round <= 1 && opt.flat_work_factor > 0.0 &&
+                                loop_work <= opt.flat_more * std::max(opt.flat_work_min, opt.flat_work_factor * initial_work);
+        if (flat && dual_degenerate && !flat_time_ok && !frac_falls) break;
         if (flat && dual_degenerate && extra_rounds < opt.degenerate_rounds &&
             lp.iterations() - iters0 <= 5 * std::max<long long>(init_iters, 1000)) {
           ++extra_rounds;
@@ -800,8 +937,30 @@ CutLoopStats cut_loop(const MipProblem& p, DualSimplex& lp, const CutLoopOptions
     for (const auto& [j, b] : rc_saved) lp.set_col_bounds(j, b.first, b.second);
     log.log(2, "  cut loop reduced-cost fixing: %d bound changes on %zu columns\n", rc_fixed_total, rc_saved.size());
   }
+  // flat_cuts bit 1: cuts that did not move the bound stay when they made the LP point more integral (at most
+  // flat_keep times the fractional integer columns of the initial LP): only the rows with a basic logical leave.
+  // Without it the tree's LPs start from the cut-free vertex again (CMS750_4).
+  bool keep_flat = false;
+  {
+    if ((opt.flat_cuts & 1) && flat_lp && lp_optimal && stats.rounds > 0 && lp.num_rows() > first_removable &&
+        stats.bound_after - stats.bound_before - fix_gain <= 1e-6 * std::max(1.0, std::abs(stats.bound_before)) &&
+        static_cast<double>(frac_now) <= opt.flat_keep * static_cast<double>(frac_initial)) {
+      // Counted first: at most flat_rows x the problem's rows may stay (cut rows that never moved the bound make
+      // every node LP larger: fhnw-binpack4-4, 122 rows on 493, 65,000 nodes at twice the time).
+      Index binding = 0;
+      for (Index i = first_removable; i < lp.num_rows(); ++i) binding += !lp.row_is_basic(i) || i < r0;
+      if (static_cast<double>(binding) <= opt.flat_rows * static_cast<double>(m0)) {
+        int hist[4] = {0, 0, 0, 0};
+        const size_t removed = remove_slack(-1, stats.rounds, hist);
+        keep_flat = lp.num_rows() > first_removable;
+        log.log(2, "  cuts did not improve the bound; %d fractional integer columns (initial LP %d): %d binding cut "
+                "rows kept, %zu removed\n", static_cast<int>(frac_now), static_cast<int>(frac_initial),
+                static_cast<int>(lp.num_rows() - first_removable), removed);
+      }
+    }
+  }
   // Cuts that did not move the bound only make node LPs larger: drop them all.
-  if (stats.rounds > 0 && lp.num_rows() > first_removable &&
+  if (!keep_flat && stats.rounds > 0 && lp.num_rows() > first_removable &&
       stats.bound_after - stats.bound_before - fix_gain <= 1e-6 * std::max(1.0, std::abs(stats.bound_before))) {
     std::vector<Index> rows;
     for (Index i = first_removable; i < lp.num_rows(); ++i) rows.push_back(i);

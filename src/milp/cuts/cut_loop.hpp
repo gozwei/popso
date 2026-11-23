@@ -109,6 +109,11 @@ struct CutLoopOptions {
   // means (a barrier root: its warm initial solve takes ~0 iterations); counted as the initial solve's in the
   // budgets relative to it.
   long long prior_iterations = 0;
+  // > 0 (MILP_SLOW_ROOT=1, on trial): a round's LP re-solve ends once it has used max(resolve_work_min,
+  // resolve_work_rel x the larger of the LP's work before the first round and the initial solve's iterations x
+  // (rows + columns), prior_iterations included) simplex work units (DualSimplex::work(), about 1 ns each); the round is then discarded like one that hit the time limit, and the loop ends.
+  double resolve_work_min = 0.0;
+  double resolve_work_rel = 1.0;
   long long probe_work = -1;     // probing work limit (matrix entries; -1: from the problem size)
   bool gomory = true, cover = true, mir = true, clique = true, implied_bound = true, zerohalf = true;
   bool mcf = true;  // network cut-sets (MILP_MCF=0: off)
@@ -134,6 +139,25 @@ struct CutLoopOptions {
   // in the LP (they are global bounds of the search, unlike the reduced-cost fixings above); the LP is re-solved.
   std::function<Index(std::vector<double>&, std::vector<double>&, std::vector<Index>&)> fix_fn;
   int threads = 1;  // SepaContext::threads of the rounds (the cuts do not depend on it)
+  // Degenerate moves (MILP_DEGEN_MOVES, default 0; root loops only, not sub-MIPs): on a dual degenerate LP,
+  // primal pivots inside the optimal face towards the rounding of the LP point (DualSimplex::degenerate_moves)
+  // after the initial solve (bit 1), after every round's re-solve (bit 2), or after the rounds only while the bound
+  // has not moved (bit 4: flat loops, the case the moves are for). The bound does not change; the
+  // point the cuts are separated from, and the vertex the tree starts from, has fewer fractional integer columns.
+  // At most 4 x the initial solve's iterations (at least 1000) pivots and the initial solve's work (at least 1e9
+  // units, about a second) over the loop; a pass that leaves more fractional columns is undone and ends the moves.
+  int degen_moves = 0;
+  // Flat cuts (MILP_FLAT_CUTS, default 0): bit 1: cuts that did not move the bound stay (those with a nonbasic
+  // logical) when the LP point has at most flat_keep times the fractional integer columns of the initial LP and
+  // they are at most flat_rows times the problem's rows; bit 2: the flat rounds go on past their work cap (up
+  // to flat_more times it) while that count reached a new low within the last two rounds.
+  int flat_cuts = 0;
+  double flat_keep = 0.5;
+  double flat_rows = 0.1;
+  double flat_more = 4.0;
+  // degen_moves bit 4 and flat_cuts need at least this share of the free integer columns fractional at the
+  // initial LP (MILP_FLAT_FRAC; 0: no such test).
+  double flat_frac = 0.15;
 };
 
 // The loop behind root_cut_loop. If `all_cuts` is given, every cut added to

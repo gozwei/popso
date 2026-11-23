@@ -83,13 +83,13 @@ struct PresolveOptions {
   // MILP_GROUP_PROP=0 switches it off).
   bool group_prop = true;
   // Integer columns whose values are all congruent modulo a divisor g are replaced by x = g x' + r
-  // (PresolveWork::int_divisors; MILP_INT_DIV=1 switches it on).
-  bool int_divisors = false;
+  // (PresolveWork::int_divisors; MILP_INT_DIV=0 switches it off).
+  bool int_divisors = true;
   // Of two complementary binaries x + y = 1 the member of a packing or partitioning row is the one kept by
-  // the doubleton aggregation (MILP_KEEP_MEMBERS=1 switches it on).
-  bool keep_members = false;
-  // Probing does not lift a row that the fixings of the same pass made redundant (MILP_LIFT_LIVE=1 switches it on).
-  bool lift_live = false;
+  // the doubleton aggregation (MILP_KEEP_MEMBERS=0 switches it off).
+  bool keep_members = true;
+  // Probing does not lift a row that the fixings of the same pass made redundant (MILP_LIFT_LIVE=0 switches it off).
+  bool lift_live = true;
   // Liftings and coefficient tightenings of rows whose coefficients are multiples of 1/1024 (with integral
   // bounds) are computed without a rounding margin, like those of integral rows: 0.25 + 0.75 gives 1, not
   // 0.9999999996, and the row stays a clique (ProbingOptions::lift_dyadic; MILP_LIFT_DYADIC=1 switches it on).

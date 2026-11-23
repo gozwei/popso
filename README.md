@@ -26,7 +26,7 @@ instances, and is faster overall, than the open-source solvers HiGHS and SCIP:
 
 On the 43 harder instances of the same collection that no solver finishes in 2 minutes, with a
 10-minute limit, popso solves 16, HiGHS 12 and SCIP 6. On the full 240-instance MIPLIB 2017
-benchmark set (2 minutes, another machine) it solves 94, HiGHS 74 and SCIP 65. On 346 models with
+benchmark set (2 minutes, another machine) it solves 95, HiGHS 74 and SCIP 65. On 346 models with
 quadratic constraints, second-order cones or nonconvex quadratics over binaries from
 [QPLIB](https://qplib.zib.de) and [CBLIB](https://cblib.zib.de) (2 minutes, 1 thread, another
 machine) it solves 196 and SCIP 101.

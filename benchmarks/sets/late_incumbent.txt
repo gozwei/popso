@@ -1,0 +1,21 @@
+# Late-incumbent stream (2026-11-20): instances whose bound is closed at the root (or one step short) while the
+# final solution comes late, and controls from the screening set.
+benchmarks/miplib/neos-960392.mps.gz
+benchmarks/miplib/neos-1171737.mps.gz
+benchmarks/miplib/neos-933966.mps.gz
+benchmarks/miplib/n2seq36q.mps.gz
+benchmarks/miplib/neos-1171448.mps.gz
+benchmarks/miplib/fhnw-binpack4-4.mps.gz
+benchmarks/miplib/supportcase18.mps.gz
+benchmarks/miplib/pg5_34.mps.gz
+benchmarks/miplib/timtab1.mps.gz
+benchmarks/miplib/roll3000.mps.gz
+benchmarks/miplib/mcsched.mps.gz
+benchmarks/miplib/swath3.mps.gz
+benchmarks/miplib/app1-1.mps.gz
+benchmarks/miplib/nw04.mps.gz
+benchmarks/miplib/beasleyC3.mps.gz
+benchmarks/miplib/mc11.mps.gz
+benchmarks/miplib/neos-911970.mps.gz
+benchmarks/miplib/eil33-2.mps.gz
+benchmarks/miplib/neos-860300.mps.gz

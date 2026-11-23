@@ -59,6 +59,9 @@ PresolveOptions only(bool bt, bool coef, bool par, bool dual, bool aggr) {
   o.dual_aggregation = false;
   o.sparsify = false;
   o.group_prop = false;
+  o.int_divisors = false;
+  o.keep_members = false;
+  o.lift_live = false;
   return o;
 }
 

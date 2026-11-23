@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <utility>
 
 #include "milp/lp/simplex.hpp"
@@ -37,9 +38,37 @@ bool polish_point(const MipProblem& p, const Timer& timer, double time_limit, st
 bool postsolve_result(const MipProblem& p, const Presolver& pre, const SolverParams& params, const Timer& timer,
                       const Logger& log, MipResult* mr) {
   if (!mr->has_solution) return true;
+  const std::vector<double> reduced = mr->x;
   mr->x = pre.postsolve(mr->x);
-  const double viol = p.max_violation(mr->x);
+  double viol = p.max_violation(mr->x);
   const double scale = std::max(1.0, std::abs(mr->objective));
+  if (!(viol <= 1e-6)) {
+    // First in the reduced problem: the integers fixed, the continuous columns re-solved at a tight tolerance.
+    // The postsolved point then misses the original rows by correspondingly less, and the LP is the small
+    // one (supportcase12 at its time limit: a point 7e-6 off, the repair LP over the original 166781 x 799616
+    // model had 1 s left and failed, and the run ended without any solution although the search held one).
+    // The repair LP may run past the time limit by a twentieth of it (2-10 s; MILP_REPAIR_GRACE seconds):
+    // without the repair the run returns no solution at all.
+    std::vector<double> xr = reduced;
+    const double t0 = timer.elapsed();
+    double grace = std::clamp(0.05 * params.time_limit, 2.0, 10.0);
+    if (const char* v = std::getenv("MILP_REPAIR_GRACE")) grace = std::atof(v);
+    if (polish_point(pre.reduced(), timer, std::max(params.time_limit, t0 + grace), xr, 1e-9)) {
+      std::vector<double> x2 = pre.postsolve(xr);
+      const double v2 = p.max_violation(x2);
+      if (v2 <= 1e-6 && (mr->status != Status::Optimal || p.objective(x2) <= mr->objective + 1e-6 * scale)) {
+        log.log(2, "Postsolved solution violated the original problem by %.3g; repaired in the presolved problem "
+                "(%.3g, %.2fs)\n", viol, v2, timer.elapsed() - t0);
+        mr->x = std::move(x2);
+        viol = v2;
+      } else {
+        log.log(2, "Repair in the presolved problem: postsolved point still %.3g off (%.2fs)\n", v2, timer.elapsed() - t0);
+      }
+    } else {
+      log.log(2, "Repair in the presolved problem: no LP point (%.2fs; reduced violation %.3g)\n", timer.elapsed() - t0,
+              pre.reduced().max_violation(reduced));
+    }
+  }
   if (!(viol <= 1e-6)) {
     // The polished point rounds the integers exactly, so its objective may differ from the
     // presolved one by round-off (n5-3: 8429 vs 8428.999991). Accept it within a relative 1e-6,

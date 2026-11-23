@@ -4,7 +4,7 @@ How the solver compares with the open-source solvers [HiGHS](https://highs.dev) 
 [SCIP](https://www.scipopt.org). Every answer is checked independently: the returned
 solution must be feasible, and its objective must match the known optimum.
 
-_Last updated 2026-11-20 for popso v0.12.0: the 240-instance MIPLIB run is v0.12.0's. The 63-instance
+_Last updated 2026-11-23 for popso v0.12.1: the 240-instance MIPLIB run is v0.12.1's. The 63-instance
 numbers are v0.8.0's and the hard-instance run is v0.7.0's; the quadratic sections name their versions._
 
 ## Setup
@@ -205,52 +205,53 @@ four that popso does not (blp-ic98, csched007, csched008, sct2), SCIP one (csche
 All 240 instances of the official MIPLIB 2017 benchmark set, without selection
 ([`benchmarks/sets/miplib_benchmark.txt`](benchmarks/sets/miplib_benchmark.txt)). The reference
 values are MIPLIB's own (232 optimal, 7 infeasible, 1 best known), so every answer is checked.
-This run (popso v0.12.0) used a second machine:
+This run (popso v0.12.1) used a second machine:
 
 - Machine: AMD EPYC 4465P (12 cores, 24 hardware threads, 62 GB), Linux; six solver runs at a time.
 - Versions and scoring as above; 120 s per instance, 4 threads (SCIP's branch-and-bound is
   single-threaded), memory cap 8 GB per solver process.
 - The HiGHS and SCIP results were measured on the same machine with the same settings, in
   [`benchmarks/reference/miplib_benchmark_epyc.json`](benchmarks/reference/miplib_benchmark_epyc.json).
-- popso ran the v0.12.0 solver code with seeds 0, 1 and 2: 95, 94 and 95 instances solved, shifted
-  geometric means 50.8, 50.1 and 49.1 s, no wrong answer. The table and the plot show the middle run
+- popso ran the v0.12.1 solver code with seeds 0, 1 and 2: 94, 95 and 96 instances solved, shifted
+  geometric means 49.0, 48.4 and 47.6 s, no wrong answer. The table and the plot show the middle run
   (seed 1). The machine ran other benchmark jobs at the same time, so times vary by a few percent
-  between runs. v0.11.0 solved 84, 85 and 88 at 56.7, 55.4 and 54.6 s; in a side-by-side run of both
-  versions on two further seeds, v0.12.0 solved 186 of 480 runs against 171 and took 9% less time
-  (shifted geometric mean, 90% interval 6-12%). The tables and the plot come from
+  between runs. v0.12.0 solved 95, 94 and 95 at 50.8, 50.1 and 49.1 s; in a side-by-side run of both
+  versions on two further seeds, v0.12.1 solved 193 of 480 runs against 185 and took 4% less time
+  (shifted geometric mean, 90% interval 2-7%). The tables and the plot come from
   [`tools/bench_report.py`](tools/bench_report.py).
 
 ![MIPLIB 2017 benchmark set: instances solved vs. time](docs/miplib_benchmark.svg)
 
 | solver | solved | shifted geomean (s) |
 |---|---|---|
-| popso | 94/240 | 50.1 |
+| popso | 95/240 | 48.4 |
 | HiGHS | 74/240 | 66.3 |
 | SCIP | 65/240 | 69.1 |
 
-No solver solves 140 of the 240 instances within 2 minutes. popso is fastest on 62 instances
-(HiGHS 23, SCIP 15) and solves 15 that neither reference solver does (30n20b8, comp07-2idx, dano3_5,
-fhnw-binpack4-48, gfd-schedulen180f7d50m30k18, mas74, mcsched, mushroom-best, neos-3216931-puriri,
-neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-8). HiGHS or SCIP solve
-6 that popso does not in this run: CMS750_4, csched008, fast0507, rail507, rocI-4-11 and supportcase33.
+No solver solves 140 of the 240 instances within 2 minutes. popso is fastest on 64 instances
+(HiGHS 21, SCIP 15) and solves 15 that neither reference solver does (30n20b8, comp07-2idx,
+fhnw-binpack4-48, gfd-schedulen180f7d50m30k18, mas74, mcsched, mushroom-best, neos-1171737,
+neos-4738912-atrato, neos-933966, net12, netdiversion, nexp-150-20-8-5, ran14x18-disj-8, traininstance6).
+HiGHS or SCIP solve 5 that popso does not in this run: csched008, fast0507, rail507, supportcase33 and
+swath3.
 
 <details><summary>Per instance (seconds; TL = time limit; bold = fastest)</summary>
 
 | instance | popso | HiGHS | SCIP |
 |---|---|---|---|
-| 30n20b8 | **3.6** | TL | TL |
+| 30n20b8 | **4.2** | TL | TL |
 | 50v-10 | TL | TL | TL |
 | academictimetablesmall | TL | TL | TL |
-| air05 | **15.9** | 17.0 | 19.3 |
-| app1-1 | 37.1 | 10.8 | **4.2** |
+| air05 | **15.4** | 17.0 | 19.3 |
+| app1-1 | 27.4 | 10.8 | **4.2** |
 | app1-2 | TL | TL | TL |
 | assign1-5-8 | TL | TL | TL |
 | atlanta-ip | TL | TL | TL |
 | b1c1s1 | TL | TL | TL |
 | bab2 | TL | TL | TL |
 | bab6 | TL | TL | TL |
-| beasleyC3 | 15.2 | 13.1 | **10.4** |
-| binkar10_1 | **2.4** | 15.9 | 18.9 |
+| beasleyC3 | 21.0 | 13.1 | **10.4** |
+| binkar10_1 | **2.1** | 15.9 | 18.9 |
 | blp-ar98 | TL | TL | TL |
 | blp-ic98 | TL | TL | TL |
 | bnatt400 | TL | TL | TL |
@@ -262,10 +263,10 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | chromaticindex1024-7 | TL | TL | TL |
 | chromaticindex512-7 | TL | TL | TL |
 | cmflsp50-24-8-8 | TL | TL | TL |
-| CMS750_4 | TL | TL | **93.5** |
+| CMS750_4 | **9.5** | TL | 93.5 |
 | co-100 | TL | TL | TL |
-| cod105 | **0.7** | 58.3 | 33.3 |
-| comp07-2idx | **6.7** | TL | TL |
+| cod105 | **1.0** | 58.3 | 33.3 |
+| comp07-2idx | **5.6** | TL | TL |
 | comp21-2idx | TL | TL | TL |
 | cost266-UUE | TL | TL | TL |
 | cryptanalysiskb128n5obj14 | TL | TL | TL |
@@ -273,41 +274,41 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | csched007 | TL | TL | TL |
 | csched008 | TL | **97.8** | TL |
 | cvs16r128-89 | TL | TL | TL |
-| dano3_3 | **30.7** | 45.4 | 56.0 |
-| dano3_5 | **66.4** | TL | TL |
+| dano3_3 | **29.8** | 45.4 | 56.0 |
+| dano3_5 | TL | TL | TL |
 | decomp2 | **0.5** | 11.4 | 0.9 |
-| drayage-100-23 | 2.3 | **0.3** | 3.9 |
-| drayage-25-23 | 5.1 | **0.9** | 8.9 |
+| drayage-100-23 | 1.9 | **0.3** | 3.9 |
+| drayage-25-23 | 4.8 | **0.9** | 8.9 |
 | dws008-01 | TL | TL | TL |
-| eil33-2 | 77.1 | **48.6** | 52.1 |
+| eil33-2 | 70.3 | **48.6** | 52.1 |
 | eilA101-2 | TL | TL | TL |
-| enlight_hard | 1.6 | 7.1 | **0.0** |
-| ex10 | **5.1** | 22.4 | TL |
-| ex9 | **1.8** | 2.6 | 19.0 |
-| exp-1-500-5-5 | **0.4** | 2.1 | 1.5 |
+| enlight_hard | 1.7 | 7.1 | **0.0** |
+| ex10 | **6.7** | 22.4 | TL |
+| ex9 | **2.1** | 2.6 | 19.0 |
+| exp-1-500-5-5 | **0.3** | 2.1 | 1.5 |
 | fast0507 | TL | TL | **116.0** |
 | fastxgemm-n2r6s0t2 | TL | TL | TL |
-| fhnw-binpack4-4 | **5.3** | TL | 10.2 |
+| fhnw-binpack4-4 | **4.7** | TL | 10.2 |
 | fhnw-binpack4-48 | **0.2** | TL | TL |
 | fiball | **1.6** | 51.4 | TL |
 | gen-ip002 | TL | TL | TL |
 | gen-ip054 | TL | TL | TL |
 | germanrr | TL | TL | TL |
-| gfd-schedulen180f7d50m30k18 | **25.0** | TL | TL |
+| gfd-schedulen180f7d50m30k18 | **23.3** | TL | TL |
 | glass-sc | TL | TL | TL |
 | glass4 | TL | TL | TL |
 | gmu-35-40 | TL | TL | TL |
 | gmu-35-50 | TL | TL | TL |
-| graph20-20-1rand | 85.5 | TL | **3.3** |
+| graph20-20-1rand | 36.3 | TL | **3.3** |
 | graphdraw-domain | TL | TL | TL |
-| h80x6320d | 25.3 | **9.2** | 67.4 |
+| h80x6320d | 25.2 | **9.2** | 67.4 |
 | highschool1-aigio | TL | TL | TL |
-| hypothyroid-k1 | 7.4 | 6.4 | **3.7** |
+| hypothyroid-k1 | 7.3 | 6.4 | **3.7** |
 | ic97_potential | TL | TL | TL |
 | icir97_tension | TL | TL | TL |
 | irish-electricity | TL | TL | TL |
-| irp | **3.1** | 12.7 | 10.7 |
-| istanbul-no-cutoff | **36.9** | TL | 56.7 |
+| irp | **3.9** | 12.7 | 10.7 |
+| istanbul-no-cutoff | **35.5** | TL | 56.7 |
 | k1mushroom | TL | TL | TL |
 | lectsched-5-obj | TL | TL | TL |
 | leo1 | TL | TL | TL |
@@ -317,53 +318,53 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | map10 | TL | TL | TL |
 | map16715-04 | TL | TL | TL |
 | markshare2 | TL | TL | TL |
-| markshare_4_0 | **13.2** | 77.6 | 71.2 |
-| mas74 | **101.5** | TL | TL |
-| mas76 | **15.5** | 56.0 | 40.1 |
-| mc11 | 16.3 | 28.0 | **10.4** |
-| mcsched | **93.3** | TL | TL |
-| mik-250-20-75-4 | **5.2** | 8.3 | 22.2 |
+| markshare_4_0 | **13.8** | 77.6 | 71.2 |
+| mas74 | **109.8** | TL | TL |
+| mas76 | **13.3** | 56.0 | 40.1 |
+| mc11 | 19.6 | 28.0 | **10.4** |
+| mcsched | **59.4** | TL | TL |
+| mik-250-20-75-4 | **4.9** | 8.3 | 22.2 |
 | milo-v12-6-r2-40-1 | TL | TL | TL |
 | momentum1 | TL | TL | TL |
-| mushroom-best | **54.6** | TL | TL |
-| mzzv11 | **14.9** | 63.9 | TL |
-| mzzv42z | **5.2** | 25.8 | 73.7 |
-| n2seq36q | **46.1** | 47.6 | 76.1 |
+| mushroom-best | **68.2** | TL | TL |
+| mzzv11 | **16.0** | 63.9 | TL |
+| mzzv42z | **4.2** | 25.8 | 73.7 |
+| n2seq36q | **24.7** | 47.6 | 76.1 |
 | n3div36 | TL | TL | TL |
-| n5-3 | 20.6 | **20.3** | 28.8 |
-| neos-1122047 | 2.6 | **2.4** | 2.7 |
-| neos-1171448 | **5.5** | 110.0 | 6.3 |
-| neos-1171737 | TL | TL | TL |
+| n5-3 | 20.3 | **20.3** | 28.8 |
+| neos-1122047 | **2.4** | 2.4 | 2.7 |
+| neos-1171448 | 7.6 | 110.0 | **6.3** |
+| neos-1171737 | **103.8** | TL | TL |
 | neos-1354092 | TL | TL | TL |
-| neos-1445765 | **20.1** | 47.5 | 21.5 |
+| neos-1445765 | **20.6** | 47.5 | 21.5 |
 | neos-1456979 | TL | TL | TL |
-| neos-1582420 | **6.6** | 23.2 | 16.5 |
+| neos-1582420 | **6.5** | 23.2 | 16.5 |
 | neos-2075418-temuka | TL | TL | TL |
 | neos-2657525-crna | TL | TL | TL |
 | neos-2746589-doon | TL | TL | TL |
-| neos-2978193-inde | 15.7 | **11.4** | TL |
-| neos-2987310-joes | **2.8** | 3.3 | 11.7 |
+| neos-2978193-inde | 27.0 | **11.4** | TL |
+| neos-2987310-joes | **3.1** | 3.3 | 11.7 |
 | neos-3004026-krka | **0.8** | TL | 42.3 |
 | neos-3024952-loue | TL | TL | TL |
 | neos-3046615-murg | TL | TL | TL |
-| neos-3083819-nubu | **2.2** | 6.0 | 4.2 |
-| neos-3216931-puriri | **86.1** | TL | TL |
-| neos-3381206-awhea | 4.8 | 3.6 | **1.3** |
-| neos-3402294-bobin | **10.1** | 109.8 | TL |
+| neos-3083819-nubu | **1.5** | 6.0 | 4.2 |
+| neos-3216931-puriri | TL | TL | TL |
+| neos-3381206-awhea | 4.0 | 3.6 | **1.3** |
+| neos-3402294-bobin | **19.7** | 109.8 | TL |
 | neos-3402454-bohle | TL | TL | TL |
 | neos-3555904-turama | TL | TL | TL |
-| neos-3627168-kasai | **15.6** | 46.4 | 89.2 |
+| neos-3627168-kasai | **15.5** | 46.4 | 89.2 |
 | neos-3656078-kumeu | TL | TL | TL |
 | neos-3754480-nidda | TL | TL | TL |
 | neos-3988577-wolgan | TL | TL | TL |
 | neos-4300652-rahue | TL | TL | TL |
 | neos-4338804-snowy | TL | TL | TL |
 | neos-4387871-tavua | TL | TL | TL |
-| neos-4413714-turia | 92.4 | **13.0** | TL |
+| neos-4413714-turia | 89.6 | **13.0** | TL |
 | neos-4532248-waihi | TL | TL | TL |
 | neos-4647030-tutaki | TL | TL | TL |
-| neos-4722843-widden | 87.9 | **82.9** | TL |
-| neos-4738912-atrato | **54.3** | TL | TL |
+| neos-4722843-widden | **51.0** | 82.9 | TL |
+| neos-4738912-atrato | **20.5** | TL | TL |
 | neos-4763324-toguru | TL | TL | TL |
 | neos-4954672-berkel | TL | TL | TL |
 | neos-5049753-cuanza | TL | TL | TL |
@@ -376,63 +377,63 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | neos-5195221-niemur | TL | TL | TL |
 | neos-631710 | TL | TL | TL |
 | neos-662469 | TL | TL | TL |
-| neos-787933 | 1.0 | TL | **0.9** |
-| neos-827175 | 7.7 | **2.1** | 2.8 |
+| neos-787933 | 1.1 | TL | **0.9** |
+| neos-827175 | 5.4 | **2.1** | 2.8 |
 | neos-848589 | TL | TL | TL |
-| neos-860300 | 57.0 | **9.0** | 16.0 |
+| neos-860300 | 52.0 | **9.0** | 16.0 |
 | neos-873061 | TL | TL | TL |
-| neos-911970 | **3.0** | 15.0 | 7.6 |
-| neos-933966 | **15.9** | TL | TL |
-| neos-950242 | **3.1** | 12.5 | TL |
-| neos-957323 | **30.7** | 43.4 | 97.6 |
-| neos-960392 | 34.8 | **6.8** | TL |
-| neos17 | **1.5** | 4.0 | 3.7 |
-| neos5 | **40.1** | 61.2 | TL |
-| neos8 | 3.6 | 2.1 | **0.8** |
-| neos859080 | **0.3** | 0.8 | 0.4 |
-| net12 | **118.2** | TL | TL |
-| netdiversion | TL | TL | TL |
-| nexp-150-20-8-5 | **43.7** | TL | TL |
-| ns1116954 | 8.4 | **1.3** | TL |
-| ns1208400 | **22.1** | 48.3 | TL |
+| neos-911970 | **2.1** | 15.0 | 7.6 |
+| neos-933966 | **16.1** | TL | TL |
+| neos-950242 | **3.2** | 12.5 | TL |
+| neos-957323 | **25.3** | 43.4 | 97.6 |
+| neos-960392 | 20.2 | **6.8** | TL |
+| neos17 | **1.6** | 4.0 | 3.7 |
+| neos5 | **48.1** | 61.2 | TL |
+| neos8 | 2.6 | 2.1 | **0.8** |
+| neos859080 | **0.2** | 0.8 | 0.4 |
+| net12 | **105.7** | TL | TL |
+| netdiversion | **71.2** | TL | TL |
+| nexp-150-20-8-5 | **27.8** | TL | TL |
+| ns1116954 | 6.9 | **1.3** | TL |
+| ns1208400 | **17.7** | 48.3 | TL |
 | ns1644855 | TL | TL | TL |
 | ns1760995 | TL | TL | TL |
-| ns1830653 | **52.2** | TL | 79.9 |
+| ns1830653 | **39.5** | TL | 79.9 |
 | ns1952667 | TL | TL | TL |
-| nu25-pr12 | 5.3 | 3.5 | **2.5** |
+| nu25-pr12 | 6.7 | 3.5 | **2.5** |
 | nursesched-medium-hint03 | TL | TL | TL |
-| nursesched-sprint02 | **9.4** | 13.9 | 36.2 |
-| nw04 | **5.3** | 31.5 | 27.9 |
+| nursesched-sprint02 | **12.6** | 13.9 | 36.2 |
+| nw04 | **7.8** | 31.5 | 27.9 |
 | opm2-z10-s4 | TL | TL | TL |
-| p200x1188c | 0.9 | **0.4** | 2.7 |
+| p200x1188c | 0.7 | **0.4** | 2.7 |
 | peg-solitaire-a3 | TL | TL | TL |
-| pg | 6.6 | **3.2** | 12.0 |
-| pg5_34 | **108.9** | TL | TL |
+| pg | 5.5 | **3.2** | 12.0 |
+| pg5_34 | TL | TL | TL |
 | physiciansched3-3 | TL | TL | TL |
-| physiciansched6-2 | 5.8 | **5.6** | 100.5 |
-| piperout-08 | **2.2** | 16.7 | 8.9 |
-| piperout-27 | 10.7 | 27.1 | **7.5** |
-| pk1 | **7.0** | TL | 68.3 |
+| physiciansched6-2 | 5.9 | **5.6** | 100.5 |
+| piperout-08 | **2.0** | 16.7 | 8.9 |
+| piperout-27 | 10.6 | 27.1 | **7.5** |
+| pk1 | **8.7** | TL | 68.3 |
 | proteindesign121hz512p9 | TL | TL | TL |
 | proteindesign122trx11p8 | TL | TL | TL |
-| qap10 | **58.1** | 64.0 | 65.3 |
+| qap10 | **48.1** | 64.0 | 65.3 |
 | radiationm18-12-05 | TL | TL | TL |
 | radiationm40-10-02 | TL | TL | TL |
 | rail01 | TL | TL | TL |
 | rail02 | TL | TL | TL |
 | rail507 | TL | TL | **109.3** |
-| ran14x18-disj-8 | **89.8** | TL | TL |
+| ran14x18-disj-8 | **85.2** | TL | TL |
 | rd-rplusc-21 | TL | TL | TL |
 | reblock115 | TL | TL | TL |
 | rmatr100-p10 | **9.0** | 46.3 | 87.1 |
 | rmatr200-p5 | TL | TL | TL |
-| rocI-4-11 | TL | TL | **58.8** |
+| rocI-4-11 | 117.2 | TL | **58.8** |
 | rocII-5-11 | TL | TL | TL |
 | rococoB10-011000 | TL | TL | TL |
-| rococoC10-001000 | 118.4 | **115.4** | TL |
+| rococoC10-001000 | **83.2** | 115.4 | TL |
 | roi2alpha3n4 | TL | TL | TL |
 | roi5alpha10n8 | TL | TL | TL |
-| roll3000 | 56.6 | **25.8** | 30.8 |
+| roll3000 | 43.6 | **25.8** | 30.8 |
 | s100 | TL | TL | TL |
 | s250r10 | TL | TL | TL |
 | satellites2-40 | TL | TL | TL |
@@ -440,12 +441,12 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | savsched1 | TL | TL | TL |
 | sct2 | TL | TL | TL |
 | seymour | TL | TL | TL |
-| seymour1 | **20.9** | 75.7 | 29.6 |
+| seymour1 | **19.2** | 75.7 | 29.6 |
 | sing326 | TL | TL | TL |
 | sing44 | TL | TL | TL |
 | snp-02-004-104 | TL | TL | TL |
 | sorrell3 | TL | TL | TL |
-| sp150x300d | 0.2 | **0.0** | 0.2 |
+| sp150x300d | 0.1 | **0.0** | 0.2 |
 | sp97ar | TL | TL | TL |
 | sp98ar | TL | TL | TL |
 | splice1k1 | TL | TL | TL |
@@ -461,21 +462,21 @@ neos-4738912-atrato, neos-933966, net12, nexp-150-20-8-5, pg5_34, ran14x18-disj-
 | supportcase40 | TL | TL | TL |
 | supportcase42 | TL | TL | TL |
 | supportcase6 | TL | TL | TL |
-| supportcase7 | 114.3 | **52.1** | TL |
-| swath1 | **8.7** | 9.9 | 9.5 |
-| swath3 | **29.4** | 78.7 | TL |
-| tbfp-network | **87.0** | 114.8 | TL |
+| supportcase7 | 81.4 | **52.1** | TL |
+| swath1 | **6.6** | 9.9 | 9.5 |
+| swath3 | TL | **78.7** | TL |
+| tbfp-network | **68.3** | 114.8 | TL |
 | thor50dday | TL | TL | TL |
-| timtab1 | **9.4** | 33.9 | 35.0 |
+| timtab1 | **10.1** | 33.9 | 35.0 |
 | tr12-30 | TL | TL | TL |
 | traininstance2 | TL | TL | TL |
-| traininstance6 | TL | TL | TL |
+| traininstance6 | **28.0** | TL | TL |
 | trento1 | TL | TL | TL |
-| triptim1 | 83.3 | **64.2** | TL |
+| triptim1 | 89.9 | **64.2** | TL |
 | uccase12 | TL | TL | TL |
 | uccase9 | TL | TL | TL |
 | uct-subprob | TL | TL | TL |
-| unitcal_7 | **47.8** | 82.8 | TL |
+| unitcal_7 | **46.2** | 82.8 | TL |
 | var-smallemery-m6j6 | TL | TL | TL |
 | wachplan | TL | TL | TL |
 

@@ -1804,6 +1804,23 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
     // Dantzig pricing over the variables dual infeasible in unscaled terms (dftol_).
     Index q = -1;
     double best = 0.0;
+    if (primal_window_ > 0) {
+      // Partial pricing (degenerate_moves): the best candidate of the next primal_window_ variables in cyclic
+      // order, or the first one found after them. A full scan per pivot was most of a pivot's time there.
+      const Index total = n_ + m_;
+      Index scanned = 0;
+      for (; scanned < total; ++scanned) {
+        if (q >= 0 && scanned >= primal_window_) break;
+        Index j = primal_pos_ + scanned;
+        if (j >= total) j -= total;
+        const VarStatus st = status_[j];
+        if (st == VarStatus::Basic || wlb_[j] == wub_[j]) continue;
+        const double dj = d_[j];
+        const double infeas = st == VarStatus::AtLower ? -dj : st == VarStatus::AtUpper ? dj : std::abs(dj);
+        if (infeas > best && infeas > dtol * dftol_[j]) best = infeas, q = j;
+      }
+      primal_pos_ = (primal_pos_ + scanned) % total;
+    } else
     for (Index j = 0; j < n_ + m_; ++j) {
       const VarStatus st = status_[j];
       if (st == VarStatus::Basic || wlb_[j] == wub_[j]) continue;
@@ -1914,6 +1931,56 @@ LpStatus DualSimplex::primal_loop(const LpOptions& opt) {
     count_iteration_work(alpha_.count, alpha_.count);
     work_ += n_;
   }
+}
+
+long long DualSimplex::degenerate_moves(const std::vector<char>& is_int, const LpOptions& opt, long long max_pivots,
+                                        long long max_work, const double* target) {
+  if (m_ == 0) return 0;
+  const double dtol = opt.tol.dual_feas;
+  // True costs and bounds, fresh values and duals (rows may have been removed since the solve).
+  wcost_ = cost_;
+  wlb_ = lb_;
+  wub_ = ub_;
+  for (Index j = 0; j < n_ + m_; ++j) place_nonbasic(j);
+  if (!has_factor_ || lu_.num_updates() > 0) {
+    if (!refactor()) return 0;
+  }
+  compute_primal();
+  compute_duals();
+  // Nonbasic variables with a nonzero reduced cost stay at their bound: every point reachable is optimal.
+  for (Index j = 0; j < n_ + m_; ++j) {
+    if (status_[j] == VarStatus::Basic || wlb_[j] == wub_[j]) continue;
+    if (std::abs(d_[j]) > dtol * dftol_[j]) wlb_[j] = wub_[j] = x_[j];
+  }
+  // Distance to the rounding of the current point over the binary-like integer columns.
+  std::fill(wcost_.begin(), wcost_.end(), 0.0);
+  for (Index j = 0; j < n_; ++j) {
+    if (!is_int[j] || !(ub_[j] - lb_[j] == 1.0)) continue;
+    wcost_[j] = (target ? target[j] : x_[j]) - lb_[j] < 0.5 ? 1.0 : -1.0;
+  }
+  compute_duals();
+  LpOptions o = opt;
+  o.iteration_limit = max_pivots;
+  o.checkpoint = nullptr;
+  solve_start_ = t_timer.elapsed();
+  iter_start_ = total_iterations_;
+  primal_window_ = std::max<Index>(200, (n_ + m_) / 20);
+  primal_pos_ = 0;
+  const long long saved_limit = work_limit_;
+  if (max_work >= 0) work_limit_ = work_limit_ >= 0 ? std::min(work_limit_, work_ + max_work) : work_ + max_work;
+  primal_loop(o);
+  work_limit_ = saved_limit;
+  primal_window_ = 0;
+  const long long pivots = total_iterations_ - iter_start_;
+  // Back to the true problem; the next solve recomputes everything from the basis.
+  wcost_ = cost_;
+  wlb_ = lb_;
+  wub_ = ub_;
+  dse_.assign(m_, 1.0);
+  dse_ok_ = false;
+  values_ok_ = false;
+  moves_.clear();
+  return pivots;
 }
 
 Index DualSimplex::pivot_out_rows(const std::vector<Index>& rows) {

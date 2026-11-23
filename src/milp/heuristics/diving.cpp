@@ -150,7 +150,8 @@ bool dive(const MipProblem& p, DualSimplex& lp, DiveRule rule, const SimpleRound
       break;
     }
     const long long used = lp.iterations() - it0;
-    if (used >= limits.iteration_budget || timer.elapsed() > limits.time_limit || interrupted()) {
+    if (used >= limits.iteration_budget || timer.elapsed() > limits.time_limit || interrupted() ||
+        (limits.stop && limits.stop->load())) {
       out.limit_hit = true;
       break;
     }

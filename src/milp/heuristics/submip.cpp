@@ -199,7 +199,7 @@ bool rens(const MipProblem& p, const double* lp_x, double cutoff, const SubMipLi
   };
   bool quick_infeasible = true;  // every sub-MIP so far was infeasible at (or right after) its root
   for (double keep : {1.0, 0.7, 0.4}) {
-    if (keep < 1.0 && !redcost) break;
+    if (keep < 1.0 && (!redcost || (limits.retry_empty_only && !quick_infeasible))) break;
     std::vector<double> lb = p.col_lb, ub = p.col_ub;
     for (Index j = 0; j < p.num_cols(); ++j) {
       if (!p.is_int[j] || std::abs(lp_x[j] - std::round(lp_x[j])) <= 1e-6) continue;

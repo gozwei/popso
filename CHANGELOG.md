@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.12.1 — 2026-11-23
+
+Four more defaults for the MILP search and one fix. Side by side with v0.12.0 (120 s, 4 threads): 193 of 480
+runs solved against 185 and 4% less time on the MIPLIB 2017 benchmark set, 183 of 189 against 180 and 9% less
+on the 63-instance development set. Over three seeds the benchmark set is at 94, 95 and 96 solved (49.0, 48.4,
+47.6 s). No wrong answer in any run.
+
+- **Fixed: a solution lost at the time limit on very large models.** When the solution of the presolved
+  problem, mapped back, misses a row of the original model by slightly more than the tolerance (substitutions
+  amplify a 1e-7 slack to 2e-6), the solver repairs it with an LP over the continuous columns. That LP ran on
+  the original model with whatever time was left; at a time limit on a model of 800,000 columns it had one
+  second, failed, and the run ended without any solution although the search held one (supportcase12: 2-4 of
+  12 seeds; since v0.11 at least). The repair now runs in the presolved problem first, which is small, and may
+  take up to a twentieth of the time limit beyond it (2-10 s) when the alternative is no solution.
+- **Heuristics between root cut rounds.** After each round's LP the root rounds the point, and idle threads
+  run one task each of a dive on a copy of the LP, RENS, or RINS once a solution exists; a kind that keeps
+  failing waits longer each time, and the root never waits for a task. The heuristics after the loop are
+  skipped where the loop already did their work. Good solutions arrive during the cut loop instead of after
+  it. MIPLIB 2017 benchmark set, two pairs of seeds: time ratio 0.98 and 0.99 with 3 and 1 more runs solved;
+  development set 0.97. Not in deterministic mode. `MILP_CUTLOOP_HEUR=0` switches it off.
+- **Flat root LPs.** On a model whose root bound does not move in the cut rounds and whose first LP point is
+  very fractional (at least 15% of the integer columns), the root now makes degenerate pivots inside the LP's
+  optimal face that push 0/1 columns toward their rounding, and keeps the cuts that are binding afterwards
+  instead of removing every cut of a loop that did not move the bound. The LP value is unchanged; the vertex
+  is far less fractional and branching has something to decide on (CMS750_4: 1391 fractional columns -> under
+  100; 60-113 s and 34-126k nodes -> 3-6 s and 45-277 nodes at 4 threads). The first call is a short trial
+  and the rule stops when it does not pay; on the benchmark set it acts on this one instance and costs under a
+  second elsewhere. `MILP_DEGEN_MOVES=0 MILP_FLAT_CUTS=0` switch it off.
+- **Presolve: integer columns with a common divisor, and two repairs.** An integer column that an equation
+  shows to be a multiple of g (plus an offset), such as X = 10 (a - b), is replaced by X = g X' + r; a one-of
+  group that encodes X by its value then loses the members that are no multiple of g. Probing no longer lifts
+  a row that its own fixings in the same pass made redundant (such rows stayed alive with entries of other
+  binaries), and of two complementary binaries the one that is a member of a packing or partitioning row is
+  the one kept. Models that multiply two integers through value encodings shrink most (traininstance6: 2804 x
+  1172 -> 534 x 272 after presolve, unsolved in 120 s -> 10 s at 4 threads; rd-rplusc-21 loses 40% of its
+  rows); the benchmark set as a whole is unchanged in time. `MILP_INT_DIV=0`, `MILP_LIFT_LIVE=0` and
+  `MILP_KEEP_MEMBERS=0` switch them off.
+- **Slow root LPs.** When a root cut round's re-solve would cost more than the whole LP work before the first
+  round (and at least a few seconds), the round is discarded and the cut loop ends; root strong branching ends
+  after the first probe that learns nothing when a single child costs half a second or more. Both are measured
+  on the simplex work clock, so they are reproducible. Ordinary roots never reach the thresholds; on large
+  models the root phase gets shorter (supportcase22 95 -> 34 s, square47 121 -> 99 s). MIPLIB 2017 benchmark
+  set, two pairs of seeds: solved 173 -> 180 and 175 -> 178 of 480 runs, time ratio 0.97 and 0.98.
+  `MILP_SLOW_ROOT=0` switches it off.
+
 ## v0.12.0 — 2026-11-20
 
 Performance. On the MIPLIB 2017 benchmark set (240 instances, 120 s, 4 threads) this version solves 95, 94 and
