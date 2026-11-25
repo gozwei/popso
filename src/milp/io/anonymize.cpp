@@ -105,6 +105,23 @@ Model anonymize(const Model& model, const AnonOptions& options, AnonMap* map_out
     a.A.start.push_back(static_cast<Index>(a.A.index.size()));
   }
 
+  // Further objectives: the same order (priorities, weights and tolerances kept), columns renumbered and
+  // sorted, neutral names.
+  a.obj_priority = model.obj_priority;
+  a.obj_weight = model.obj_weight;
+  a.obj_abs_tol = model.obj_abs_tol;
+  a.obj_rel_tol = model.obj_rel_tol;
+  if (!model.objectives.empty()) a.obj_name = "obj0";
+  for (size_t k = 0; k < model.objectives.size(); ++k) {
+    Objective o = model.objectives[k];
+    o.name = "obj" + std::to_string(k + 1);
+    std::vector<std::pair<Index, double>> e;
+    for (size_t t = 0; t < o.cols.size(); ++t) e.emplace_back(new_col[o.cols[t]], o.coefs[t]);
+    std::stable_sort(e.begin(), e.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    for (size_t t = 0; t < e.size(); ++t) o.cols[t] = e[t].first, o.coefs[t] = e[t].second;
+    a.objectives.push_back(std::move(o));
+  }
+
   // Quadratic objective: (row, col) with row >= col in the new indices, sorted by (col, row);
   // the stable sort keeps the order of repeated entries (they are summed in that order).
   {

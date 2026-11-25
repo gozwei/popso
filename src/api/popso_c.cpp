@@ -542,6 +542,71 @@ int popso_set_objective(popso_model* m, int nnz, const int* vars, const double* 
   });
 }
 
+int popso_set_objective_attributes(popso_model* m, int priority, double weight, double abs_tol, double rel_tol) {
+  return guarded(m, [&] {
+    if (!std::isfinite(weight)) fail(POPSO_ERROR_INVALID_ARGUMENT, "objective weight must be finite");
+    if (!(abs_tol >= 0.0) || !(rel_tol >= 0.0) || !std::isfinite(abs_tol) || !std::isfinite(rel_tol))
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "objective tolerances must be finite and not negative");
+    m->model.obj_priority = priority;
+    m->model.obj_weight = weight;
+    m->model.obj_abs_tol = abs_tol;
+    m->model.obj_rel_tol = rel_tol;
+    touched(m);
+  });
+}
+
+int popso_add_objective(popso_model* m, int nnz, const int* vars, const double* vals, double constant, int priority,
+                        double weight, double abs_tol, double rel_tol, const char* name, int* index) {
+  return guarded(m, [&] {
+    if (nnz < 0 || (nnz > 0 && (!vars || !vals))) fail(POPSO_ERROR_INVALID_ARGUMENT, "add_objective: invalid entries");
+    if (!std::isfinite(constant) || !std::isfinite(weight))
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "objective constant and weight must be finite");
+    if (!(abs_tol >= 0.0) || !(rel_tol >= 0.0) || !std::isfinite(abs_tol) || !std::isfinite(rel_tol))
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "objective tolerances must be finite and not negative");
+    milp::Objective o;
+    std::vector<std::pair<int, double>> e;
+    for (int k = 0; k < nnz; ++k) {
+      check_var(m, vars[k]);
+      if (!std::isfinite(vals[k])) fail(POPSO_ERROR_INVALID_ARGUMENT, "objective coefficient must be finite");
+      e.emplace_back(vars[k], vals[k]);
+    }
+    std::stable_sort(e.begin(), e.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [j, v] : e) {
+      if (!o.cols.empty() && o.cols.back() == j) o.coefs.back() += v;
+      else o.cols.push_back(j), o.coefs.push_back(v);
+    }
+    o.offset = constant;
+    o.priority = priority;
+    o.weight = weight;
+    o.abs_tol = abs_tol;
+    o.rel_tol = rel_tol;
+    o.name = name ? name : "";
+    m->model.objectives.push_back(std::move(o));
+    if (index) *index = static_cast<int>(m->model.objectives.size());
+    touched(m);
+  });
+}
+
+int popso_clear_objectives(popso_model* m) {
+  return guarded(m, [&] {
+    m->model.objectives.clear();
+    touched(m);
+  });
+}
+
+int popso_num_objectives(const popso_model* m) { return m ? m->model.num_objectives() : -1; }
+
+int popso_get_objective_value(const popso_model* m, int index, double* value) {
+  return guarded(m, [&] {
+    if (!value) fail(POPSO_ERROR_INVALID_ARGUMENT, "null output pointer");
+    if (index < 0 || index >= m->model.num_objectives())
+      fail(POPSO_ERROR_INVALID_ARGUMENT, "objective index " + std::to_string(index) + " out of range");
+    check_solved(m);
+    if (!m->result.has_solution) fail(POPSO_ERROR_NO_SOLUTION, "no feasible solution is known");
+    *value = m->model.objective_value(index, m->result.x);
+  });
+}
+
 namespace {
 
 void add_q_impl(popso_model* m, int nnz, const int* rows, const int* cols, const double* vals, const char* what) {

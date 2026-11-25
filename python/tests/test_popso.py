@@ -597,6 +597,48 @@ class TestDualsAndControl(unittest.TestCase):
             self.assertEqual((a.num_vars, a.num_constrs), (b.num_vars, b.num_constrs))
             self.assertAlmostEqual(a.solve(threads=1).objective, b.solve(threads=1).objective)
 
+    def test_several_objectives(self):
+        # max x + 2y + 3 (priority 2, may lose 0.5), then 2 (z - x) - (y - z) (priority 1, blended).
+        m = popso.Model("three")
+        x = m.add_var(ub=10, vtype=popso.INTEGER, name="x")
+        y = m.add_var(ub=5, name="y")
+        z = m.add_var(vtype=popso.BINARY, name="z")
+        m.add_constr(x + y + z <= 7)
+        m.add_constr(x - y >= -2)
+        m.set_objective(x + 2 * y + 3, sense=popso.MAXIMIZE)
+        self.assertEqual(m.num_objectives, 1)
+        m.set_objective_attributes(priority=2, abs_tol=0.5, rel_tol=0.01)
+        self.assertEqual(m.add_objective(z - x, priority=1, weight=2.0, name="second"), 1)
+        self.assertEqual(m.add_objective(y - z, priority=1, weight=-1.0, name="third"), 2)
+        self.assertEqual(m.num_objectives, 3)
+        with self.assertRaises(ValueError):
+            m.add_objective(x * y)
+        with self.assertRaises(popso.PopsoError):
+            m.add_objective(x, abs_tol=-1.0)
+        r = m.solve(threads=1, mip_gap=0.0)
+        self.assertEqual(r.status, "OPTIMAL")
+        self.assertEqual(len(r.objectives), 3)
+        self.assertAlmostEqual(r.objectives[0], 13.5, places=5)
+        self.assertAlmostEqual(r.objectives[1], -3.0, places=5)
+        self.assertAlmostEqual(r.objectives[2], 3.75, places=5)
+        self.assertAlmostEqual(r.objective, r.objectives[0])
+        self.assertAlmostEqual(r.bound, 14.0, places=5)
+        self.assertAlmostEqual(r[x], 3.0, places=5)
+        # Through an MPS file and back.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "three.mps")
+            m.write_mps(path)
+            back = popso.read_mps(path)
+            self.assertEqual(back.num_objectives, 3)
+            rb = back.solve(threads=1, mip_gap=0.0)
+            for a, b in zip(r.objectives, rb.objectives):
+                self.assertAlmostEqual(a, b, places=5)
+        m.clear_objectives()
+        self.assertEqual(m.num_objectives, 1)
+        r = m.solve(threads=1, mip_gap=0.0)
+        self.assertAlmostEqual(r.objective, 14.0, places=5)
+        self.assertEqual(len(r.objectives), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

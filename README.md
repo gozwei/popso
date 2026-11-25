@@ -310,6 +310,43 @@ m.add_constr(x * x + y ** 2 <= 2, name="disk")
 m.add_constr(t >= (z - 2.6) * (z - 2.6))   # an epigraph: t >= (z - 2.6)^2
 ```
 
+### Several objectives
+
+A model can have several linear objectives, each with a **priority**, a **weight** and two
+**tolerances**. All are optimized in the model's sense (a negative weight turns one around):
+
+- Objectives are solved in stages by descending priority (lexicographic optimization). A later stage
+  may make an earlier stage's value worse by at most `max(abs_tol, rel_tol * |value|)`.
+- Objectives of the same priority are blended: their stage optimizes the sum of `weight * objective`,
+  and its tolerances are the largest of its members.
+- Defaults: priority 0, weight 1, `abs_tol` 1e-6, `rel_tol` 0. So objectives added without a priority
+  are simply summed.
+
+```python
+m.set_objective(cost, sense=popso.MINIMIZE)
+m.set_objective_attributes(priority=2, rel_tol=0.01)     # cost first; later stages may give up 1% of it
+m.add_objective(late_jobs, priority=1, name="lateness")  # then lateness
+m.add_objective(overtime, priority=0, name="overtime")   # then overtime
+r = m.solve()
+r.objectives        # [cost, lateness, overtime] at the solution
+```
+
+Each stage is an ordinary solve of the model with one more row per earlier stage, and starts from the
+solution of the stage before. The **time limit covers all stages**; a stage that stops at a limit ends
+the sequence with its best solution, which still respects the earlier stages. Deterministic mode is
+deterministic over the whole sequence. The result reports every objective's value; the bound is that
+of the first objective when it alone has the highest priority. No dual values are returned, and the
+objectives must be linear.
+
+In files: an MPS file gives every objective as an `N` row with four numbers after its name
+(` N  cost  2  1  1e-06  0.01`: priority, weight, absolute and relative tolerance), with the
+constants as negated `RHS` entries (an `N` row without the numbers after the first one is ignored, as
+before); an LP file starts with `Minimize multi-objectives` and lists each objective as
+`name: Priority=2 Weight=1 AbsTol=1e-06 RelTol=0.01` followed by its expression. Both are the
+conventions other solvers use for such files. The C API has `popso_add_objective`,
+`popso_set_objective_attributes` and `popso_get_objective_value`; the command line prints one
+`Objective k (name, priority p): value` line per objective.
+
 ### C library
 
 The build also produces a shared library (`build/libpopso.dylib`, `libpopso.so` or `popso.dll`) with

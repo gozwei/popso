@@ -774,6 +774,12 @@ class Search : public BasisOwner {
     // The node LP's objective is not confirmed by its safe bound (lp_bound): gains relative to it are no
     // bounds (root strong branching's bound, MILP_SB_BOUNDS).
     bool lp_unsafe = false;
+    // Node LP solved again inside select_branch after strong-branching fixings (MILP_SB_FIX >= 2): the new
+    // objective, safe bound and basis for the children.
+    bool sbr = false;
+    double sbr_obj = 0.0, sbr_bnd = 0.0;
+    std::shared_ptr<const Basis> sbr_basis;
+    std::vector<std::pair<Index, double>> sbr_fracs;
   };
 
   double cutoff(const Worker& w) const { return w.det ? w.cutoff : cutoff_.load(); }
@@ -1386,6 +1392,7 @@ class Search : public BasisOwner {
   std::atomic<long long> sb_flat_nodes_{0};             // branchings scored without pseudocost gains (flat objective)
   std::atomic<long long> sb_calls_{0};  // branching decisions (select_branch calls)
   std::atomic<long long> sb_fixed_{0};  // strong branching domain reductions
+  std::atomic<long long> sb_resolves_{0}, sb_resolve_prunes_{0};  // node LPs solved again after them, nodes closed by that
   std::atomic<long long> sb_degen_skips_{0};  // branchings without strong branching (dual degenerate LP)
   void learn_conflict(Worker& w, LpStatus st, bool use_trail = true);
   void learn_prop_conflict(Worker& w, const char* what);
@@ -3355,6 +3362,15 @@ Index Search::select_branch(Worker& w, double obj, const Basis& basis) {
     }
     degen_factor = factor;
   }
+  // MILP_SB_FIX: 0 (default) a candidate with a cut-off child is branched on at once; 1 its other side becomes a
+  // bound at this node and probing goes on; 2 as 1, and when a pass fixed something the node LP is solved again
+  // and the selection starts over on the new point (as SCIP's "reduced domain" result), up to
+  // MILP_SB_FIX_PASSES times per node; 3 as 2, with the pass ending at its first fixing.
+  static const int sb_fix_mode = static_cast<int>(knob("MILP_SB_FIX", 0));
+  static const int sb_fix_passes = static_cast<int>(knob("MILP_SB_FIX_PASSES", sb_fix_mode >= 3 ? 8 : 3));
+  int sbr_pass = 0;
+  const Basis* bp = &basis;
+sbr_again:
   double ps_scale = 1.0;
   const double gap = cutoff(w) - obj;
   const BranchScoreRule rule = w.pc->score_rule(gap);
@@ -3405,8 +3421,8 @@ Index Search::select_branch(Worker& w, double obj, const Basis& basis) {
     if (!c.reliable && probes < max_probes && no_improve < kLookahead && !pl_stop) {
       const double v = w.xnode[c.j];
       bool ex_dn = false, ex_up = false;
-      const double dn = probe(w, c.j, w.lp.col_lower(c.j), std::floor(v), obj, basis, &ex_dn, sb_bounds);
-      const double up = probe(w, c.j, std::ceil(v), w.lp.col_upper(c.j), obj, basis, &ex_up, sb_bounds);
+      const double dn = probe(w, c.j, w.lp.col_lower(c.j), std::floor(v), obj, *bp, &ex_dn, sb_bounds);
+      const double up = probe(w, c.j, std::ceil(v), w.lp.col_upper(c.j), obj, *bp, &ex_up, sb_bounds);
       probed = true;
       ++probes;
       if (!is_finite(dn) && !is_finite(up)) {
@@ -3436,6 +3452,7 @@ Index Search::select_branch(Worker& w, double obj, const Basis& basis) {
         if (first_fixed < 0) first_fixed = c.j;
         if (is_finite(dn)) pc_update(w, c.j, -1, dn / c.f);
         else pc_update(w, c.j, 1, up / (1.0 - c.f));
+        if (sb_fix_mode >= 3 && sbr_pass < sb_fix_passes) break;
         continue;
       }
       pc_update(w, c.j, -1, dn / c.f);
@@ -3463,6 +3480,57 @@ Index Search::select_branch(Worker& w, double obj, const Basis& basis) {
       best_score = score, best = c.j;
       if (sb_bounds) w.sb_var = c.j, w.sb_dn = cand_dn, w.sb_up = cand_up;
     }
+  }
+  if (sb_fix_mode >= 2 && first_fixed >= 0 && sbr_pass < sb_fix_passes && !stop_.load()) {
+    ++sbr_pass;
+    DualSimplex& lp = w.lp;
+    lp.restore_state(w.state);
+    LpOptions o;
+    o.tol = params_.tol;
+    o.objective_cutoff = cutoff(w);
+    o.time_limit = params_.time_limit - timer_.elapsed();
+    const long long it0 = lp.iterations();
+    const LpStatus st = lp.solve(o);
+    lp_iters_ += lp.iterations() - it0;
+    w.sb_iters += lp.iterations() - it0;
+    sb_iters_ += lp.iterations() - it0;
+    ++sb_resolves_;
+    bool below = false;
+    const double nbnd = st == LpStatus::Optimal ? lp_bound(lp, &below, -1) : -kInf;
+    if (st == LpStatus::Infeasible || st == LpStatus::CutoffReached || nbnd >= cutoff(w)) {
+      ++sb_resolve_prunes_;
+      lp.restore_state(w.state);
+      return -1;
+    }
+    bool adopt = st == LpStatus::Optimal && !below;
+    if (adopt) {
+      const double* x = lp.x();
+      const double itol = params_.tol.integrality;
+      w.sbr_fracs.clear();
+      for (Index k = 0; k < p_.num_cols(); ++k) {
+        if (!p_.is_int[k]) continue;
+        const double fk = x[k] - std::floor(x[k]);
+        if (fk > itol && fk < 1.0 - itol) w.sbr_fracs.emplace_back(k, fk);
+      }
+      // An integral point is left to the children (the branching on the first fixed column, as without the
+      // re-solve): this function only chooses a column.
+      adopt = !w.sbr_fracs.empty();
+      if (adopt) {
+        w.fracs.swap(w.sbr_fracs);
+        w.xnode.assign(x, x + p_.num_cols());
+        obj = lp.objective();
+        w.sbr = true;
+        w.sbr_obj = obj;
+        w.sbr_bnd = nbnd;
+        w.sbr_basis = std::make_shared<const Basis>(lp.get_basis());
+        if (w.wts_ok)
+          w.wts_ok = lp.basic_weights(p_.num_cols() + (use_pool_ && w.m_base >= 0 ? w.m_base : lp.num_rows()), w.wts);
+        lp.save_state(w.state);
+        bp = w.sbr_basis.get();
+        goto sbr_again;
+      }
+    }
+    lp.restore_state(w.state);
   }
   if (probed) w.restore_node_state();
   // Every scored candidate was fixed by strong branching (or the best one was): branch on the first
@@ -5057,13 +5125,13 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
     return unsolved_branch(w, node, children);
   }
 
-  const double obj = lp.objective();
+  double obj = lp.objective();
   // The node's bound: obj, or the LP's safe dual bound where that is lower (a dual infeasibility the scaled
   // tolerances let pass would make obj an invalid bound). Pruning, the children's bounds and the root bound use
   // it; pseudocosts, estimates and branching scores stay on obj.
   bool unsafe = false;
   w.phase(kPhAfterLp);
-  const double bnd = lp_bound(lp, &unsafe, node.id);
+  double bnd = lp_bound(lp, &unsafe, node.id);
   w.lp_unsafe = unsafe;
   static const long long debug_node = std::getenv("MILP_DEBUG_NODE") ? std::atoll(std::getenv("MILP_DEBUG_NODE")) : -1;
   if (debug_node >= 0 && node.id == debug_node) {
@@ -5357,7 +5425,17 @@ int Search::process_impl(Worker& w, Node& node, Node* children) {
       }
     }
   }
-  if (j < 0) j = select_branch(w, obj, *basis);
+  if (j < 0) {
+    w.sbr = false;
+    j = select_branch(w, obj, *basis);
+    if (w.sbr) {
+      // Strong-branching fixings and a new node LP: the children start from it.
+      obj = w.sbr_obj;
+      bnd = std::max(bnd, w.sbr_bnd);
+      basis = w.sbr_basis;
+      w.sbr = false;
+    }
+  }
   if (j < 0) {
     count_outcome(10, node.depth);
     return 0;
@@ -8902,6 +8980,9 @@ MipResult Search::run() {
     if (sb_fixed_.load() + sb_degen_skips_.load() > 0) {
       log_.log(2, "  strong branching: %lld domain reductions (one child cut off), %lld of %lld branchings without "
                "probes (dual degenerate LP)\n", sb_fixed_.load(), sb_degen_skips_.load(), sb_calls_.load());
+      if (sb_resolves_.load() > 0)
+        log_.log(2, "  strong branching: node LP solved again %lld times after fixings, %lld nodes closed by it\n",
+                 sb_resolves_.load(), sb_resolve_prunes_.load());
     }
     {
       // path: global fixings contradict the branching; late cutoff: LP optimal at or above the cutoff

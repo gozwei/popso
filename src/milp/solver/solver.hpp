@@ -129,6 +129,19 @@ struct SolveResult {
   std::vector<int8_t> col_basis, row_basis;
   bool fixed_mip_duals = false;  // the duals are those of the MILP with its integers fixed
   SolveStats stats;
+  // Models with several objectives (Model::objectives; see solver/multiobj.hpp): the value of every objective
+  // at x (index 0: the model's own; `objective` repeats it) and the stages in the order solved, each with the
+  // status, value and bound of its blended objective. `bound` is the bound of the model's own objective when
+  // that objective alone is the first stage, infinite otherwise. No duals. Empty for ordinary models.
+  struct Stage {
+    int priority = 0;
+    Status status = Status::Unknown;
+    double objective = kInf, bound = -kInf;
+    double time = 0.0;
+    long long nodes = 0;
+  };
+  std::vector<double> objective_values;
+  std::vector<Stage> stages;
   // With SolverParams::trace_incumbents: the incumbents in the order found (runs merged, see
   // IncumbentEvent), each better than the one before by more than a relative 1e-9 (a restarted
   // search accepts its start again, and racing searches report their own improvements).

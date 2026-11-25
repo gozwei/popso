@@ -510,11 +510,17 @@ class Result:
     upper bound (opposite signs when maximizing). result.dual(c) and result.reduced_cost(x) look
     single values up. var_basis / constr_basis: the optimal basis of LP and fixed-MIP duals
     (popso.BASIC, AT_LOWER, AT_UPPER, AT_ZERO per variable / constraint), else None.
+
+    objectives: the value of every objective at the solution (one entry for an ordinary model; with
+    Model.add_objective the first is `objective`), None without a solution. With several objectives
+    `bound` is finite only when the first objective alone has the highest priority, and no duals are
+    returned.
     """
 
     def __init__(self, model, status, objective, bound, gap, nodes, lp_iterations, time, x, duals=None,
-                 reduced_costs=None, fixed_mip_duals=False, var_basis=None, constr_basis=None):
+                 reduced_costs=None, fixed_mip_duals=False, var_basis=None, constr_basis=None, objectives=None):
         self._model = model
+        self.objectives = objectives
         self.status = status
         self.objective = objective
         self.bound = bound
@@ -819,6 +825,41 @@ class Model:
         if sense is not None:
             self.sense = sense
 
+    def set_objective_attributes(self, priority=0, weight=1.0, abs_tol=1e-6, rel_tol=0.0):
+        """Priority, weight and tolerances of the model's (first) objective when further objectives are
+        added with add_objective; see there."""
+        self._check(lib.popso_set_objective_attributes(self._h, int(priority), float(weight), float(abs_tol),
+                                                       float(rel_tol)))
+
+    def add_objective(self, expr, priority=0, weight=1.0, abs_tol=1e-6, rel_tol=0.0, name=None):
+        """Adds a further linear objective (an expression, Var, number or {var: coef} dict) and returns its
+        index (1, 2, ...; the objective of set_objective is number 0).
+
+        All objectives are optimized in the model's sense (a negative weight turns one around), in stages
+        by descending priority. Objectives of one priority are blended: the stage optimizes the sum of
+        weight * objective. A later stage may make an earlier stage's value worse by at most
+        max(abs_tol, rel_tol * |value|), with the largest tolerances of that stage's objectives. The time
+        limit covers all stages. Result.objectives holds the value of every objective."""
+        if isinstance(expr, QuadExpr):
+            raise ValueError("further objectives must be linear")
+        if isinstance(expr, numbers.Real):
+            idx, val, const = [], [], float(expr)
+        else:
+            idx, val, const = self._coeffs(expr)
+        index = ctypes.c_int(-1)
+        self._check(lib.popso_add_objective(self._h, len(idx), _iarray(idx), _darray(val), const, int(priority),
+                                            float(weight), float(abs_tol), float(rel_tol), _enc(name),
+                                            ctypes.byref(index)))
+        return index.value
+
+    def clear_objectives(self):
+        """Removes the objectives added with add_objective (the first objective stays)."""
+        self._check(lib.popso_clear_objectives(self._h))
+
+    @property
+    def num_objectives(self):
+        return lib.popso_num_objectives(self._h)
+
     def get_q(self):
         """The objective's quadratic part as the lower triangle of Q (objective c'x + 1/2 x'Qx):
         a list of (row, column, value) with row >= column."""
@@ -989,13 +1030,17 @@ class Model:
             self._check(f(h, ctypes.byref(ll)))
             return ll.value
 
-        x = objective = None
+        x = objective = objectives = None
         if lib.popso_has_solution(h):
             objective = get_d(lib.popso_get_objective)
             n = self.num_vars
             buf = (ctypes.c_double * n)()
             self._check(lib.popso_get_solution(h, buf, n))
             x = list(buf)
+            objectives = []
+            for k in range(self.num_objectives):
+                self._check(lib.popso_get_objective_value(h, k, ctypes.byref(d)))
+                objectives.append(d.value)
         duals = reduced_costs = var_basis = constr_basis = None
         has_duals = lib.popso_has_duals(h)
         if has_duals:
@@ -1011,7 +1056,7 @@ class Model:
         return Result(self, _dec(lib.popso_status_string(status)), objective, get_d(lib.popso_get_bound),
                       get_d(lib.popso_get_gap), get_ll(lib.popso_get_node_count),
                       get_ll(lib.popso_get_lp_iterations), get_d(lib.popso_get_solve_time), x, duals,
-                      reduced_costs, has_duals == 2, var_basis, constr_basis)
+                      reduced_costs, has_duals == 2, var_basis, constr_basis, objectives)
 
     def write_solution(self, filename):
         self._check(lib.popso_write_solution(self._h, _enc(os.fspath(filename))))

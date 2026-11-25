@@ -136,6 +136,12 @@ class LpParser {
 
   ObjSense sense_ = ObjSense::Minimize;
   double obj_offset_ = 0.0;
+  // Several objectives ("multi-objectives"): the further ones and the first one's name and attributes.
+  bool multi_ = false;
+  std::vector<Objective> objectives_;
+  std::string obj_name_;
+  int obj_priority_ = 0;
+  double obj_weight_ = 1.0, obj_abs_tol_ = 1e-6, obj_rel_tol_ = 0.0;
 
   std::unordered_map<string_view, Index> col_index_;
   std::vector<string_view> col_names_;
@@ -541,9 +547,61 @@ int LpParser::parse_expr(double& constant, int& nvars, bool quad) {
 }
 
 void LpParser::parse_objective() {
-  // Multi-objective files ("Minimize multi-objectives") are not supported.
-  if (cur().type == T::Name && !cur().line_start && iequals(cur().text, "multi") && at(pos_ + 1).type == T::Minus)
-    error("multiple objectives are not supported yet");
+  // Several objectives: "Minimize multi-objectives", then per objective "<name>: Priority=<p> Weight=<w>
+  // AbsTol=<a> RelTol=<r>" (each attribute optional) and its linear expression.
+  if (cur().type == T::Name && !cur().line_start && iequals(cur().text, "multi") && at(pos_ + 1).type == T::Minus &&
+      at(pos_ + 2).type == T::Name && iequals(at(pos_ + 2).text, "objectives")) {
+    pos_ += 3;
+    int count = 0;
+    while (is_label(pos_)) {
+      Objective o;
+      o.name = std::string(cur().text);
+      pos_ += 2;
+      while (cur().type == T::Name && at(pos_ + 1).type == T::Eq) {
+        const string_view key = cur().text;
+        const bool prio = iequals(key, "priority"), weight = iequals(key, "weight"), at_ = iequals(key, "abstol"),
+                   rt = iequals(key, "reltol");
+        if (!prio && !weight && !at_ && !rt) break;
+        pos_ += 2;
+        const double v = parse_signed_number("objective attribute");
+        if (!std::isfinite(v)) error("infinite value of '" + std::string(key) + "' in objective '" + o.name + "'");
+        if (prio) {
+          if (v != std::floor(v) || std::abs(v) > 1e9) error("the priority of objective '" + o.name + "' must be an integer");
+          o.priority = static_cast<int>(v);
+        } else if (weight) {
+          o.weight = v;
+        } else {
+          if (v < 0.0) error("negative tolerance in objective '" + o.name + "'");
+          (at_ ? o.abs_tol : o.rel_tol) = v;
+        }
+      }
+      terms_.clear();
+      double constant = 0.0;
+      int nvars = 0;
+      parse_expr(constant, nvars, false);
+      if (!std::isfinite(constant)) error("infinite constant term in objective '" + o.name + "'");
+      if (count == 0) {
+        for (const auto& [j, v] : terms_) obj_[j] += v;
+        obj_offset_ += constant;
+        obj_name_ = o.name;
+        obj_priority_ = o.priority, obj_weight_ = o.weight, obj_abs_tol_ = o.abs_tol, obj_rel_tol_ = o.rel_tol;
+      } else {
+        std::sort(terms_.begin(), terms_.end());
+        for (const auto& [j, v] : terms_) {
+          if (!o.cols.empty() && o.cols.back() == j) o.coefs.back() += v;
+          else o.cols.push_back(j), o.coefs.push_back(v);
+        }
+        o.offset = constant;
+        objectives_.push_back(std::move(o));
+      }
+      terms_.clear();
+      ++count;
+    }
+    if (count == 0) error("expected '<name>: Priority=...' and an expression after 'multi-objectives', found " + describe(cur()));
+    multi_ = true;
+    if (cur().type != T::Eof && !at_keyword()) error("unexpected " + describe(cur()) + " in the objectives");
+    return;
+  }
   if (is_label(pos_)) pos_ += 2;
   terms_.clear();
   double constant = 0.0;
@@ -855,6 +913,14 @@ Model LpParser::parse() {
   m.name = name_;
   m.sense = sense_;
   m.obj_offset = obj_offset_;
+  if (multi_) {
+    m.objectives = std::move(objectives_);
+    m.obj_name = obj_name_;
+    m.obj_priority = obj_priority_;
+    m.obj_weight = obj_weight_;
+    m.obj_abs_tol = obj_abs_tol_;
+    m.obj_rel_tol = obj_rel_tol_;
+  }
   m.col_names.reserve(n);
   for (string_view s : col_names_) m.col_names.emplace_back(s);
   m.obj = std::move(obj_);

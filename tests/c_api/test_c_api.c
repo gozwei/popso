@@ -599,6 +599,64 @@ static void test_quadratic_rows(void) {
   popso_free(m);
 }
 
+static void test_objectives(void) {
+  /* max x + 2y + 3 (priority 2, may lose 0.5), then 2 (z - x) - (y - z) (priority 1, blended);
+   * x + y + z <= 7, x - y >= -2, x integer in [0, 10], y in [0, 5], z binary. */
+  popso_model* m = popso_create();
+  int x, y, z, idx = -1;
+  double v, sol[3];
+  const int c1[3] = {0, 1, 2}, c2[2] = {0, 1};
+  const double a1[3] = {1.0, 1.0, 1.0}, a2[2] = {1.0, -1.0};
+  const int o2[2] = {0, 2}, o3[2] = {1, 2};
+  const double w2[2] = {-1.0, 1.0}, w3[2] = {1.0, -1.0};
+  const int bad[1] = {9};
+  CHECK_OK(popso_add_var(m, 0.0, 10.0, 1.0, POPSO_INTEGER, "x", &x));
+  CHECK_OK(popso_add_var(m, 0.0, 5.0, 2.0, POPSO_CONTINUOUS, "y", &y));
+  CHECK_OK(popso_add_var(m, 0.0, 1.0, 0.0, POPSO_BINARY, "z", &z));
+  CHECK_OK(popso_add_row(m, 3, c1, a1, -POPSO_INFINITY, 7.0, "c1", NULL));
+  CHECK_OK(popso_add_row(m, 2, c2, a2, -2.0, POPSO_INFINITY, "c2", NULL));
+  CHECK_OK(popso_set_objective_sense(m, POPSO_MAXIMIZE));
+  CHECK_OK(popso_set_objective_constant(m, 3.0));
+  CHECK(popso_num_objectives(m) == 1);
+  CHECK(popso_num_objectives(NULL) == -1);
+  CHECK_OK(popso_set_objective_attributes(m, 2, 1.0, 0.5, 0.01));
+  CHECK_OK(popso_add_objective(m, 2, o2, w2, 0.0, 1, 2.0, 1e-6, 0.0, "second", &idx));
+  CHECK(idx == 1);
+  CHECK_OK(popso_add_objective(m, 2, o3, w3, 0.0, 1, -1.0, 1e-6, 0.0, "third", &idx));
+  CHECK(idx == 2);
+  CHECK(popso_num_objectives(m) == 3);
+  CHECK(popso_add_objective(m, 1, bad, w2, 0.0, 0, 1.0, 0.0, 0.0, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT);
+  CHECK(popso_add_objective(m, 2, o2, w2, 0.0, 0, 1.0, -1.0, 0.0, NULL, NULL) == POPSO_ERROR_INVALID_ARGUMENT);
+  CHECK(popso_set_objective_attributes(m, 0, 1.0, 0.0, -2.0) == POPSO_ERROR_INVALID_ARGUMENT);
+  CHECK(popso_get_objective_value(m, 0, &v) == POPSO_ERROR_NOT_SOLVED);
+  CHECK_OK(popso_set_param(m, "verbosity", 0.0));
+  CHECK_OK(popso_set_param(m, "threads", 1.0));
+  CHECK_OK(popso_set_param(m, "mip_gap", 0.0));
+  CHECK_OK(popso_solve(m));
+  CHECK(popso_get_status(m) == POPSO_STATUS_OPTIMAL);
+  CHECK_OK(popso_get_objective_value(m, 0, &v));
+  CHECK_NEAR(v, 13.5);
+  CHECK_OK(popso_get_objective(m, &v));
+  CHECK_NEAR(v, 13.5);
+  CHECK_OK(popso_get_objective_value(m, 1, &v));
+  CHECK_NEAR(v, -3.0);
+  CHECK_OK(popso_get_objective_value(m, 2, &v));
+  CHECK_NEAR(v, 3.75);
+  CHECK(popso_get_objective_value(m, 3, &v) == POPSO_ERROR_INVALID_ARGUMENT);
+  CHECK_OK(popso_get_bound(m, &v));
+  CHECK_NEAR(v, 14.0);
+  CHECK_OK(popso_get_solution(m, sol, 3));
+  CHECK_NEAR(sol[0], 3.0);
+  CHECK_NEAR(sol[1], 3.75);
+  /* Without the further objectives: the first one alone, 14. */
+  CHECK_OK(popso_clear_objectives(m));
+  CHECK(popso_num_objectives(m) == 1);
+  CHECK_OK(popso_solve(m));
+  CHECK_OK(popso_get_objective(m, &v));
+  CHECK_NEAR(v, 14.0);
+  popso_free(m);
+}
+
 #define RUN(t)                     \
   do {                             \
     fprintf(stderr, "c_api: %s\n", #t); \
@@ -619,6 +677,7 @@ int main(void) {
   RUN(test_infeasible_and_lp);
   RUN(test_files_and_start);
   RUN(test_control_and_fixed_duals);
+  RUN(test_objectives);
   if (failures) {
     fprintf(stderr, "c_api: %d of %d checks failed\n", failures, checks);
     return 1;

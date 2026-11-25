@@ -288,13 +288,24 @@ int main(int argc, char** argv) {
     std::printf("Status: %s\n", milp::to_string(result.status));
     if (result.has_solution) std::printf("Objective: %.10g\n", result.objective);
     else std::printf("Objective: -\n");
+    // Several objectives: the value of each (the line above repeats the first), in the file's order.
+    if (result.has_solution && !model.objectives.empty()) {
+      for (int k = 0; k < model.num_objectives(); ++k) {
+        const std::string& nm = k == 0 ? model.obj_name : model.objectives[static_cast<size_t>(k - 1)].name;
+        const int prio = k == 0 ? model.obj_priority : model.objectives[static_cast<size_t>(k - 1)].priority;
+        std::printf("Objective %d (%s, priority %d): %.10g\n", k, nm.empty() ? "-" : nm.c_str(), prio,
+                    result.objective_values[static_cast<size_t>(k)]);
+      }
+    }
     std::printf("Bound: %.10g\n", result.bound);
     double gap = milp::kInf;
     if (result.has_solution && std::isfinite(result.bound)) {
       const double diff = std::abs(result.objective - result.bound);
       gap = diff == 0.0 ? 0.0 : diff / std::max(std::abs(result.objective), 1e-10);
     }
-    if (std::isfinite(gap)) std::printf("Gap: %.4f%%\n", 100.0 * gap);
+    // Several objectives: the first objective's distance to its bound is the room the later stages used.
+    if (!model.objectives.empty()) std::printf("Gap: -\n");
+    else if (std::isfinite(gap)) std::printf("Gap: %.4f%%\n", 100.0 * gap);
     else std::printf("Gap: inf\n");
     std::printf("Nodes: %lld\n", result.stats.nodes);
     std::printf("LP iterations: %lld\n", result.stats.lp_iterations);

@@ -403,7 +403,8 @@ TEST(lp_reader_errors) {
   CHECK(error_contains("min\n x\nst\n x >= 1\nlazy constraints\n x <= 2\nend\n", "lazy constraints are not supported yet"));
   CHECK(error_contains("min\n x\nst\n x >= 1\nuser cuts\n x <= 2\nend\n", "user cuts are not supported yet"));
   CHECK(error_contains("min\n x\nst\n x >= 1\ngeneral constraints\nend\n", "general constraints are not supported"));
-  CHECK(error_contains("minimize multi-objectives\n obj1: x\nst\n x >= 1\nend\n", "multiple objectives"));
+  // Several objectives are read (tests/test_multiobj.cpp); the section needs at least one named objective.
+  CHECK(error_contains("minimize multi-objectives\nst\n x >= 1\nend\n", "after 'multi-objectives'"));
   CHECK(error_contains("min\n x\nst\n x >= 1\nmax\n y\nend\n", "multiple objective sections"));
   CHECK(error_contains("min\n x\nst\n c1: x + y\n c2: x >= 1\nend\n", "<string>:5: expected '<=', '>=' or '=' in constraint 'c1'"));
   CHECK(error_contains("min\n x\nst\n c1: x + y >= z\nend\n", "<string>:4: expected a number for the right-hand side"));

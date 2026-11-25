@@ -51,10 +51,35 @@ struct IndicatorConstraint {
   double lb = -kInf, ub = kInf;
 };
 
+// A further linear objective of a multi-objective model (Model::objectives). The first objective is the
+// model's own (Model::obj, obj_offset) with the attributes Model::obj_priority etc.
+//
+// Objectives are optimized in the model's sense (a negative weight turns one around), in stages by descending
+// priority. Objectives of one priority form one stage and are blended: the stage optimizes the sum of
+// weight * objective. A later stage may not make an earlier stage's blended value worse than the value found
+// by more than max(abs_tol, rel_tol * |value|), with abs_tol / rel_tol the largest of that stage's members.
+struct Objective {
+  std::string name;
+  std::vector<Index> cols;
+  std::vector<double> coefs;  // one per entry of cols; duplicates are summed
+  double offset = 0.0;
+  int priority = 0;
+  double weight = 1.0;
+  double abs_tol = 1e-6, rel_tol = 0.0;
+};
+
 struct Model {
   std::string name;
   ObjSense sense = ObjSense::Minimize;
   double obj_offset = 0.0;
+
+  // Multiple objectives: the further ones, and the attributes of the first (obj, obj_offset). Empty: an
+  // ordinary model. Linear objectives only (no Q with further objectives).
+  std::vector<Objective> objectives;
+  std::string obj_name;
+  int obj_priority = 0;
+  double obj_weight = 1.0;
+  double obj_abs_tol = 1e-6, obj_rel_tol = 0.0;
 
   // Columns.
   std::vector<std::string> col_names;
@@ -109,6 +134,10 @@ struct Model {
 
   // Objective value of x in the original sense (including offset and the quadratic term).
   double objective_value(const std::vector<double>& x) const;
+  // Multiple objectives: their number (1 + objectives.size()) and the value of objective k at x (k = 0: the
+  // model's own, as objective_value; k >= 1: objectives[k - 1], with its offset, without its weight).
+  int num_objectives() const { return 1 + static_cast<int>(objectives.size()); }
+  double objective_value(int k, const std::vector<double>& x) const;
 
   // Maximum absolute violation of bounds, rows, integrality and logical
   // constraints (semi-continuous domains, SOS sets, active indicator rows;

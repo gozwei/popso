@@ -115,6 +115,9 @@ enum class Section { None, Name, ObjSense, ObjName, Rows, Columns, Rhs, Ranges, 
 
 constexpr Index kObjRow = -1;
 constexpr Index kDroppedRow = -2;
+// A further objective (an N row with the four attributes after its name): row value kExtraObj - k for
+// Model::objectives[k].
+constexpr Index kExtraObj = -3;
 
 struct RowInfo {
   char type = 'E';
@@ -220,6 +223,12 @@ class MpsParser {
   string_view obj_name_;  // from OBJNAME
   bool have_obj_ = false;
   double obj_offset_ = 0.0;
+  // Several objectives: N rows written as "N <name> <priority> <weight> <abstol> <reltol>".
+  std::vector<Objective> objectives_;
+  string_view obj_row_name_;
+  bool obj_attr_ = false;
+  int obj_priority_ = 0;
+  double obj_weight_ = 1.0, obj_abs_tol_ = 1e-6, obj_rel_tol_ = 0.0;
 
   NameTable rows_;
   std::vector<string_view> row_names_;
@@ -310,6 +319,25 @@ Model MpsParser::finish() {
   m.name = name_;
   m.sense = sense_;
   m.obj_offset = obj_offset_;
+  if (!objectives_.empty() || obj_attr_) {
+    // Entries of a column given twice for an objective are summed, as for the first objective.
+    for (Objective& o : objectives_) {
+      std::vector<std::pair<Index, double>> e;
+      for (size_t k = 0; k < o.cols.size(); ++k) e.emplace_back(o.cols[k], o.coefs[k]);
+      std::stable_sort(e.begin(), e.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      o.cols.clear(), o.coefs.clear();
+      for (const auto& [j, v] : e) {
+        if (!o.cols.empty() && o.cols.back() == j) o.coefs.back() += v;
+        else o.cols.push_back(j), o.coefs.push_back(v);
+      }
+    }
+    m.objectives = std::move(objectives_);
+    m.obj_name = std::string(obj_row_name_);
+    m.obj_priority = obj_priority_;
+    m.obj_weight = obj_weight_;
+    m.obj_abs_tol = obj_abs_tol_;
+    m.obj_rel_tol = obj_rel_tol_;
+  }
   const size_t n = col_names_.size(), nr = row_info_.size();
   m.col_names.reserve(n);
   for (string_view s : col_names_) m.col_names.emplace_back(s);
@@ -494,6 +522,7 @@ bool MpsParser::handle_header(string_view line) {
     if (qsection && ntok_ == 2) {
       const Index* r = rows_.find(tok_[1]);
       if (!r) error("QSECTION for unknown row '" + std::string(tok_[1]) + "'");
+      if (*r <= kExtraObj) error("QSECTION for the further objective '" + std::string(tok_[1]) + "' (only linear ones are supported)");
       quad_row_ = *r;
     }
     section_ = Section::Quad;
@@ -508,7 +537,7 @@ bool MpsParser::handle_header(string_view line) {
     }
     const Index* r = rows_.find(tok_[1]);
     if (!r) error("QCMATRIX for unknown row '" + std::string(tok_[1]) + "'");
-    if (*r == kObjRow) error("QCMATRIX for the objective row (use QUADOBJ or QMATRIX)");
+    if (*r == kObjRow || *r <= kExtraObj) error("QCMATRIX for the objective row (use QUADOBJ or QMATRIX)");
     quad_row_ = *r;
     section_ = Section::Quad;
     quad_full_ = true;
@@ -534,16 +563,36 @@ void MpsParser::parse_sense(string_view tok) {
 }
 
 void MpsParser::parse_rows() {
-  if (ntok_ != 2) error("ROWS: expected '<type> <name>'");
   const string_view t = tok_[0];
   char type = t.size() == 1 ? t[0] : '?';
   if (type >= 'a' && type <= 'z') type = static_cast<char>(type - 'a' + 'A');
+  // An objective of a multi-objective model carries its priority, weight and tolerances on the row line.
+  const bool attr = type == 'N' && ntok_ == 6;
+  if (ntok_ != 2 && !attr) error("ROWS: expected '<type> <name>' (an N row may add '<priority> <weight> <abstol> <reltol>')");
   const string_view name = tok_[1];
   Index value;
   if (type == 'N') {
     const bool is_obj = obj_name_.empty() ? !have_obj_ : name == obj_name_;
     value = is_obj ? kObjRow : kDroppedRow;
     if (is_obj) have_obj_ = true;
+    if (is_obj) obj_row_name_ = keep(name);
+    if (attr) {
+      const double prio = number(tok_[2]), w = number(tok_[3]), at = number(tok_[4]), rt = number(tok_[5]);
+      if (prio != std::floor(prio) || std::abs(prio) > 1e9) error("ROWS: the priority of objective '" + std::string(name) + "' must be an integer");
+      if (!std::isfinite(w)) error("ROWS: the weight of objective '" + std::string(name) + "' must be finite");
+      if (!(at >= 0.0) || !(rt >= 0.0) || !std::isfinite(at) || !std::isfinite(rt))
+        error("ROWS: the tolerances of objective '" + std::string(name) + "' must be finite and not negative");
+      if (is_obj) {
+        obj_attr_ = true;
+        obj_priority_ = static_cast<int>(prio), obj_weight_ = w, obj_abs_tol_ = at, obj_rel_tol_ = rt;
+      } else {
+        value = kExtraObj - static_cast<Index>(objectives_.size());
+        Objective o;
+        o.name = std::string(name);
+        o.priority = static_cast<int>(prio), o.weight = w, o.abs_tol = at, o.rel_tol = rt;
+        objectives_.push_back(std::move(o));
+      }
+    }
   } else if (type == 'E' || type == 'L' || type == 'G') {
     value = static_cast<Index>(row_info_.size());
   } else {
@@ -593,6 +642,12 @@ void MpsParser::parse_columns() {
     const double v = number(tok_[k + 1]);
     if (r == kObjRow) {
       obj_[cur_col_] += v;
+    } else if (r <= kExtraObj) {
+      if (v != 0.0) {
+        Objective& o = objectives_[static_cast<size_t>(kExtraObj - r)];
+        o.cols.push_back(cur_col_);
+        o.coefs.push_back(v);
+      }
     } else if (r >= 0 && v != 0.0) {
       trip_col_.push_back(cur_col_);
       trip_row_.push_back(r);
@@ -609,6 +664,7 @@ void MpsParser::parse_rhs() {
     const Index r = row_index(tok_[k]);
     const double v = number(tok_[k + 1]);
     if (r == kObjRow) obj_offset_ = -v;
+    else if (r <= kExtraObj) objectives_[static_cast<size_t>(kExtraObj - r)].offset = -v;
     else if (r >= 0) row_info_[r].rhs = to_inf(v);
   }
 }
@@ -947,6 +1003,37 @@ std::string write_mps_string(const Model& model_in, Index* inexact_ranges) {
   std::unordered_set<std::string_view> row_set(rn.begin(), rn.end());
   std::string objname = "OBJ";
   for (int k = 1; row_set.count(objname); ++k) objname = "OBJ_" + std::to_string(k);
+  // Several objectives: every one an N row with its priority, weight and tolerances after the name.
+  const bool multi = !model.objectives.empty();
+  std::vector<std::string> on(model.objectives.size());
+  if (multi) {
+    std::unordered_set<std::string> used(rn.begin(), rn.end());
+    auto unique = [&](std::string nm) {
+      const std::string base = nm;
+      for (int k = 1; !used.insert(nm).second; ++k) nm = base + "_" + std::to_string(k);
+      return nm;
+    };
+    objname = unique(model.obj_name.empty() ? std::string("OBJ") : sanitize(model.obj_name, 'O', 0));
+    for (size_t k = 0; k < on.size(); ++k)
+      on[k] = unique(sanitize(model.objectives[k].name.empty() ? "OBJ" + std::to_string(k + 1) : model.objectives[k].name, 'O',
+                              static_cast<Index>(k + 1)));
+  }
+  auto objective_line = [](std::string& out, const std::string& nm, int priority, double weight, double abs_tol, double rel_tol) {
+    out += " N  " + nm + "  " + std::to_string(priority) + "  ";
+    append_num(out, weight);
+    out += "  ";
+    append_num(out, abs_tol);
+    out += "  ";
+    append_num(out, rel_tol);
+    out += '\n';
+  };
+  // Column-wise entries of the further objectives.
+  std::vector<std::vector<std::pair<int, double>>> extra(multi ? static_cast<size_t>(n) : 0);
+  for (size_t k = 0; k < model.objectives.size(); ++k) {
+    const Objective& o = model.objectives[k];
+    for (size_t t = 0; t < o.cols.size(); ++t)
+      if (o.coefs[t] != 0.0) extra[static_cast<size_t>(o.cols[t])].emplace_back(static_cast<int>(k), o.coefs[t]);
+  }
 
   std::string out;
   out.reserve(64 + 48 * static_cast<size_t>(model.num_nonzeros() + n + m));
@@ -954,7 +1041,15 @@ std::string write_mps_string(const Model& model_in, Index* inexact_ranges) {
   if (!model.name.empty()) out += " " + sanitize(model.name, 'M', 0);
   out += "\n";
   if (model.sense == ObjSense::Maximize) out += "OBJSENSE\n    MAX\n";
-  out += "ROWS\n N  " + objname + "\n";
+  out += "ROWS\n";
+  if (multi) {
+    objective_line(out, objname, model.obj_priority, model.obj_weight, model.obj_abs_tol, model.obj_rel_tol);
+    for (size_t k = 0; k < on.size(); ++k)
+      objective_line(out, on[k], model.objectives[k].priority, model.objectives[k].weight, model.objectives[k].abs_tol,
+                     model.objectives[k].rel_tol);
+  } else {
+    out += " N  " + objname + "\n";
+  }
 
   std::vector<double> rhs(m, 0.0), range(m, 0.0);
   Index inexact = 0;  // ranged rows MPS cannot give back exactly (ranged_row)
@@ -992,12 +1087,16 @@ std::string write_mps_string(const Model& model_in, Index* inexact_ranges) {
     }
     const bool empty = model.A.begin(j) == model.A.end(j);
     if (model.obj[j] != 0.0 || empty) append_entry(out, cn[j], objname, model.obj[j]);
+    if (multi)
+      for (const auto& [k, v] : extra[static_cast<size_t>(j)]) append_entry(out, cn[j], on[static_cast<size_t>(k)], v);
     for (Index p = model.A.begin(j); p < model.A.end(j); ++p) append_entry(out, cn[j], rn[model.A.index[p]], model.A.value[p]);
   }
   if (in_int) out += "    MARKER" + std::to_string(marker) + "  'MARKER'  'INTEND'\n";
 
   out += "RHS\n";
   if (model.obj_offset != 0.0) append_entry(out, "RHS", objname, -model.obj_offset);
+  for (size_t k = 0; k < on.size(); ++k)
+    if (model.objectives[k].offset != 0.0) append_entry(out, "RHS", on[k], -model.objectives[k].offset);
   for (Index i = 0; i < m; ++i)
     if (rhs[i] != 0.0) append_entry(out, "RHS", rn[i], rhs[i]);
 

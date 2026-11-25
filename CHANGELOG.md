@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.13.0 — 2026-11-25
+
+Models with several objectives. The MILP search is v0.12.1's: the same runs give the same results and node
+counts.
+
+- **Several objectives.** A model can carry further linear objectives, each with a priority, a weight and an
+  absolute and a relative tolerance. They are optimized in stages by descending priority (lexicographic
+  optimization); objectives of one priority are blended by their weights; a later stage may give up at most
+  the tolerance of an earlier stage's value. Each stage is an ordinary solve with one more row per earlier
+  stage, starting from the previous solution; the time limit covers the whole sequence, and deterministic
+  mode stays deterministic. Available in the C++ model (`Model::objectives`), the C API
+  (`popso_add_objective`, `popso_set_objective_attributes`, `popso_get_objective_value`), Python
+  (`Model.add_objective`, `Result.objectives`), MPS files (`N` rows with priority, weight and tolerances
+  after the name, read and written) and LP files (`multi-objectives` section, read). Checked against
+  enumeration on small models with ties, weights of both signs and tolerances.
+
 ## v0.12.1 — 2026-11-23
 
 Four more defaults for the MILP search and one fix. Side by side with v0.12.0 (120 s, 4 threads): 193 of 480

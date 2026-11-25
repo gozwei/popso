@@ -204,6 +204,32 @@ POPSO_API int popso_set_objective_constant(popso_model* m, double constant);
 POPSO_API int popso_set_obj_coef(popso_model* m, int var, double value);
 POPSO_API int popso_set_objective(popso_model* m, int nnz, const int* vars, const double* vals);
 
+/* Several objectives. The objective above is the first; popso_add_objective
+ * adds a further linear one (index 1, 2, ... in *index, which may be NULL).
+ * All are optimized in the model's sense (a negative weight turns one
+ * around), in stages by descending priority; objectives of one priority are
+ * blended (the stage optimizes the sum of weight * objective). A later stage
+ * may make an earlier stage's value worse by at most
+ * max(abs_tol, rel_tol * |value|), with the largest tolerances of that
+ * stage's objectives. Defaults of the first objective: priority 0, weight 1,
+ * abs_tol 1e-6, rel_tol 0. Linear objectives only (no popso_set_q).
+ * The time limit covers all stages. After a solve popso_get_objective gives
+ * the first objective's value, popso_get_objective_value any objective's;
+ * popso_get_bound is finite only when the first objective alone forms the
+ * first stage. No duals are returned. An incumbent callback is called during
+ * every stage, with that stage's blended objective and bound. */
+POPSO_API int popso_set_objective_attributes(popso_model* m, int priority, double weight, double abs_tol,
+                                             double rel_tol);
+POPSO_API int popso_add_objective(popso_model* m, int nnz, const int* vars, const double* vals, double constant,
+                                  int priority, double weight, double abs_tol, double rel_tol, const char* name,
+                                  int* index);
+/* Removes the further objectives (the first one and its attributes stay). */
+POPSO_API int popso_clear_objectives(popso_model* m);
+/* 1 + the number of further objectives; -1 for a NULL model. */
+POPSO_API int popso_num_objectives(const popso_model* m);
+/* Value of objective `index` (0 = the first) at the best solution. */
+POPSO_API int popso_get_objective_value(const popso_model* m, int index, double* value);
+
 /* Quadratic objective term 1/2 x^T Q x, Q symmetric. Entries are given as
  * (rows[k], cols[k], vals[k]) from either triangle: an off-diagonal entry
  * (i, j) sets both Q_ij and Q_ji (give each pair once), a diagonal entry Q_jj

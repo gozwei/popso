@@ -23,6 +23,14 @@ double Model::objective_value(const std::vector<double>& x) const {
   return v;
 }
 
+double Model::objective_value(int k, const std::vector<double>& x) const {
+  if (k <= 0) return objective_value(x);
+  const Objective& o = objectives[static_cast<size_t>(k - 1)];
+  double v = o.offset;
+  for (size_t t = 0; t < o.cols.size(); ++t) v += o.coefs[t] * x[static_cast<size_t>(o.cols[t])];
+  return v;
+}
+
 bool Model::has_quadratic() const {
   for (double v : q_val)
     if (v != 0.0) return true;
@@ -183,6 +191,22 @@ void Model::validate() const {
   auto check_col = [&](Index j, const std::string& what) {
     if (j < 0 || static_cast<size_t>(j) >= n) throw std::runtime_error("model: column index out of range in " + what);
   };
+  if (!objectives.empty()) {
+    if (has_quadratic()) throw std::runtime_error("model: several objectives need a linear first objective");
+    if (!std::isfinite(obj_weight) || !(obj_abs_tol >= 0.0) || !(obj_rel_tol >= 0.0) || !std::isfinite(obj_abs_tol) ||
+        !std::isfinite(obj_rel_tol))
+      throw std::runtime_error("model: invalid weight or tolerance of the first objective");
+  }
+  for (const Objective& o : objectives) {
+    const std::string what = "objective '" + o.name + "'";
+    if (o.coefs.size() != o.cols.size()) throw std::runtime_error("model: " + what + ": one coefficient per column needed");
+    for (Index j : o.cols) check_col(j, what);
+    for (double a : o.coefs)
+      if (!std::isfinite(a)) throw std::runtime_error("model: non-finite coefficient in " + what);
+    if (!std::isfinite(o.offset) || !std::isfinite(o.weight)) throw std::runtime_error("model: non-finite offset or weight in " + what);
+    if (!(o.abs_tol >= 0.0) || !(o.rel_tol >= 0.0) || !std::isfinite(o.abs_tol) || !std::isfinite(o.rel_tol))
+      throw std::runtime_error("model: " + what + ": tolerances must be finite and not negative");
+  }
   for (const SosConstraint& s : sos) {
     const std::string what = "SOS '" + s.name + "'";
     if (s.type != 1 && s.type != 2) throw std::runtime_error("model: " + what + " must be of type 1 or 2");

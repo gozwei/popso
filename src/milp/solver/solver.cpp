@@ -1,4 +1,5 @@
 #include "milp/solver/solver.hpp"
+#include "milp/solver/multiobj.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -2819,6 +2820,8 @@ SolveResult solve_model(const Model& model, const SolverParams& params, const st
 }  // namespace
 
 SolveResult solve(const Model& model, const SolverParams& params_in, const std::vector<double>& start) {
+  // Several objectives: a sequence of ordinary solves (each comes back here with one objective).
+  if (!model.objectives.empty()) return solve_multi_objective(model, params_in, start);
   // The interrupt flags of this solve: the caller's (never written here) and a local one, set when
   // the incumbent callback asks to stop (so the caller's flag stays clear for its next solve).
   std::atomic<bool> local_flag{false};
